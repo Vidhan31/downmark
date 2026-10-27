@@ -272,6 +272,10 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         let previous = Session::load();
+        #[cfg_attr(
+            test,
+            expect(unused_variables, reason = "tests do not use welcome document")
+        )]
         let first_run = previous.is_none();
         let previous = previous.unwrap_or_default();
         let mut active = None;
@@ -335,7 +339,12 @@ impl Workspace {
 
         // Files being opened replace this untouched placeholder.
         if self.tabs.is_empty() {
-            let tab = if first_run && paths.is_empty() {
+            #[cfg(not(test))]
+            let is_first = first_run;
+            #[cfg(test)]
+            let is_first = false;
+
+            let tab = if is_first && paths.is_empty() {
                 let doc = cx.new(|cx| {
                     DocumentView::new(WELCOME.to_string(), None, LineEnding::Lf, window, cx)
                 });
