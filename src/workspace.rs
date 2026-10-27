@@ -1596,11 +1596,12 @@ impl Workspace {
         } else {
             px(0.)
         };
-        let tab_width = px(TAB_WIDTH_PX);
-        let tab_count = self.tabs.len();
-        let tabs_content_width =
-            tab_width * tab_count as f32 + px(TAB_GAP_PX) * tab_count.saturating_sub(1) as f32;
-        let tabs_width = available_tabs_width.min(tabs_content_width);
+        let single_tab_width = px(TAB_WIDTH_PX);
+        let tab_count = u16::try_from(self.tabs.len()).unwrap_or(u16::MAX);
+        let tab_count_f32 = f32::from(tab_count);
+        let tab_gaps_f32 = f32::from(tab_count.saturating_sub(1));
+        let tabs_content_width = single_tab_width * tab_count_f32 + px(TAB_GAP_PX) * tab_gaps_f32;
+        let visible_tabs_width = available_tabs_width.min(tabs_content_width);
 
         TitleBar::new()
             .w_full()
@@ -1620,8 +1621,8 @@ impl Workspace {
                     .gap_1()
                     .child(self.render_app_menu_button(cx))
                     .child(self.render_tabs(
-                        tabs_width + px(NEW_TAB_BUTTON_WIDTH_PX),
-                        tab_width,
+                        visible_tabs_width + px(NEW_TAB_BUTTON_WIDTH_PX),
+                        single_tab_width,
                         cx,
                     )),
             )
@@ -1866,7 +1867,7 @@ impl Workspace {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
-                                    this.activate(ix, window, cx)
+                                    this.activate(ix, window, cx);
                                 }),
                             )
                             .on_mouse_down(
