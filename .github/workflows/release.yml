@@ -1,0 +1,486 @@
+# Builds installable Downmark packages for macOS, Windows and Linux.
+#
+# Pushing a tag vX.Y.Z (matching the version in Cargo.toml) publishes a
+# GitHub Release with every package.
+# The macOS job attaches its disk image to the draft itself rather than
+# handing it over as an artifact, so it doesn't depend on GitHub-hosted
+# runners or Actions artifact storage. Code signing and notarization happen when the
+# repository secrets (macOS) and variables (Windows, Azure Artifact Signing)
+# described in docs/RELEASING.md are set; without them the macOS app is
+# signed ad hoc and the Windows files are unsigned.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Read the version from Cargo.toml
+        id: version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+          echo "Version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  macos:
+    # The repository variable MACOS_RUNNER picks another macOS runner, such
+    # as GetMac's; GitHub's macOS 26 runner otherwise. The job checks the
+    # version itself rather than waiting on a GitHub-hosted job, so it runs
+    # wherever its runner is available.
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # A certificate exported with a blank password is fine, so the
+      # password may be empty.
+      HAS_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_NOTARY: ${{ (secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER != '') || (secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Read the version from Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$version" ]]; then
+            echo "::error::No version found in Cargo.toml"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+          echo "Version $version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "DMG=Downmark-$version-macos-universal.dmg" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # Compiled dependencies, restored so a release rebuilds little but
+      # Downmark itself. Saved even when a later step (signing, packaging)
+      # fails, so a retry doesn't start from scratch.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # CI has jobs with the same names that cache debug builds; without
+          # its own key, a release job would restore those and rebuild.
+          key: release
+          cache-on-failure: true
+
+      - name: Check the signing secrets
+        env:
+          CERTIFICATE_SET: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          PASSWORD_SET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          IDENTITY_SET: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+        run: |
+          # Report which secrets arrived without printing any of them; a
+          # secret that exists but is empty looks the same as a missing one.
+          echo "APPLE_CERTIFICATE set: $CERTIFICATE_SET"
+          echo "APPLE_CERTIFICATE_PASSWORD set: $PASSWORD_SET (may be empty for a certificate with a blank password)"
+          echo "APPLE_SIGNING_IDENTITY set: $IDENTITY_SET"
+          echo "Notarization credentials set: $HAS_NOTARY"
+          if [[ "$HAS_SIGNING" != true ]]; then
+            echo "::warning::Signing is off: APPLE_CERTIFICATE and APPLE_SIGNING_IDENTITY must both be non-empty"
+          fi
+
+      # Before building, so a certificate problem shows up in seconds.
+      - name: Import the signing certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          keychain="$RUNNER_TEMP/downmark-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          certificate="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          if [[ ! -s "$certificate" ]]; then
+            echo "::error::APPLE_CERTIFICATE isn't base64 of a .p12 file"
+            exit 1
+          fi
+          certificate_password="$APPLE_CERTIFICATE_PASSWORD"
+          if [[ -z "$certificate_password" ]]; then
+            # security import rejects a .p12 with a blank password, so
+            # re-wrap it with a random one, in the SHA-1/3DES form every
+            # macOS version imports. (OpenSSL 3 needs -legacy to read the
+            # RC2 encryption older Keychain Access exports use.)
+            certificate_password="$(openssl rand -hex 24)"
+            echo "::add-mask::$certificate_password"
+            pem="$RUNNER_TEMP/certificate.pem"
+            unwrap() {
+              openssl pkcs12 -in "$certificate" -passin pass: -nodes -out "$pem" "$@"
+            }
+            if ! unwrap 2>/dev/null && ! unwrap -legacy; then
+              echo "::error::Couldn't open APPLE_CERTIFICATE with a blank password; set APPLE_CERTIFICATE_PASSWORD"
+              exit 1
+            fi
+            openssl pkcs12 -export -in "$pem" -out "$certificate" \
+              -passout "pass:$certificate_password" \
+              -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+            rm -f "$pem"
+          fi
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -f pkcs12 \
+            -P "$certificate_password" -T /usr/bin/codesign
+          rm -f "$certificate"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          # Search the new keychain first, keeping the existing ones.
+          security list-keychains -d user | xargs security list-keychains -d user -s "$keychain"
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          echo "$identities"
+          if ! grep -qiF -- "$APPLE_SIGNING_IDENTITY" <<< "$identities"; then
+            echo "::error::The certificate has no valid signing identity named APPLE_SIGNING_IDENTITY; the list above shows what it has"
+            exit 1
+          fi
+
+      - name: Build a universal binary
+        run: |
+          # One after the other: building both in a single cargo run was
+          # slower (26 minutes against 17), as the two link-time-optimized
+          # builds compete for the runner's memory.
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/downmark \
+            target/aarch64-apple-darwin/release/downmark \
+            target/x86_64-apple-darwin/release/downmark
+          lipo -info dist/downmark
+
+      - name: Assemble Downmark.app
+        run: packaging/macos/bundle.sh dist/downmark "$VERSION" dist
+
+      - name: Sign Downmark.app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [[ "$HAS_SIGNING" == true ]]; then
+            codesign --force --options runtime --timestamp \
+              --keychain "$KEYCHAIN" --sign "$APPLE_SIGNING_IDENTITY" dist/Downmark.app
+          else
+            echo "::warning::No signing certificate configured; signing Downmark.app ad hoc"
+            codesign --force --sign - dist/Downmark.app
+          fi
+          codesign --verify --strict --verbose=2 dist/Downmark.app
+
+      - name: Notarize Downmark.app
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: packaging/macos/notarize.sh dist/Downmark.app
+
+      - name: Create the disk image
+        run: |
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging"
+          ditto dist/Downmark.app "$staging/Downmark.app"
+          ln -s /Applications "$staging/Applications"
+          # hdiutil occasionally fails with "Resource busy" on hosted runners.
+          for attempt in 1 2 3; do
+            if hdiutil create -volname Downmark -srcfolder "$staging" -fs HFS+ \
+              -format UDZO -ov "dist/$DMG"; then
+              break
+            fi
+            if [[ $attempt == 3 ]]; then exit 1; fi
+            sleep 10
+          done
+
+      - name: Sign the disk image
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --timestamp --keychain "$KEYCHAIN" \
+            --sign "$APPLE_SIGNING_IDENTITY" "dist/$DMG"
+          codesign --verify --verbose=2 "dist/$DMG"
+
+      - name: Notarize the disk image
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: packaging/macos/notarize.sh "dist/$DMG"
+
+      - name: Remove the signing keychain
+        if: always() && env.KEYCHAIN != ''
+        run: security delete-keychain "$KEYCHAIN" || true
+
+      - name: Attach the disk image to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! command -v gh >/dev/null; then
+            brew install gh
+          fi
+          tag="$GITHUB_REF_NAME"
+          title="Downmark $VERSION"
+          if [[ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" == false ]]; then
+            echo "::error::$tag is already published; bump the version in Cargo.toml first"
+            exit 1
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --draft --target "$GITHUB_SHA" \
+              --title "$title" --notes "Release build for $tag."
+          fi
+          gh release upload "$tag" "dist/$DMG" --clobber
+          echo "::notice::$DMG is attached to the draft release $tag"
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      # Signs in to Azure with GitHub's OIDC token rather than a stored secret.
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Signing with Azure Artifact Signing (formerly Trusted Signing) when
+      # the repository variables in docs/RELEASING.md are set.
+      HAS_SIGNING: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' && vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
+      # aws-lc-sys (TLS for remote images) needs NASM on x86_64 Windows
+      # unless it may use its prebuilt objects.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      # Compiled dependencies; see the macOS job.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage Downmark.exe
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/downmark.exe dist/Downmark.exe
+
+      - name: Sign in to Azure
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Downmark.exe
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\Downmark.exe
+          description: Downmark
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+          # Use only the Azure CLI sign-in from the step above.
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Create the zip
+        run: |
+          $name = "Downmark-$env:VERSION-windows-x64"
+          $staging = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item dist/Downmark.exe $staging
+          foreach ($doc in 'README.md', 'LICENSE') {
+            if (Test-Path $doc) { Copy-Item $doc $staging }
+          }
+          Compress-Archive -Path $staging -DestinationPath "dist/$name.zip"
+
+      - name: Build the MSIX package
+        run: |
+          $dist = (Resolve-Path dist).Path
+          $packageName = if ('${{ vars.MSIX_PACKAGE_NAME }}') { '${{ vars.MSIX_PACKAGE_NAME }}' } else { 'Downmark' }
+          $publisher = if ('${{ vars.MSIX_PUBLISHER }}') {
+            '${{ vars.MSIX_PUBLISHER }}'
+          } else {
+            'CN=Downmark'
+          }
+          $displayName = if ('${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}') { '${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}' } else { 'Downmark Contributors' }
+          $signSelfSigned = ($env:HAS_SIGNING -ne 'true')
+          & packaging/windows/build-msix.ps1 `
+            -Version $env:VERSION `
+            -SourceExe "$dist\Downmark.exe" `
+            -OutputDir $dist `
+            -PackageName $packageName `
+            -Publisher $publisher `
+            -PublisherDisplayName $displayName `
+            -SignSelfSigned:$signSelfSigned
+
+      - name: Sign the MSIX package
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\Downmark-${{ needs.version.outputs.version }}-windows-x64.msix
+          description: Downmark MSIX package
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Check the signatures
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          $files = @('dist/Downmark.exe', "dist/Downmark-$env:VERSION-windows-x64.msix")
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file
+            "{0}: {1}, signed by {2}" -f $file, $signature.Status, $signature.SignerCertificate.Subject
+            if ($signature.Status -ne 'Valid') { throw "$file is not validly signed" }
+          }
+
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: downmark-windows
+          path: |
+            dist/*.zip
+            dist/*.msix
+            dist/*.cer
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          bundle: Downmark-${{ needs.version.outputs.version }}-x86_64.flatpak
+          manifest-path: packaging/linux/io.github.Vidhan31.Downmark.yaml
+          cache: true
+
+      - name: Stage package
+        run: |
+          mkdir -p dist
+          mv Downmark-${{ needs.version.outputs.version }}-x86_64.flatpak dist/
+
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: downmark-linux
+          path: dist/*.flatpak
+          if-no-files-found: error
+
+  # Collects every package on the draft release the macOS job started and
+  # publishes the final release.
+  release:
+    needs: [version, macos, windows, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      # Read release notes from CHANGELOG.md or fallback notes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: |
+            .github/release-notes
+            CHANGELOG.md
+          persist-credentials: false
+      - name: Extract release notes from CHANGELOG
+        id: changelog_reader
+        uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
+        continue-on-error: true
+        with:
+          version: ${{ needs.version.outputs.version }}
+          path: ./CHANGELOG.md
+          validation_level: warn
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          pattern: downmark-*
+          path: dist
+          merge-multiple: true
+      - name: Fetch the macOS disk image
+        run: gh release download "$TAG" --pattern '*.dmg' --dir dist
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt ./SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Attach the packages
+        run: gh release upload "$TAG" dist/* --clobber
+      - name: Publish the release
+        env:
+          CHANGELOG_NOTES: ${{ steps.changelog_reader.outputs.changes }}
+        run: |
+          notes_file=".github/release-notes/$TAG.md"
+          if [[ -n "$CHANGELOG_NOTES" ]]; then
+            printf '%s\n' "$CHANGELOG_NOTES" > /tmp/release-notes.md
+          elif [[ -f "$notes_file" ]]; then
+            cat "$notes_file" > /tmp/release-notes.md
+          else
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" \
+              -f target_commitish="$GITHUB_SHA" --jq .body > /tmp/release-notes.md
+          fi
+          prerelease=false
+          if [[ "$TAG" == *-* ]]; then prerelease=true; fi
+          gh release edit "$TAG" --draft=false --prerelease="$prerelease" \
+            --title "Downmark $VERSION" --notes-file /tmp/release-notes.md

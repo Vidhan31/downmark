@@ -1,0 +1,162 @@
+[package]
+name = "downmark"
+version = "1.0.0"
+edition = "2024"
+description = "Downmark — a fast, native Markdown viewer built with GPUI Kit."
+license = "Apache-2.0"
+repository = "https://github.com/Vidhan31/downmark"
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"          # each unsafe op needs its own unsafe block
+missing_debug_implementations = "warn"   # every public type implements Debug
+missing_docs = "warn"                    # [lib] document every public item
+unreachable_pub = "warn"                 # pub items that aren't actually exported
+rust_2018_idioms = { level = "warn", priority = -1 } # 2018-edition idioms, e.g. Formatter<'_>
+
+[lints.clippy]
+# Groups first, at lower priority so the individual settings below win.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Panics: return errors, and give every intentional panic a reason.
+unwrap_used = "warn"                     # use ?, or expect("why this cannot fail")
+expect_used = "allow"                    # expect with a reason is the sanctioned form
+panic_in_result_fn = "warn"              # a fn returning Result shouldn't also panic
+missing_panics_doc = "warn"              # [lib] document reachable panics under # Panics
+missing_errors_doc = "warn"              # [lib] document failures under # Errors
+
+# Suppressions must explain themselves and expire when no longer needed.
+allow_attributes = "warn"                # prefer #[expect] over #[allow] (needs rust-version 1.81+)
+allow_attributes_without_reason = "warn" # every suppression says why (needs rust-version 1.81+)
+
+# Unsafe must be justified.
+undocumented_unsafe_blocks = "warn"      # // SAFETY: comment on every unsafe block
+multiple_unsafe_ops_per_block = "warn"   # one unsafe operation per block
+
+# API shape.
+fn_params_excessive_bools = "warn"       # bool parameters: use an enum or two methods
+struct_excessive_bools = "warn"          # many bool fields: use an enum or bitflags
+clone_on_ref_ptr = "warn"                # write Rc::clone(&x) so cheap clones are visible
+redundant_clone = "warn"                 # a clone whose original is never used again
+rc_buffer = "warn"                       # Rc<String> / Rc<Vec<T>>: use Rc<str> / Rc<[T]>
+
+# Idioms.
+string_add = "warn"                      # build strings with format! or push_str, not +
+wildcard_imports = "warn"                # no glob imports (use super::* in tests is allowed)
+
+# Output and debugging leftovers.
+dbg_macro = "warn"
+todo = "warn"
+print_stdout = "warn"                    # [lib] libraries log, they don't print
+print_stderr = "warn"                    # [lib] libraries log, they don't print
+
+# Casts that silently lose information.
+as_conversions = "warn"                  # prefer From / TryFrom
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+# Pedantic lints that are mostly noise in practice, or that the skill disagrees with.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"               # a leaf module named after its main item is fine
+enum_glob_use = "allow"                  # use Enum::* inside a function that matches on it
+unsafe_derive_deserialize = "allow"      # GPUI's Action derive macro generates internal methods using unsafe
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+mimalloc = { version = "0.1", optional = true, default-features = false, features = ["no_thp"] }
+smol = "2"
+# GPUI Kit is the only UI dependency: it re-exports GPUI, GPUI Base and GPUI Component.
+gpui-kit = { version = "0.8.1", features = [
+    "tree-sitter",
+    "tree-sitter-markdown",
+    "tree-sitter-markdown-inline",
+    "tree-sitter-rust",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-tsx",
+    "tree-sitter-bash",
+    "tree-sitter-go",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-html",
+    "tree-sitter-css",
+    "tree-sitter-toml",
+    "tree-sitter-yaml",
+    "tree-sitter-java",
+    "tree-sitter-ruby",
+    "tree-sitter-diff",
+    "tree-sitter-swift",
+    "tree-sitter-kotlin",
+    "tree-sitter-zig",
+    "tree-sitter-lua",
+    "tree-sitter-csharp",
+    "tree-sitter-php",
+    "tree-sitter-scala",
+    "tree-sitter-elixir",
+    "tree-sitter-graphql",
+    "tree-sitter-make",
+    "tree-sitter-cmake",
+    "tree-sitter-proto",
+] }
+# Loads remote (http/https) images referenced by documents, e.g. README badges.
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.10" }
+# Same Markdown parser the preview uses; drives scroll-sync block indexing.
+markdown = "1.0.0"
+serde = { version = "1", features = ["derive"] }
+# Display width of table cells, so wide characters line up.
+unicode-width = "0.2"
+# Mermaid diagrams, parsed, laid out and drawn in pure Rust.
+merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "complete-svg"] }
+# Files the system asks Downmark to open arrive on another thread.
+futures = "0.3"
+url = "2"
+# The SVG renderer GPUI draws with: the diagram viewer draws the part of a
+# zoomed diagram in view with it, so it stays sharp.
+resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+fontdb = "0.23"
+# Math rendering, all pure Rust: LaTeX is translated to Typst math, laid out
+# by the Typst compiler with its bundled math fonts, and drawn as SVG.
+# LaTeX math → Typst math (Apache-2.0), without its command-line tool.
+tylax = { version = "0.3.8", default-features = false }
+typst = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
+comemo = "0.5"
+typst-layout = "0.15.1"
+typst-svg = "0.15.1"
+serde_json = "1"
+
+# "Default app for Markdown" in Settings.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.100"
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+
+[build-dependencies]
+# Windows only (build.rs checks the target): the exe's icon and version info.
+winresource = { version = "0.1.34", default-features = false }
+
+[dev-dependencies]
+gpui-kit = { version = "0.8.1", features = ["test-support"] }
+
+# Dependencies are large (GPUI, tree-sitter grammars, Typst); full debug info
+# for them makes every test binary hundreds of megabytes.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

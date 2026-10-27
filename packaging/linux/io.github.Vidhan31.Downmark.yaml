@@ -1,0 +1,49 @@
+app-id: io.github.Vidhan31.Downmark
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: downmark
+
+finish-args:
+  # Wayland display and fallback to X11 with shared IPC
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Hardware-accelerated GPU rendering (Vulkan)
+  - --device=dri
+  # Loading remote images and badges in Markdown preview
+  - --share=network
+  # Markdown document editing, relative images, and workspace folders
+  - --filesystem=home
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/downmark/cargo
+    CARGO_NET_OFFLINE: "true"
+
+modules:
+  - name: downmark
+    buildsystem: simple
+    build-commands:
+      # Use pre-downloaded crate sources from cargo-sources.json
+      - install -Dm0644 cargo/config .cargo/config.toml
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo build --offline --release
+      # Install binary
+      - install -Dm0755 target/release/downmark ${FLATPAK_DEST}/bin/downmark
+      # Install desktop integration and AppStream metainfo
+      - install -Dm0644 packaging/linux/io.github.Vidhan31.Downmark.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm0644 packaging/linux/io.github.Vidhan31.Downmark.metainfo.xml ${FLATPAK_DEST}/share/metainfo/${FLATPAK_ID}.metainfo.xml
+      # Install scalable SVG icon
+      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.github.Vidhan31.Downmark.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+      # Install PNG icons for standard resolutions
+      - for s in 16 24 32 48 64 128 256 512; do install -Dm0644 packaging/linux/icons/hicolor/${s}x${s}/apps/io.github.Vidhan31.Downmark.png ${FLATPAK_DEST}/share/icons/hicolor/${s}x${s}/apps/${FLATPAK_ID}.png; done
+      # Install license files per Flathub requirements
+      - install -Dm0644 LICENSE ${FLATPAK_DEST}/share/licenses/${FLATPAK_ID}/LICENSE
+    sources:
+      - type: dir
+        path: ../../
+      - cargo-sources.json

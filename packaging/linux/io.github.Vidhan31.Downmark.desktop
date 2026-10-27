@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Downmark
+GenericName=Markdown Editor
+Comment=Write and preview Markdown
+Keywords=markdown;md;editor;preview;text;
+Exec=downmark %F
+Icon=io.github.Vidhan31.Downmark
+Terminal=false
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+StartupWMClass=io.github.Vidhan31.Downmark

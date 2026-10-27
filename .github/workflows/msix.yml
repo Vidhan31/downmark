@@ -1,0 +1,122 @@
+name: MSIX
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msix:
+    name: Build Windows MSIX
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+      HAS_SIGNING: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' && vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          $version = (Get-Content Cargo.toml | Select-String -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $version) {
+            throw "Could not determine version from Cargo.toml"
+          }
+          Write-Host "Resolved version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msix-release
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage Downmark.exe
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/downmark.exe dist/Downmark.exe
+
+      - name: Sign in to Azure
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Downmark.exe
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\Downmark.exe
+          description: Downmark
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Build MSIX package
+        run: |
+          $dist = (Resolve-Path dist).Path
+          $packageName = if ('${{ vars.MSIX_PACKAGE_NAME }}') { '${{ vars.MSIX_PACKAGE_NAME }}' } else { 'Downmark' }
+          $publisher = if ('${{ vars.MSIX_PUBLISHER }}') { '${{ vars.MSIX_PUBLISHER }}' } else { 'CN=Downmark' }
+          $displayName = if ('${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}') { '${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}' } else { 'Downmark Contributors' }
+          $signSelfSigned = ($env:HAS_SIGNING -ne 'true')
+
+          & packaging/windows/build-msix.ps1 `
+            -Version "${{ steps.version.outputs.version }}" `
+            -SourceExe "$dist\Downmark.exe" `
+            -OutputDir $dist `
+            -PackageName $packageName `
+            -Publisher $publisher `
+            -PublisherDisplayName $displayName `
+            -SignSelfSigned:$signSelfSigned
+
+      - name: Sign MSIX package
+        if: env.HAS_SIGNING == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\dist\Downmark-${{ steps.version.outputs.version }}-windows-x64.msix
+          description: Downmark MSIX package
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-azure-cli-credential: false
+
+      - name: Upload MSIX Artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: Downmark-${{ steps.version.outputs.version }}-windows-msix
+          path: |
+            dist/*.msix
+            dist/*.cer
+          if-no-files-found: error
