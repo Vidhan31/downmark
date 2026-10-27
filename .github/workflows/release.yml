@@ -390,7 +390,6 @@ jobs:
           path: |
             dist/*.zip
             dist/*.msix
-            dist/*.cer
           if-no-files-found: error
 
   linux:

@@ -118,5 +118,4 @@ jobs:
           name: Downmark-${{ steps.version.outputs.version }}-windows-msix
           path: |
             dist/*.msix
-            dist/*.cer
           if-no-files-found: error
