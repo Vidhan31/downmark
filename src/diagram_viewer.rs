@@ -175,7 +175,6 @@ impl DiagramViewer {
     fn new(source: String, title: String, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        // Redraw in the new colors when the theme changes.
         let theme_subscription = cx.observe_global_in::<Theme>(window, |this, _, cx| {
             this.draw(cx);
         });
@@ -377,12 +376,10 @@ impl DiagramViewer {
                 Some(event.position),
                 cx,
             ),
-            // Holding Command or Control turns trackpad scrolling into zoom.
             ScrollDelta::Pixels(delta) if event.modifiers.secondary(cx) => {
                 let factor = (f32::from(delta.y) / 200.).exp();
                 self.zoom_by(factor, Some(event.position), cx);
             }
-            // Otherwise trackpads move the diagram around.
             ScrollDelta::Pixels(_) => {
                 let delta = event.delta.pixel_delta(window.line_height());
                 self.pan(f32::from(delta.x), f32::from(delta.y), cx);
@@ -402,7 +399,6 @@ impl DiagramViewer {
     ) {
         self.focus_handle.focus(window, cx);
         if event.click_count == 2 {
-            // Double-click zooms in on that spot, or back out to fit.
             self.drag = None;
             if self.fitted {
                 self.zoom_by(2., Some(event.position), cx);

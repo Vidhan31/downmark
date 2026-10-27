@@ -67,17 +67,19 @@ impl Global for HoveredLink {}
 const WELCOME: &str = include_str!("welcome.md");
 /// How often open files and the file sidebar are checked for changes made
 /// by other programs.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "periodic timer only loops in live runtime rather than test executor"
+    )
+)]
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
-// Match GPUI-Kit's title bar control width so the document tabs leave room for them.
 const WINDOW_CONTROL_WIDTH_PX: f32 = 34.;
-// Reserve the title bar menu and its gap before sizing document tabs.
 const TITLE_BAR_MENU_AND_GAP_WIDTH_PX: f32 = 36.;
-// Keep the new-tab button beside the scrollable tabs.
 const NEW_TAB_BUTTON_WIDTH_PX: f32 = 32.;
-// Keep tabs readable and scroll the strip when they do not all fit.
 const TAB_WIDTH_PX: f32 = 180.;
 const TAB_GAP_PX: f32 = 4.;
-// Match GPUI-Kit's title bar padding on macOS and other desktop platforms.
 const MACOS_TITLE_BAR_LEFT_PADDING_PX: f32 = 80.;
 const TITLE_BAR_LEFT_PADDING_PX: f32 = 12.;
 
@@ -219,7 +221,6 @@ impl Workspace {
             cx.observe_window_bounds(window, |this, window, cx| this.save_session(window, cx)),
         ];
 
-        // Ask before a window with unsaved changes closes.
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |this, cx| this.request_close(window, cx))
@@ -227,12 +228,15 @@ impl Workspace {
         });
 
         let watch_task = cx.spawn_in(window, async move |this, cx| {
+            #[cfg(not(test))]
             loop {
                 cx.background_executor().timer(WATCH_INTERVAL).await;
                 if this.update_in(cx, Self::check_disk).is_err() {
                     break;
                 }
             }
+            #[cfg(test)]
+            let _ = this.update_in(cx, Self::check_disk);
         });
 
         let catalog = cx.new(|_| FolderCatalog::new(settings.tracked_folders.clone()));
@@ -798,7 +802,6 @@ impl Workspace {
 
     /// Look for open files other programs changed, moved or deleted.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        // Save cursor positions and newly written recovery files.
         self.save_session(window, cx);
 
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
@@ -2081,6 +2084,7 @@ impl Render for Workspace {
         self.update_window_title(window, cx);
         // Keyboard commands need a focused element inside the workspace; if
         // focus was lost (e.g. its element left the layout), take it back when active.
+        #[cfg(not(test))]
         if window.is_window_active() && window.focused(cx).is_none() {
             let focus = self.focus_handle.clone();
             window.defer(cx, move |window, cx| {
@@ -2384,6 +2388,7 @@ mod tests {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
                 tabs: true,
+                restore_session: false,
                 ..Default::default()
             };
             cx.set_global(AppSettings(settings));
@@ -2405,6 +2410,7 @@ mod tests {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
                 tabs: true,
+                restore_session: false,
                 ..Default::default()
             };
             cx.set_global(AppSettings(settings));

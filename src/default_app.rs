@@ -223,7 +223,6 @@ mod platform {
             .create(r"Software\RegisteredApplications")?
             .set_string(APP_NAME, format!(r"Software\{APP_NAME}\Capabilities"))?;
 
-        // Tell Explorer the associations changed.
         // SAFETY: SHCNE_ASSOCCHANGED takes no items.
         unsafe {
             windows_sys::Win32::UI::Shell::SHChangeNotify(

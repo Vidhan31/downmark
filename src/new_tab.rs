@@ -263,7 +263,6 @@ impl Render for NewTabView {
         let total_folders = tracked_folders.len();
         let total_files = catalog.total_files();
 
-        // 1. Last accessed files in app
         let recent_paths = &AppSettings::get(cx).recent_files;
         let recent_entries: Vec<WorkspaceFileEntry> = catalog
             .get_recent_accessed_entries(recent_paths)
@@ -271,7 +270,6 @@ impl Render for NewTabView {
             .take(6)
             .collect();
 
-        // 2. Last modified files (up to 8)
         let last_modified: Vec<WorkspaceFileEntry> = catalog
             .sorted_modified_files()
             .iter()
@@ -279,7 +277,6 @@ impl Render for NewTabView {
             .cloned()
             .collect();
 
-        // 3. Filtered all files
         let (filtered_files, matched_count) =
             catalog.filter_files(&self.filter_query, self.selected_folder.as_deref());
 
@@ -375,7 +372,6 @@ impl Render for NewTabView {
                     .max_w(px(980.))
                     .mx_auto()
                     .gap_7()
-                    // Header Bar
                     .child(
                         h_flex()
                             .justify_between()
@@ -456,7 +452,6 @@ impl Render for NewTabView {
                                     }),
                             ),
                     )
-                    // Section 1: Last accessed files in app
                     .when(!recent_entries.is_empty(), |page| {
                         page.child(
                             v_flex()
@@ -487,7 +482,6 @@ impl Render for NewTabView {
                                 .child(Self::render_file_grid(&recent_entries, "recent", None, cx)),
                         )
                     })
-                    // If no folders are tracked yet: Folder Empty State
                     .when(total_folders == 0, |page| {
                         page.child(
                             v_flex()
@@ -542,12 +536,10 @@ impl Render for NewTabView {
                                 ),
                         )
                     })
-                    // When folders are tracked: Section 2 & Section 3
                     .when(total_folders > 0, |page| {
                         page.child(
                             v_flex()
                                 .gap_7()
-                                // Section 2: Last modified files
                                 .when(!last_modified.is_empty() && !has_filter, |s2| {
                                     s2.child(
                                         v_flex()
@@ -578,7 +570,6 @@ impl Render for NewTabView {
                                             .child(Self::render_file_grid(&last_modified, "modified", None, cx)),
                                     )
                                 })
-                                // Section 3: List of all files
                                 .child(
                                     v_flex()
                                         .gap_4()
@@ -614,7 +605,6 @@ impl Render for NewTabView {
                                                         ),
                                                 ),
                                         )
-                                        // Filter bar
                                         .child(
                                             h_flex()
                                                 .gap_3()
@@ -625,7 +615,6 @@ impl Render for NewTabView {
                                                         .child(Input::new(&self.filter_input).cleanable(true)),
                                                 ),
                                         )
-                                        // Folder chips when multiple folders are tracked
                                         .when(total_folders > 1, |list| {
                                             list.child(
                                                 h_flex()
@@ -733,7 +722,6 @@ impl Render for NewTabView {
                                                     })),
                                             )
                                         })
-                                        // All files list or empty search message
                                         .when(!filtered_files.is_empty(), |list| {
                                             list.child(Self::render_file_grid(&filtered_files, "all", self.selected_card_index, cx))
                                         })

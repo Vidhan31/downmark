@@ -232,7 +232,6 @@ impl DocumentView {
                     _ => {}
                 },
             ),
-            // The editor notifies when it scrolls or its caret moves.
             cx.observe(&editor, |this, editor, cx| {
                 this.last_cursor = editor.read(cx).cursor();
                 this.sync_preview(false, cx);
@@ -1180,7 +1179,6 @@ impl DocumentView {
             return;
         };
         if Self::shows_editor(cx) {
-            // The editor places the heading exactly; the preview follows it.
             self.set_scroll_driver(ScrollDriver::Editor);
             self.editor.update(cx, |editor, cx| {
                 editor.set_cursor_position(

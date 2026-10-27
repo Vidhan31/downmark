@@ -465,7 +465,6 @@ fn renumbered(
     let block = list_block(new, &lines, changed_start, changed_end);
     let numbers = renumber(new, &lines, block.clone());
 
-    // Nothing to renumber: the plain edit.
     if numbers.is_empty() {
         return Edit {
             range: edited,

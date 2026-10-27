@@ -130,7 +130,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
     let workspace = Some(WORKSPACE_CONTEXT);
     let document = Some(DOCUMENT_CONTEXT);
     let preview = Some(PREVIEW_CONTEXT);
-    // `secondary` is Command on macOS and Control elsewhere.
     cx.bind_keys([
         key_binding("secondary-n", NewFile, None),
         key_binding("secondary-t", NewTab, None),

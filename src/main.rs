@@ -1,6 +1,5 @@
 //! Downmark — a fast, native Markdown editor and previewer.
 
-// Keep release builds on Windows from opening a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 #[cfg(feature = "mimalloc")]
@@ -257,7 +256,6 @@ mod tests {
 
     #[test]
     fn test_trim_allocator_memory() {
-        // Trimming allocator memory should execute cleanly without panicking.
         trim_allocator_memory();
     }
 }
