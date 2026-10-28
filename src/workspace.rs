@@ -585,7 +585,10 @@ impl Workspace {
             let result = task.await;
             _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(loaded) => {
-                    AppSettings::update(cx, |settings| settings.push_recent(&path));
+                    AppSettings::update(cx, |settings| {
+                        settings.push_recent(&path);
+                        settings.layout = Layout::Preview;
+                    });
                     let doc = cx.new(|cx| {
                         DocumentView::new(
                             loaded.text,
@@ -628,6 +631,7 @@ impl Workspace {
     }
 
     fn new_document(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        AppSettings::update(cx, |settings| settings.layout = Layout::Preview);
         let doc = cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
         let tab = WorkspaceTab::Document(doc);
         if AppSettings::get(cx).tabs {
@@ -2490,6 +2494,28 @@ mod tests {
             assert_eq!(ws.tabs.len(), 2);
             assert_eq!(ws.active, 1);
             assert!(matches!(ws.tabs[1], WorkspaceTab::NewTab(_)));
+            ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn new_document_defaults_to_preview_mode(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Split,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Split);
+
+            ws.new_document(window, cx);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
             ws
         });
         let _ = workspace;

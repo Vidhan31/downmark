@@ -64,6 +64,9 @@ pub(crate) struct Settings {
     pub(crate) font_family: Option<String>,
     /// Preferred monospace font family for editor and code blocks; `None` is the system default.
     pub(crate) mono_font_family: Option<String>,
+    /// Which panes the workspace shows. Not persisted so opening files
+    /// always starts in preview mode.
+    #[serde(skip)]
     pub(crate) layout: Layout,
     pub(crate) soft_wrap: bool,
     pub(crate) line_numbers: bool,
@@ -122,6 +125,7 @@ impl Settings {
             .and_then(|json| serde_json::from_str::<Settings>(&json).ok())
             .unwrap_or_default();
         settings.font_size = clamp_font_size(settings.font_size);
+        settings.layout = Layout::Preview;
         settings.recent_files.truncate(RECENT_LIMIT);
         settings.tracked_folders.retain(|dir| dir.is_dir());
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
@@ -209,6 +213,14 @@ mod tests {
         assert!(settings.restore_session);
         assert_eq!(settings.open_links_in, LinkPlacement::NewTab);
         assert!(settings.confirm_web_links);
+    }
+
+    #[test]
+    fn layout_is_not_persisted_and_defaults_to_preview() {
+        let settings: Settings = serde_json::from_str(r#"{ "layout": "split" }"#).unwrap();
+        assert_eq!(settings.layout, Layout::Preview);
+        let serialized = serde_json::to_string(&settings).unwrap();
+        assert!(!serialized.contains("layout"));
     }
 
     #[test]
