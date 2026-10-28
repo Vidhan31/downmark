@@ -11,7 +11,7 @@ Downmark is a fast, native Markdown editor and previewer built with GPUI for Lin
 - Inline and display LaTeX math equations rendered with Typst.
 - Syntax highlighting for 28 languages with code block copy buttons.
 - GitHub alert callouts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
-- Distraction-free focus mode and bundled light and dark themes.
+- Bundled light and dark themes.
 
 ## Screenshots
 

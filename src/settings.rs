@@ -84,11 +84,6 @@ pub(crate) struct Settings {
     pub(crate) open_links_in: LinkPlacement,
     /// Ask before opening a web link in the browser.
     pub(crate) confirm_web_links: bool,
-
-    /// Hide everything but the text, dimming all but the current paragraph.
-    /// Lasts until turned off or Downmark quits.
-    #[serde(skip)]
-    pub(crate) focus_mode: bool,
 }
 
 impl Default for Settings {
@@ -100,18 +95,17 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             font_family: None,
             mono_font_family: None,
-            layout: Layout::Split,
+            layout: Layout::Preview,
             soft_wrap: true,
             line_numbers: true,
             scroll_sync: true,
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
-            tabs: false,
+            tabs: true,
             restore_session: true,
             image_folder: "assets".to_string(),
             open_links_in: LinkPlacement::NewTab,
             confirm_web_links: true,
-            focus_mode: false,
         }
     }
 }
@@ -209,8 +203,7 @@ mod tests {
         assert_eq!(settings.font_size, DEFAULT_FONT_SIZE);
         assert_eq!(settings.font_family, None);
         assert_eq!(settings.mono_font_family, None);
-        // Optional features start off; session restore starts on.
-        assert!(!settings.tabs);
+        assert!(settings.tabs);
         assert!(settings.restore_session);
         assert_eq!(settings.open_links_in, LinkPlacement::NewTab);
         assert!(settings.confirm_web_links);

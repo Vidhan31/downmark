@@ -29,7 +29,6 @@ actions!(
         ToggleLineNumbers,
         ToggleAppearance,
         ToggleTabs,
-        ToggleFocusMode,
         ToggleRestoreSession,
         OpenSettings,
         TidyTable,
@@ -148,7 +147,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
         key_binding("ctrl-pagedown", NextTab, workspace),
         #[cfg(not(target_os = "macos"))]
         key_binding("ctrl-pageup", PreviousTab, workspace),
-        key_binding("secondary-shift-f", ToggleFocusMode, workspace),
         key_binding("secondary-,", OpenSettings, None),
         key_binding("secondary-q", Quit, None),
         key_binding("secondary-1", SetLayout(Layout::Editor), workspace),

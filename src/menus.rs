@@ -18,7 +18,7 @@ use crate::{
         About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, FindInPreview, GoToHeading,
         Heading, InlineCode, InsertLink, Italic, NewFile, NewTab, NumberedList, Open,
         OpenMarkdownGuide, OpenRecent, OpenSettings, Quit, Quote, RevealInFolder, Save, SaveAs,
-        SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList, TidyTable, ToggleFocusMode,
+        SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList, TidyTable,
         ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap, ToggleTabs, ZoomIn, ZoomOut,
         ZoomReset,
     },
@@ -186,7 +186,6 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
             .checked(settings.layout == Layout::Split),
         MenuItem::action("Preview", SetLayout(Layout::Preview))
             .checked(settings.layout == Layout::Preview),
-        MenuItem::action("Focus mode", ToggleFocusMode).checked(settings.focus_mode),
         MenuItem::separator(),
         MenuItem::action("Tabs", ToggleTabs).checked(settings.tabs),
         MenuItem::action("Go to heading…", GoToHeading),
@@ -273,7 +272,10 @@ mod tests {
                     _ => String::new(),
                 })
                 .collect();
-            assert_eq!(checked, ["Preview", "Sync scrolling", "Line numbers"]);
+            assert_eq!(
+                checked,
+                ["Preview", "Tabs", "Sync scrolling", "Line numbers"]
+            );
         });
     }
 

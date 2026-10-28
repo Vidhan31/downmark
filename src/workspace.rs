@@ -11,7 +11,7 @@ use std::{
 };
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle, Focusable,
+    Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle, Focusable,
     FontWeight, Global, InteractiveElement as _, IntoElement, Menu, MouseButton, OwnedMenu,
     OwnedMenuItem, ParentElement as _, PathPromptOptions, Render, ScrollEvent, ScrollHandle,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
@@ -39,7 +39,7 @@ use crate::{
     actions::{
         About, ActivateTab, CloseDocument, CloseWindow, FindInPreview, FollowLink, GoToHeading,
         NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab, Quit,
-        RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleFocusMode,
+        RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance,
         ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
         ToggleTabs, ViewDiagram, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
     },
@@ -163,7 +163,7 @@ impl WorkspaceTab {
         match self {
             Self::Document(doc) => {
                 let doc = doc.read(cx);
-                if AppSettings::get(cx).layout.shows_editor() || AppSettings::get(cx).focus_mode {
+                if AppSettings::get(cx).layout.shows_editor() {
                     doc.editor().focus_handle(cx)
                 } else {
                     doc.preview().read(cx).focus_handle().clone()
@@ -1447,9 +1447,7 @@ impl Workspace {
             self.open_paths(documents, window, cx);
             return;
         }
-        if (AppSettings::get(cx).layout.shows_editor() || AppSettings::get(cx).focus_mode)
-            && let Some(doc) = self.active_document()
-        {
+        if AppSettings::get(cx).layout.shows_editor() && let Some(doc) = self.active_document() {
             let paths = paths.paths().to_vec();
             doc.update(cx, |doc, cx| doc.drop_images(&paths, window, cx));
             return;
@@ -1461,18 +1459,7 @@ impl Workspace {
         let layout = action.0;
         AppSettings::update(cx, |settings| {
             settings.layout = layout;
-            settings.focus_mode = false;
         });
-        self.focus_active(window, cx);
-    }
-
-    fn toggle_focus_mode(
-        &mut self,
-        _: &ToggleFocusMode,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.toggle(|settings| settings.focus_mode = !settings.focus_mode, cx);
         self.focus_active(window, cx);
     }
 
@@ -1652,42 +1639,6 @@ impl Workspace {
             .dropdown_menu(move |menu, window, cx| {
                 let action_context = action_context.clone();
                 let mut menu = menu.action_context(action_context.clone());
-
-                let settings = AppSettings::get(cx);
-                let layout = settings.layout;
-                let is_dark = cx.theme().is_dark();
-
-                menu = menu
-                    .menu_with_check(
-                        "Editor",
-                        layout == Layout::Editor,
-                        Box::new(SetLayout(Layout::Editor)),
-                    )
-                    .menu_with_check(
-                        "Editor and preview",
-                        layout == Layout::Split,
-                        Box::new(SetLayout(Layout::Split)),
-                    )
-                    .menu_with_check(
-                        "Preview",
-                        layout == Layout::Preview,
-                        Box::new(SetLayout(Layout::Preview)),
-                    )
-                    .separator()
-                    .menu_with_icon(
-                        if is_dark {
-                            "Use light appearance"
-                        } else {
-                            "Use dark appearance"
-                        },
-                        Icon::new(if is_dark {
-                            IconName::Sun
-                        } else {
-                            IconName::Moon
-                        }),
-                        Box::new(ToggleAppearance),
-                    )
-                    .separator();
 
                 let menus: Vec<OwnedMenu> = crate::menus::build(cx)
                     .into_iter()
@@ -1965,18 +1916,22 @@ impl Workspace {
                     .w_full()
                     .role(gpui_kit::Role::Status)
                     .aria_label("Status bar")
-                    .child(StatusBar::new().left(h_flex().gap_4().child(item(
-                        if total_folders == 0 {
-                            "Home — No tracked folders".to_string()
-                        } else {
-                            format!(
-                                "Home — {} markdown files across {} folder{}",
-                                total_files,
-                                total_folders,
-                                if total_folders > 1 { "s" } else { "" }
-                            )
-                        },
-                    ))));
+                    .child(
+                        StatusBar::new()
+                            .left(h_flex().gap_4().child(item(
+                                if total_folders == 0 {
+                                    "Home — No tracked folders".to_string()
+                                } else {
+                                    format!(
+                                        "Home — {} markdown files across {} folder{}",
+                                        total_files,
+                                        total_folders,
+                                        if total_folders > 1 { "s" } else { "" }
+                                    )
+                                },
+                            )))
+                            .right(self.render_layout_button(cx)),
+                    );
             }
             WorkspaceTab::Document(doc) => {
                 let doc = doc.read(cx);
@@ -2041,6 +1996,7 @@ impl Workspace {
                 StatusBar::new().left(left_section).right(
                     h_flex()
                         .gap_4()
+                        .items_center()
                         .when(settings.layout.shows_editor(), |this| {
                             this.child(item(if editor_selection.is_empty() {
                                 format!(
@@ -2058,9 +2014,56 @@ impl Workspace {
                             }))
                         })
                         .child(item(line_ending.label().to_string()))
-                        .child(item("Markdown".to_string())),
+                        .child(item("Markdown".to_string()))
+                        .child(self.render_layout_button(cx)),
                 ),
             )
+    }
+
+    fn render_layout_button(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let layout = AppSettings::get(cx).layout;
+        let action_context = self.active_tab_focus_handle(cx);
+
+        let icon = match layout {
+            Layout::Preview => IconName::Eye,
+            Layout::Split => IconName::Columns2,
+            Layout::Editor => IconName::PenLine,
+        };
+
+        let tooltip = match layout {
+            Layout::Preview => "Layout: Preview",
+            Layout::Split => "Layout: Editor and preview",
+            Layout::Editor => "Layout: Editor",
+        };
+
+        Button::new("layout-toggle-button")
+            .accessibility_label("Switch layout")
+            .ghost()
+            .small()
+            .compact()
+            .icon(Icon::new(icon))
+            .tooltip(tooltip)
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _window, cx| {
+                let action_context = action_context.clone();
+                let menu = menu.action_context(action_context);
+                let current_layout = AppSettings::get(cx).layout;
+
+                menu.menu_with_check(
+                    "Editor",
+                    current_layout == Layout::Editor,
+                    Box::new(SetLayout(Layout::Editor)),
+                )
+                .menu_with_check(
+                    "Editor and preview",
+                    current_layout == Layout::Split,
+                    Box::new(SetLayout(Layout::Split)),
+                )
+                .menu_with_check(
+                    "Preview",
+                    current_layout == Layout::Preview,
+                    Box::new(SetLayout(Layout::Preview)),
+                )
+            })
     }
 }
 
@@ -2134,7 +2137,6 @@ impl Render for Workspace {
                 }
             });
         }
-        let focus_mode = AppSettings::get(cx).focus_mode;
         let main = match self.active_tab() {
             WorkspaceTab::Document(doc) => div().size_full().child(doc.clone()),
             WorkspaceTab::NewTab(new_tab) => div().size_full().child(new_tab.clone()),
@@ -2162,7 +2164,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::set_layout))
             .on_action(cx.listener(Self::go_to_heading))
             .on_action(cx.listener(Self::toggle_appearance))
-            .on_action(cx.listener(Self::toggle_focus_mode))
             .on_action(cx.listener(Self::toggle_pane_focus))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
@@ -2214,9 +2215,6 @@ impl Render for Workspace {
                             doc.close_search(window, cx);
                         });
                     }
-                } else if AppSettings::get(cx).focus_mode {
-                    this.toggle(|settings| settings.focus_mode = false, cx);
-                    this.focus_active(window, cx);
                 } else {
                     cx.propagate();
                 }
@@ -2255,7 +2253,7 @@ impl Render for Workspace {
                     .child(self.render_title_bar(window, cx)),
             )
             .child(div().flex_1().min_h_0().overflow_hidden().child(main))
-            .when(!focus_mode, |this| this.child(self.render_status_bar(cx)))
+            .child(self.render_status_bar(cx))
     }
 }
 

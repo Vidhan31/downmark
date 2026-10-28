@@ -58,7 +58,7 @@ flowchart LR
 
 Drop a Markdown file onto the window to open it, or paste an image to save it next to your document. Zoom with **Ctrl+=** and **Ctrl+-**, switch between light and dark with **Ctrl+Shift+L**, and pick a theme from the **View** menu.
 
-Want more? Turn on tabs in **Settings** (**Ctrl+,**), or write undisturbed in focus mode (**Ctrl+Shift+F**).
+Want more? Customize preferences in **Settings** (**Ctrl+,**).
 
 ---
 

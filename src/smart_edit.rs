@@ -964,32 +964,6 @@ pub(crate) fn image_markdown(text: &str, offset: usize, relative_path: &str, alt
     )
 }
 
-/// The paragraph (run of non-blank lines) around `offset`.
-pub(crate) fn paragraph_at(text: &str, offset: usize) -> Range<usize> {
-    let offset = floor_char_boundary(text, offset);
-    let mut start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
-    while start > 0 {
-        let previous = text[..start - 1].rfind('\n').map_or(0, |ix| ix + 1);
-        if text[previous..start - 1].trim().is_empty() {
-            break;
-        }
-        start = previous;
-    }
-    let mut end = text[offset..]
-        .find('\n')
-        .map_or(text.len(), |ix| offset + ix);
-    while end < text.len() {
-        let next_end = text[end + 1..]
-            .find('\n')
-            .map_or(text.len(), |ix| end + 1 + ix);
-        if text[end + 1..next_end].trim().is_empty() {
-            break;
-        }
-        end = next_end;
-    }
-    start..end
-}
-
 pub(crate) fn floor_char_boundary(text: &str, offset: usize) -> usize {
     let mut offset = offset.min(text.len());
     while !text.is_char_boundary(offset) {
@@ -1174,13 +1148,5 @@ mod tests {
         // Right under a paragraph, a blank line keeps it apart.
         assert_eq!(image_markdown("text\n", 5, "a.png", ""), "\n![](a.png)");
         assert_eq!(image_markdown("text\n\n", 6, "a.png", ""), "![](a.png)");
-    }
-
-    #[test]
-    fn finds_the_paragraph_around_the_caret() {
-        let text = "one\n\ntwo\nlines\n\nthree";
-        assert_eq!(&text[paragraph_at(text, 6)], "two\nlines");
-        assert_eq!(&text[paragraph_at(text, 0)], "one");
-        assert_eq!(&text[paragraph_at(text, text.len())], "three");
     }
 }

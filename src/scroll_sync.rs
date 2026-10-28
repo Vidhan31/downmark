@@ -80,7 +80,7 @@ impl ScrollSynchronizer {
 
     pub(crate) fn syncs_scrolling(cx: &App) -> bool {
         let settings = AppSettings::get(cx);
-        settings.scroll_sync && settings.layout == Layout::Split && !settings.focus_mode
+        settings.scroll_sync && settings.layout == Layout::Split
     }
 
     /// Scroll the preview to the block at the top of the editor.

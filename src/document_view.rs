@@ -11,10 +11,9 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    Focusable as _, HighlightStyle, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
-    MouseButton, MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache,
-    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    Window,
+    Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
+    MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache, ScrollEvent,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     assets::IconName,
     base::{TextView, TextViewState},
     component::{
@@ -24,8 +23,7 @@ use gpui_kit::{
         h_flex,
         input::{
             Copy, Cut, Editor, EditorState, Enter, Escape, IndentInline, InputEvent, InputState,
-            OutdentInline, Paste, Search, SelectAll, TabSize, TextDecoration,
-            TextDecorationCollection,
+            OutdentInline, Paste, Search, SelectAll, TabSize,
         },
         native_menu::NativeMenu,
         resizable::{h_resizable, resizable_panel},
@@ -73,8 +71,6 @@ pub(crate) enum DebouncePolicy {
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How long typing must pause before unsaved changes are written aside.
 const RECOVERY_DEBOUNCE: Duration = Duration::from_secs(1);
-/// How much of the text outside the current paragraph fades in focus mode.
-const FOCUS_FADE: f32 = 0.7;
 
 /// Something the workspace shows or acts on changed.
 pub(crate) enum DocumentEvent {
@@ -165,9 +161,6 @@ pub(crate) struct DocumentView {
     /// The caret as of the editor's last change, for code that runs while
     /// the editor is busy (its context menu).
     last_cursor: usize,
-    focus_decorations: Option<TextDecorationCollection>,
-    /// The paragraph left undimmed in focus mode.
-    focus_block: Option<Range<usize>>,
 
     smooth_scroll: SmoothScrollController,
 
@@ -235,7 +228,6 @@ impl DocumentView {
             cx.observe(&editor, |this, editor, cx| {
                 this.last_cursor = editor.read(cx).cursor();
                 this.sync_preview(false, cx);
-                this.update_focus_dimming(cx);
             }),
             // A re-parse can rebuild the preview's rows, which resets its
             // scroll position; realign once the new rows exist.
@@ -281,8 +273,6 @@ impl DocumentView {
             recovery_written: false,
             recovery_task: None,
             last_cursor: 0,
-            focus_decorations: None,
-            focus_block: None,
             smooth_scroll: SmoothScrollController::new(),
             scroll_sync: ScrollSynchronizer::new(),
             editor_width: px(0.),
@@ -733,7 +723,6 @@ impl DocumentView {
         self.dirty = true;
         self.set_scroll_driver(ScrollDriver::Editor);
         self.revision += 1;
-        self.focus_block = None;
         self.expanded_table = None;
         self.search.invalidate_cache();
         self.schedule_preview(policy, cx);
@@ -871,15 +860,13 @@ impl DocumentView {
         let settings = AppSettings::get(cx).clone();
         self.editor.update(cx, |editor, cx| {
             editor.set_soft_wrap(settings.soft_wrap, window, cx);
-            editor.set_line_number(settings.line_numbers && !settings.focus_mode, window, cx);
-            editor.set_folding(!settings.focus_mode, window, cx);
+            editor.set_line_number(settings.line_numbers, window, cx);
+            editor.set_folding(true, window, cx);
         });
         self.preview_style = make_preview_style(cx);
         if settings.layout == Layout::Preview {
             self.flush_preview(cx);
         }
-        self.focus_block = None;
-        self.update_focus_dimming(cx);
     }
 
     /// The editor's context menu: standard edit commands.
@@ -891,49 +878,9 @@ impl DocumentView {
             .menu("Select all", Box::new(SelectAll))
     }
 
-    /// In focus mode, fade everything but the paragraph with the caret.
-    fn update_focus_dimming(&mut self, cx: &mut Context<'_, Self>) {
-        let focus_mode = AppSettings::get(cx).focus_mode;
-        if !focus_mode {
-            if let Some(decorations) = self.focus_decorations.take() {
-                decorations.clear(cx);
-            }
-            self.focus_block = None;
-            return;
-        }
-        let cursor = self.cursor(cx);
-        if self
-            .focus_block
-            .as_ref()
-            .is_some_and(|block| block.start <= cursor && cursor <= block.end)
-        {
-            return;
-        }
-        let block = smart_edit::paragraph_at(&self.source, cursor);
-        let len = self.source.len();
-        let fade = HighlightStyle {
-            fade_out: Some(FOCUS_FADE),
-            ..HighlightStyle::default()
-        };
-        let decorations: Vec<TextDecoration> = [0..block.start, block.end..len]
-            .into_iter()
-            .filter(|range| !range.is_empty())
-            .map(|range| TextDecoration::new(range, fade))
-            .collect();
-        self.focus_block = Some(block);
-        if let Some(collection) = &self.focus_decorations {
-            collection.set(decorations, cx);
-        } else {
-            let collection = self.editor.update(cx, |editor, cx| {
-                editor.create_decorations_collection(decorations, cx)
-            });
-            self.focus_decorations = Some(collection);
-        }
-    }
-
     fn shows_editor(cx: &App) -> bool {
         let settings = AppSettings::get(cx);
-        settings.focus_mode || settings.layout.shows_editor()
+        settings.layout.shows_editor()
     }
 
     fn apply(&mut self, edit: Edit, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1240,7 +1187,6 @@ impl DocumentView {
     fn render_editor(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let document = cx.weak_entity();
         let inset = column_inset(self.pane_width(self.editor_width, window, cx), cx);
-        let focus_mode = AppSettings::get(cx).focus_mode;
         let (menu_document, paste_document) = (document.clone(), document.clone());
         div()
             .id("editor-pane")
@@ -1313,13 +1259,13 @@ impl DocumentView {
             .child(
                 Editor::new(&self.editor)
                     .h_full()
-                    .text_size(rems(if focus_mode { 1. } else { 0.875 }))
-                    .line_height(rems(if focus_mode { 1.75 } else { 1.5 }))
+                    .text_size(rems(0.875))
+                    .line_height(rems(1.5))
                     .border_0()
                     .rounded_none()
                     .pl(inset)
                     .pr(inset)
-                    .pt(if focus_mode { rems(4.) } else { rems(1.) })
+                    .pt(rems(1.))
                     .aria_label("Markdown source")
                     .context_menu(move |menu, _, cx| {
                         menu_document
@@ -1548,7 +1494,7 @@ impl DocumentView {
         let settings = AppSettings::get(cx);
         let window_width = window.viewport_size().width;
         match settings.layout {
-            Layout::Split if !settings.focus_mode => {
+            Layout::Split => {
                 if measured > px(0.) && self.last_window_width > px(0.) {
                     measured * (window_width / self.last_window_width)
                 } else if measured > px(0.) {
@@ -1579,11 +1525,7 @@ impl Render for DocumentView {
             });
         }
         let settings = AppSettings::get(cx);
-        let layout = if settings.focus_mode {
-            Layout::Editor
-        } else {
-            settings.layout
-        };
+        let layout = settings.layout;
         let content = match layout {
             Layout::Editor => self.render_editor(window, cx).into_any_element(),
             Layout::Preview => self.render_preview(window, cx).into_any_element(),
