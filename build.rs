@@ -18,10 +18,10 @@ fn main() {
         .set("FileDescription", "Downmark")
         .set("InternalName", "downmark")
         .set("OriginalFilename", "Downmark.exe")
-        .set("CompanyName", "Ross Cawston")
+        .set("CompanyName", "Vidhan")
         .set(
             "LegalCopyright",
-            "Copyright 2026 Ross Cawston. Apache License 2.0.",
+            "Copyright 2026 Vidhan. Apache License 2.0.",
         );
     if let Err(err) = resource.compile() {
         panic!("could not embed the Windows icon and version information: {err}");
