@@ -1828,7 +1828,12 @@ impl Workspace {
                                     .role(gpui_kit::Role::Button)
                                     .aria_label(format!("Close tab {tab_name}"))
                                     .tooltip(|window, cx| {
-                                        Tooltip::new("Close tab (Ctrl+W)").build(window, cx)
+                                        Tooltip::new(if cfg!(target_os = "macos") {
+                                            "Close tab (Cmd+W)"
+                                        } else {
+                                            "Close tab (Ctrl+W)"
+                                        })
+                                        .build(window, cx)
                                     })
                                     .absolute()
                                     .right_0()
@@ -1906,13 +1911,23 @@ impl Workspace {
             )
             .child(
                 Button::new("new-tab")
-                    .accessibility_label("New Tab (Ctrl+T)")
+                    .accessibility_label(if cfg!(target_os = "macos") {
+                        "New Tab (Cmd+T)"
+                    } else {
+                        "New Tab (Ctrl+T)"
+                    })
                     .ghost()
                     .xsmall()
                     .flex_none()
                     .icon(Icon::new(IconName::Plus))
-                    .tooltip("New Tab (Ctrl+T)")
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+                    .tooltip(if cfg!(target_os = "macos") {
+                        "New Tab (Cmd+T)"
+                    } else {
+                        "New Tab (Ctrl+T)"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_tab(true, window, cx);
+                    })),
             )
     }
 
@@ -2436,6 +2451,30 @@ mod tests {
             assert_eq!(ws.tabs_scroll_handle.offset().x, px(0.));
 
             ws.scroll_tab_into_view(5);
+            ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn new_tab_activates_newly_created_tab(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            assert_eq!(ws.tabs.len(), 1);
+            assert_eq!(ws.active, 0);
+
+            ws.new_tab(true, window, cx);
+            assert_eq!(ws.tabs.len(), 2);
+            assert_eq!(ws.active, 1);
+            assert!(matches!(ws.tabs[1], WorkspaceTab::NewTab(_)));
             ws
         });
         let _ = workspace;
