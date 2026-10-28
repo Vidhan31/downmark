@@ -35,8 +35,8 @@ pub(crate) enum Appearance {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Layout {
     Editor,
-    #[default]
     Split,
+    #[default]
     Preview,
 }
 
@@ -98,7 +98,7 @@ impl Default for Settings {
             layout: Layout::Preview,
             soft_wrap: true,
             line_numbers: true,
-            scroll_sync: true,
+            scroll_sync: false,
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
             tabs: true,
@@ -197,8 +197,10 @@ mod tests {
 
     #[test]
     fn missing_fields_use_defaults() {
-        let settings: Settings = serde_json::from_str(r#"{ "layout": "preview" }"#).unwrap();
+        let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.layout, Layout::Preview);
+        assert_eq!(Layout::default(), Layout::Preview);
+        assert!(!settings.scroll_sync);
         assert!(settings.soft_wrap);
         assert_eq!(settings.font_size, DEFAULT_FONT_SIZE);
         assert_eq!(settings.font_family, None);

@@ -161,6 +161,9 @@ pub(crate) struct DocumentView {
     /// The caret as of the editor's last change, for code that runs while
     /// the editor is busy (its context menu).
     last_cursor: usize,
+    applied_soft_wrap: Option<bool>,
+    applied_line_numbers: Option<bool>,
+    last_layout: Option<Layout>,
 
     smooth_scroll: SmoothScrollController,
 
@@ -273,6 +276,9 @@ impl DocumentView {
             recovery_written: false,
             recovery_task: None,
             last_cursor: 0,
+            applied_soft_wrap: Some(settings.soft_wrap),
+            applied_line_numbers: Some(settings.line_numbers),
+            last_layout: Some(settings.layout),
             smooth_scroll: SmoothScrollController::new(),
             scroll_sync: ScrollSynchronizer::new(),
             editor_width: px(0.),
@@ -858,11 +864,35 @@ impl DocumentView {
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let settings = AppSettings::get(cx).clone();
-        self.editor.update(cx, |editor, cx| {
-            editor.set_soft_wrap(settings.soft_wrap, window, cx);
-            editor.set_line_number(settings.line_numbers, window, cx);
-            editor.set_folding(true, window, cx);
-        });
+        if self.applied_soft_wrap != Some(settings.soft_wrap)
+            || self.applied_line_numbers != Some(settings.line_numbers)
+        {
+            let soft_wrap_changed = self.applied_soft_wrap != Some(settings.soft_wrap);
+            let line_numbers_changed = self.applied_line_numbers != Some(settings.line_numbers);
+            self.editor.update(cx, |editor, cx| {
+                if soft_wrap_changed {
+                    editor.set_soft_wrap(settings.soft_wrap, window, cx);
+                }
+                if line_numbers_changed {
+                    editor.set_line_number(settings.line_numbers, window, cx);
+                }
+            });
+            self.applied_soft_wrap = Some(settings.soft_wrap);
+            self.applied_line_numbers = Some(settings.line_numbers);
+        }
+        if self.last_layout != Some(settings.layout) {
+            if settings.layout == Layout::Split {
+                let width = if self.last_window_width > px(0.) {
+                    self.last_window_width
+                } else {
+                    window.viewport_size().width
+                };
+                let half = width / 2.;
+                self.editor_width = half;
+                self.preview_width = half;
+            }
+            self.last_layout = Some(settings.layout);
+        }
         self.preview_style = make_preview_style(cx);
         if settings.layout == Layout::Preview {
             self.flush_preview(cx);
@@ -1495,9 +1525,9 @@ impl DocumentView {
         let window_width = window.viewport_size().width;
         match settings.layout {
             Layout::Split => {
-                if measured > px(0.) && self.last_window_width > px(0.) {
-                    measured * (window_width / self.last_window_width)
-                } else if measured > px(0.) {
+                if measured > px(0.) && measured < window_width && self.last_window_width > px(0.) {
+                    (measured * (window_width / self.last_window_width)).min(window_width - px(50.))
+                } else if measured > px(0.) && measured < window_width {
                     measured
                 } else {
                     window_width / 2.
@@ -1529,18 +1559,22 @@ impl Render for DocumentView {
         let content = match layout {
             Layout::Editor => self.render_editor(window, cx).into_any_element(),
             Layout::Preview => self.render_preview(window, cx).into_any_element(),
-            Layout::Split => h_resizable("document-split")
-                .child(
-                    resizable_panel()
-                        .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_editor(window, cx)),
-                )
-                .child(
-                    resizable_panel()
-                        .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
-                        .child(self.render_preview(window, cx)),
-                )
-                .into_any_element(),
+            Layout::Split => {
+                let half = self.pane_width(self.editor_width, window, cx);
+                h_resizable("document-split")
+                    .child(
+                        resizable_panel()
+                            .size(half)
+                            .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
+                            .child(self.render_editor(window, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(rems(16.).to_pixels(window.rem_size())..Pixels::MAX)
+                            .child(self.render_preview(window, cx)),
+                    )
+                    .into_any_element()
+            }
         };
 
         div()
@@ -1752,6 +1786,34 @@ mod tests {
             view
         });
         let _ = doc;
+    }
+
+    #[gpui_kit::test]
+    fn switches_layout_to_split_smoothly(cx: &mut gpui_kit::TestAppContext) {
+        let (doc, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            cx.set_global(AppSettings(crate::settings::Settings {
+                layout: Layout::Preview,
+                ..Default::default()
+            }));
+            let text =
+                "# Title\n\nSome paragraph text.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n".repeat(20);
+            DocumentView::new(text, None, LineEnding::Lf, window, cx)
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            AppSettings::update(cx, |s| s.layout = Layout::Split);
+        });
+
+        cx.run_until_parked();
+
+        doc.read_with(cx, |view, cx| {
+            assert_eq!(AppSettings::get(cx).layout, Layout::Split);
+            assert!(view.editor_width > px(0.));
+            assert!(view.preview_width > px(0.));
+        });
     }
 
     #[gpui_kit::test]

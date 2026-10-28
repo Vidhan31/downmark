@@ -74,6 +74,8 @@ use crate::{
 };
 
 const MARKDOWN_GUIDE_URL: &str = "https://commonmark.org/help/";
+const DEFAULT_WINDOW_WIDTH: f32 = 860.;
+const DEFAULT_WINDOW_HEIGHT: f32 = 720.;
 
 /// The window's workspace, for files the system asks Downmark to open.
 struct MainWindow {
@@ -198,7 +200,7 @@ fn open_window(
     cx: &mut App,
 ) {
     let window_bounds = workspace::restored_bounds(cx).unwrap_or_else(|| {
-        let mut window_size = size(px(1280.), px(840.));
+        let mut window_size = size(px(DEFAULT_WINDOW_WIDTH), px(DEFAULT_WINDOW_HEIGHT));
         if let Some(display) = cx.primary_display() {
             let display_size = display.bounds().size;
             window_size.width = window_size.width.min(display_size.width * 0.9);

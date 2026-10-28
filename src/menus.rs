@@ -274,7 +274,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 checked,
-                ["Preview", "Tabs", "Sync scrolling", "Line numbers"]
+                ["Preview", "Tabs", "Line numbers"]
             );
         });
     }
