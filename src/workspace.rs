@@ -1724,6 +1724,7 @@ impl Workspace {
         h_flex()
             .id("tabs-wrapper")
             .h_full()
+            .items_center()
             .w(width)
             .flex_none()
             .min_w_0()
@@ -1910,24 +1911,40 @@ impl Workspace {
                     })),
             )
             .child(
-                Button::new("new-tab")
-                    .accessibility_label(if cfg!(target_os = "macos") {
+                div()
+                    .id("new-tab")
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(if cfg!(target_os = "macos") {
                         "New Tab (Cmd+T)"
                     } else {
                         "New Tab (Ctrl+T)"
                     })
-                    .ghost()
-                    .xsmall()
+                    .tooltip(|window, cx| {
+                        Tooltip::new(if cfg!(target_os = "macos") {
+                            "New Tab (Cmd+T)"
+                        } else {
+                            "New Tab (Ctrl+T)"
+                        })
+                        .build(window, cx)
+                    })
+                    .cursor_pointer()
                     .flex_none()
-                    .icon(Icon::new(IconName::Plus))
-                    .tooltip(if cfg!(target_os = "macos") {
-                        "New Tab (Cmd+T)"
-                    } else {
-                        "New Tab (Ctrl+T)"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.new_tab(true, window, cx);
-                    })),
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_color(theme.muted_foreground)
+                    .hover(|style| style.bg(theme.list_hover).text_color(theme.foreground))
+                    .active(|style| style.bg(theme.list_active))
+                    .child(Icon::new(IconName::Plus).xsmall())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.new_tab(true, window, cx);
+                        }),
+                    ),
             )
     }
 
