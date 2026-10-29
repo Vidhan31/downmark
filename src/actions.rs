@@ -30,6 +30,7 @@ actions!(
         ToggleAppearance,
         ToggleTabs,
         ToggleRestoreSession,
+        ToggleGlanceMode,
         OpenSettings,
         TidyTable,
         ZoomIn,
@@ -130,6 +131,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     let document = Some(DOCUMENT_CONTEXT);
     let preview = Some(PREVIEW_CONTEXT);
     cx.bind_keys([
+        key_binding("escape", gpui_kit::component::input::Escape, None),
         key_binding("secondary-n", NewFile, None),
         key_binding("secondary-t", NewTab, None),
         key_binding("secondary-o", Open, None),
@@ -152,6 +154,8 @@ pub(crate) fn bind_keys(cx: &mut App) {
         key_binding("secondary-1", SetLayout(Layout::Editor), workspace),
         key_binding("secondary-2", SetLayout(Layout::Split), workspace),
         key_binding("secondary-3", SetLayout(Layout::Preview), workspace),
+        key_binding("secondary-shift-d", ToggleGlanceMode, None),
+        key_binding("f11", ToggleGlanceMode, None),
         // The last binding for an action is the one menus display.
         key_binding("secondary-+", ZoomIn, None),
         key_binding("secondary-=", ZoomIn, None),

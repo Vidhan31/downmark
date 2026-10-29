@@ -68,6 +68,9 @@ pub(crate) struct Settings {
     /// always starts in preview mode.
     #[serde(skip)]
     pub(crate) layout: Layout,
+    /// Distraction-free glance mode hiding chrome. Not persisted so normal launches start in standard view.
+    #[serde(skip)]
+    pub(crate) glance_mode: bool,
     pub(crate) soft_wrap: bool,
     pub(crate) line_numbers: bool,
     /// Keep the preview scrolled to the part of the document being edited.
@@ -78,6 +81,8 @@ pub(crate) struct Settings {
 
     /// Open documents in tabs instead of replacing the current one.
     pub(crate) tabs: bool,
+    /// Open single external Markdown documents in distraction-free Glance Mode.
+    pub(crate) glance_on_external: bool,
     /// Reopen the documents, folder and window of the last session.
     pub(crate) restore_session: bool,
     /// Folder, next to the document, that pasted and dropped images are
@@ -99,12 +104,14 @@ impl Default for Settings {
             font_family: None,
             mono_font_family: None,
             layout: Layout::Preview,
+            glance_mode: false,
             soft_wrap: true,
             line_numbers: true,
             scroll_sync: false,
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
             tabs: true,
+            glance_on_external: true,
             restore_session: true,
             image_folder: "assets".to_string(),
             open_links_in: LinkPlacement::NewTab,
@@ -126,6 +133,7 @@ impl Settings {
             .unwrap_or_default();
         settings.font_size = clamp_font_size(settings.font_size);
         settings.layout = Layout::Preview;
+        settings.glance_mode = false;
         settings.recent_files.truncate(RECENT_LIMIT);
         settings.tracked_folders.retain(|dir| dir.is_dir());
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
@@ -210,6 +218,8 @@ mod tests {
         assert_eq!(settings.font_family, None);
         assert_eq!(settings.mono_font_family, None);
         assert!(settings.tabs);
+        assert!(settings.glance_on_external);
+        assert!(!settings.glance_mode);
         assert!(settings.restore_session);
         assert_eq!(settings.open_links_in, LinkPlacement::NewTab);
         assert!(settings.confirm_web_links);

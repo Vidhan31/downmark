@@ -159,6 +159,14 @@ pub(crate) fn open_settings(window: &mut Window, cx: &mut App) {
                     cx,
                 ))
                 .child(row(
+                    "glance-on-external",
+                    "Glance mode for external files",
+                    "Open single files in distraction-free preview, hiding the title bar and chrome.",
+                    settings.glance_on_external,
+                    |settings, on| settings.glance_on_external = on,
+                    cx,
+                ))
+                .child(row(
                     "restore-session",
                     "Reopen last session",
                     "Start with the documents, folder and window you had open.",

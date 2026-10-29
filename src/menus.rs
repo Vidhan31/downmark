@@ -18,7 +18,7 @@ use crate::{
         About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, FindInPreview, GoToHeading,
         Heading, InlineCode, InsertLink, Italic, NewFile, NewTab, NumberedList, Open,
         OpenMarkdownGuide, OpenRecent, OpenSettings, Quit, Quote, RevealInFolder, Save, SaveAs,
-        SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList, TidyTable,
+        SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList, TidyTable, ToggleGlanceMode,
         ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap, ToggleTabs, ZoomIn, ZoomOut,
         ZoomReset,
     },
@@ -187,6 +187,8 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
         MenuItem::action("Preview", SetLayout(Layout::Preview))
             .checked(settings.layout == Layout::Preview),
         MenuItem::separator(),
+        MenuItem::action("Glance mode", ToggleGlanceMode).checked(settings.glance_mode),
+        MenuItem::separator(),
         MenuItem::action("Tabs", ToggleTabs).checked(settings.tabs),
         MenuItem::action("Go to heading…", GoToHeading),
         MenuItem::separator(),
@@ -272,10 +274,25 @@ mod tests {
                     _ => String::new(),
                 })
                 .collect();
-            assert_eq!(
-                checked,
-                ["Preview", "Tabs", "Line numbers"]
-            );
+            assert_eq!(checked, ["Preview", "Tabs", "Line numbers"]);
+        });
+
+        cx.update(|cx| {
+            AppSettings::update(cx, |settings| settings.glance_mode = true);
+        });
+        cx.read(|cx| {
+            let menus = build(cx);
+            let view = menus.iter().find(|menu| menu.name == "View").unwrap();
+            let checked: Vec<_> = view
+                .items
+                .iter()
+                .filter(|item| item.is_checked())
+                .map(|item| match item {
+                    MenuItem::Action { name, .. } => name.to_string(),
+                    _ => String::new(),
+                })
+                .collect();
+            assert_eq!(checked, ["Preview", "Glance mode", "Tabs", "Line numbers"]);
         });
     }
 

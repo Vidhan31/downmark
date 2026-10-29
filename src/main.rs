@@ -68,9 +68,11 @@ use gpui_kit::{
 };
 
 use crate::{
-    actions::{About, OpenMarkdownGuide, OpenSettings, Quit, SetAppearance, SetTheme},
+    actions::{
+        About, OpenMarkdownGuide, OpenSettings, Quit, SetAppearance, SetTheme, ToggleGlanceMode,
+    },
     settings::Settings,
-    workspace::Workspace,
+    workspace::{GlanceStart, Workspace},
 };
 
 const MARKDOWN_GUIDE_URL: &str = "https://commonmark.org/help/";
@@ -85,9 +87,22 @@ struct MainWindow {
 
 impl Global for MainWindow {}
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Application startup, arguments parsing, global actions and lifecycle setup"
+)]
 fn main() {
-    let paths: Vec<PathBuf> = std::env::args_os()
-        .skip(1)
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let glance = if args.iter().any(|arg| {
+        let s = arg.to_string_lossy();
+        s == "--glance" || s == "-g"
+    }) {
+        GlanceStart::Glance
+    } else {
+        GlanceStart::Normal
+    };
+    let paths: Vec<PathBuf> = args
+        .into_iter()
         .filter(|arg| !arg.to_string_lossy().starts_with('-'))
         .map(PathBuf::from)
         .map(|path| path.canonicalize().unwrap_or(path))
@@ -144,6 +159,32 @@ fn main() {
         cx.on_action(|_: &OpenSettings, cx: &mut App| {
             with_window(cx, settings_dialog::open_settings);
         });
+        cx.on_action(|_: &ToggleGlanceMode, cx: &mut App| {
+            if let Some(main) = cx.try_global::<MainWindow>() {
+                let workspace = main.workspace.clone();
+                _ = main.handle.update(cx, |_, window, cx| {
+                    if let Some(ws) = workspace.upgrade() {
+                        ws.update(cx, |ws, cx| {
+                            ws.toggle_glance_mode(window, cx);
+                        });
+                    }
+                });
+            }
+        });
+        cx.on_action(|_: &gpui_kit::component::input::Escape, cx: &mut App| {
+            if themes::AppSettings::get(cx).glance_mode
+                && let Some(main) = cx.try_global::<MainWindow>()
+            {
+                let workspace = main.workspace.clone();
+                _ = main.handle.update(cx, |_, window, cx| {
+                    if let Some(ws) = workspace.upgrade() {
+                        ws.update(cx, |ws, cx| {
+                            ws.handle_escape(window, cx);
+                        });
+                    }
+                });
+            }
+        });
 
         // Downmark is a single-window app: closing the window ends it on
         // every platform, as the menu offers no way to open a new one.
@@ -163,12 +204,12 @@ fn main() {
         cx.spawn(async move |cx| {
             while let Some(paths) = open_rx.next().await {
                 let menu_bar = menu_bar.clone();
-                cx.update(|cx| open_paths(paths, menu_bar, cx));
+                cx.update(|cx| open_paths(paths, GlanceStart::Normal, menu_bar, cx));
             }
         })
         .detach();
 
-        open_window(paths, app_menu_bar, cx);
+        open_window(paths, glance, app_menu_bar, cx);
         cx.activate(true);
     });
 }
@@ -176,6 +217,7 @@ fn main() {
 /// Open files in the window, or in a new one if it was closed.
 fn open_paths(
     paths: Vec<PathBuf>,
+    glance: GlanceStart,
     app_menu_bar: gpui_kit::Entity<gpui_kit::component::menu::AppMenuBar>,
     cx: &mut App,
 ) {
@@ -183,7 +225,7 @@ fn open_paths(
         let (handle, workspace) = (main.handle, main.workspace.clone());
         let opened = handle.update(cx, |_, window, cx| {
             workspace.update(cx, |workspace, cx| {
-                workspace.open_external(paths.clone(), window, cx);
+                workspace.open_external(paths.clone(), glance, window, cx);
             })
         });
         if matches!(opened, Ok(Ok(()))) {
@@ -191,11 +233,12 @@ fn open_paths(
             return;
         }
     }
-    open_window(paths, app_menu_bar, cx);
+    open_window(paths, glance, app_menu_bar, cx);
 }
 
 fn open_window(
     paths: Vec<PathBuf>,
+    glance: GlanceStart,
     app_menu_bar: gpui_kit::Entity<gpui_kit::component::menu::AppMenuBar>,
     cx: &mut App,
 ) {
@@ -222,7 +265,7 @@ fn open_window(
 
     let result = gpui_kit::open_window(options, cx, move |window, cx| {
         themes::apply(Some(window), cx);
-        let workspace = cx.new(|cx| Workspace::new(paths, app_menu_bar, window, cx));
+        let workspace = cx.new(|cx| Workspace::new(paths, glance, app_menu_bar, window, cx));
         cx.set_global(MainWindow {
             handle: window.window_handle(),
             workspace: workspace.downgrade(),

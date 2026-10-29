@@ -570,7 +570,6 @@ impl DocumentView {
         });
     }
 
-    #[cfg(test)]
     pub(crate) fn is_expanded_table_open(&self) -> bool {
         self.expanded_table.is_some()
     }

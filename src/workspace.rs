@@ -11,11 +11,11 @@ use std::{
 };
 
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, Global, InteractiveElement as _, IntoElement, Menu, MouseButton, OwnedMenu,
-    OwnedMenuItem, ParentElement as _, PathPromptOptions, Render, ScrollEvent, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    WindowBounds,
+    Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, KeyDownEvent, Menu,
+    MouseButton, MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions,
+    Render, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, WindowBounds, WindowControlArea,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, IndexPath, Sizable as _, TitleBar, WindowExt as _,
@@ -39,7 +39,7 @@ use crate::{
     actions::{
         About, ActivateTab, CloseDocument, CloseWindow, FindInPreview, FollowLink, GoToHeading,
         NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab, Quit,
-        RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance,
+        RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
         ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
         ToggleTabs, ViewDiagram, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
     },
@@ -194,6 +194,21 @@ pub(crate) struct Workspace {
     _watch_task: Task<()>,
     tab_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     _subscriptions: Vec<Subscription>,
+    saved_layout_before_glance: Option<Layout>,
+    glance_drag_active: bool,
+}
+
+/// Whether a window or workspace should start directly in distraction-free Glance Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlanceStart {
+    Glance,
+    Normal,
+}
+
+impl GlanceStart {
+    pub(crate) fn is_glance(self) -> bool {
+        self == Self::Glance
+    }
 }
 
 impl Workspace {
@@ -201,6 +216,7 @@ impl Workspace {
     /// `paths`.
     pub(crate) fn new(
         paths: Vec<PathBuf>,
+        glance: GlanceStart,
         app_menu_bar: Entity<AppMenuBar>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -257,8 +273,10 @@ impl Workspace {
             _watch_task: watch_task,
             tab_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
+            saved_layout_before_glance: None,
+            glance_drag_active: false,
         };
-        this.restore(paths, &settings, window, cx);
+        this.restore(paths, glance, &settings, window, cx);
         this
     }
 
@@ -267,6 +285,7 @@ impl Workspace {
     fn restore(
         &mut self,
         paths: Vec<PathBuf>,
+        glance: GlanceStart,
         settings: &crate::settings::Settings,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -356,6 +375,15 @@ impl Workspace {
             self.add_tab(tab, false, window, cx);
         }
         self.active = active.unwrap_or(0).min(self.tabs.len().saturating_sub(1));
+        let single_file = paths.len() == 1;
+        let should_glance = glance.is_glance() || (single_file && settings.glance_on_external);
+        if should_glance {
+            self.saved_layout_before_glance = Some(settings.layout);
+            AppSettings::update(cx, |s| {
+                s.glance_mode = true;
+                s.layout = Layout::Preview;
+            });
+        }
         if !paths.is_empty() {
             self.open_paths(paths, window, cx);
         }
@@ -537,6 +565,7 @@ impl Workspace {
 
     fn focus_active(&self, window: &mut Window, cx: &mut App) {
         let focus = self.active_tab().focus_handle(cx);
+        window.focus(&focus, cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
     }
 
@@ -642,6 +671,9 @@ impl Workspace {
     }
 
     fn new_tab_action(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if AppSettings::get(cx).glance_mode {
+            AppSettings::update(cx, |settings| settings.glance_mode = false);
+        }
         self.new_tab(true, window, cx);
     }
 
@@ -963,6 +995,9 @@ impl Workspace {
     }
 
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if AppSettings::get(cx).glance_mode {
+            AppSettings::update(cx, |settings| settings.glance_mode = false);
+        }
         if AppSettings::get(cx).tabs {
             self.new_document(window, cx);
         } else if let Some(doc) = self.active_document() {
@@ -1451,7 +1486,9 @@ impl Workspace {
             self.open_paths(documents, window, cx);
             return;
         }
-        if AppSettings::get(cx).layout.shows_editor() && let Some(doc) = self.active_document() {
+        if AppSettings::get(cx).layout.shows_editor()
+            && let Some(doc) = self.active_document()
+        {
             let paths = paths.paths().to_vec();
             doc.update(cx, |doc, cx| doc.drop_images(&paths, window, cx));
             return;
@@ -1462,6 +1499,7 @@ impl Workspace {
     fn set_layout(&mut self, action: &SetLayout, window: &mut Window, cx: &mut Context<'_, Self>) {
         let layout = action.0;
         AppSettings::update(cx, |settings| {
+            settings.glance_mode = false;
             settings.layout = layout;
         });
         self.focus_active(window, cx);
@@ -1561,6 +1599,52 @@ impl Workspace {
                 Appearance::Dark
             };
         });
+    }
+
+    pub(crate) fn toggle_glance_mode(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let is_glance = AppSettings::get(cx).glance_mode;
+        if is_glance {
+            let previous = self
+                .saved_layout_before_glance
+                .take()
+                .unwrap_or(Layout::Preview);
+            AppSettings::update(cx, |settings| {
+                settings.glance_mode = false;
+                settings.layout = previous;
+            });
+        } else {
+            self.saved_layout_before_glance = Some(AppSettings::get(cx).layout);
+            AppSettings::update(cx, |settings| {
+                settings.glance_mode = true;
+                settings.layout = Layout::Preview;
+            });
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_glance_mode_action(
+        &mut self,
+        _: &ToggleGlanceMode,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.toggle_glance_mode(window, cx);
+    }
+
+    pub(crate) fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let search_open = self
+            .active_document()
+            .is_some_and(|doc| doc.read(cx).is_search_open());
+        if search_open {
+            if let Some(doc) = self.active_document() {
+                doc.update(cx, |doc, cx| {
+                    doc.close_search(window, cx);
+                });
+            }
+        } else if AppSettings::get(cx).glance_mode {
+            self.toggle_glance_mode(window, cx);
+        }
     }
 
     fn render_title_bar(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
@@ -1922,18 +2006,16 @@ impl Workspace {
                     .aria_label("Status bar")
                     .child(
                         StatusBar::new()
-                            .left(h_flex().gap_4().child(item(
-                                if total_folders == 0 {
-                                    "Home — No tracked folders".to_string()
-                                } else {
-                                    format!(
-                                        "Home — {} markdown files across {} folder{}",
-                                        total_files,
-                                        total_folders,
-                                        if total_folders > 1 { "s" } else { "" }
-                                    )
-                                },
-                            )))
+                            .left(h_flex().gap_4().child(item(if total_folders == 0 {
+                                "Home — No tracked folders".to_string()
+                            } else {
+                                format!(
+                                    "Home — {} markdown files across {} folder{}",
+                                    total_files,
+                                    total_folders,
+                                    if total_folders > 1 { "s" } else { "" }
+                                )
+                            })))
                             .right(self.render_layout_button(cx)),
                     );
             }
@@ -2131,22 +2213,17 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.update_window_title(window, cx);
         // Keyboard commands need a focused element inside the workspace; if
-        // focus was lost (e.g. its element left the layout), take it back when active.
-        #[cfg(not(test))]
-        if window.is_window_active() && window.focused(cx).is_none() {
-            let focus = self.focus_handle.clone();
-            window.defer(cx, move |window, cx| {
-                if window.is_window_active() && window.focused(cx).is_none() {
-                    focus.focus(window, cx);
-                }
-            });
+        // focus was lost (e.g. its element left the layout), take it back.
+        if window.focused(cx).is_none() {
+            let focus = self.active_tab().focus_handle(cx);
+            window.focus(&focus, cx);
         }
         let main = match self.active_tab() {
             WorkspaceTab::Document(doc) => div().size_full().child(doc.clone()),
             WorkspaceTab::NewTab(new_tab) => div().size_full().child(new_tab.clone()),
         };
 
-        v_flex()
+        let mut workspace_div = v_flex()
             .id("workspace")
             .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2213,14 +2290,21 @@ impl Render for Workspace {
                 let search_open = this
                     .active_document()
                     .is_some_and(|doc| doc.read(cx).is_search_open());
-                if search_open {
-                    if let Some(doc) = this.active_document() {
-                        doc.update(cx, |doc, cx| {
-                            doc.close_search(window, cx);
-                        });
-                    }
+                if search_open || AppSettings::get(cx).glance_mode {
+                    this.handle_escape(window, cx);
                 } else {
                     cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(Self::toggle_glance_mode_action))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    let table_open = this
+                        .active_document()
+                        .is_some_and(|doc| doc.read(cx).is_expanded_table_open());
+                    if !table_open {
+                        this.handle_escape(window, cx);
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleScrollSync, _, cx| {
@@ -2249,15 +2333,84 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., cx)))
             .on_drop(cx.listener(Self::on_drop_paths))
-            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target))
-            .child(
-                div()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(self.render_title_bar(window, cx)),
-            )
-            .child(div().flex_1().min_h_0().overflow_hidden().child(main))
-            .child(self.render_status_bar(cx))
+            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target));
+
+        let is_glance = AppSettings::get(cx).glance_mode;
+        if is_glance {
+            workspace_div = workspace_div
+                .child(div().size_full().overflow_hidden().child(main))
+                .child(
+                    div()
+                        .id("glance-drag-handle")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(24.))
+                        .window_control_area(WindowControlArea::Drag)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                                if ev.click_count == 2 {
+                                    window.zoom_window();
+                                } else {
+                                    this.glance_drag_active = true;
+                                }
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.glance_drag_active = false;
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, _, window, _| {
+                            if this.glance_drag_active {
+                                this.glance_drag_active = false;
+                                window.start_window_move();
+                            }
+                        }))
+                        .on_mouse_down(MouseButton::Right, move |ev, window, _| {
+                            #[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+                            window.show_window_menu(ev.position);
+                            #[cfg(not(all(target_os = "linux", not(target_family = "wasm"))))]
+                            let _ = (ev, window);
+                        }),
+                )
+                .child(
+                    div()
+                        .id("glance-exit-button-wrapper")
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(12.))
+                        .opacity(0.2)
+                        .hover(|s| s.opacity(1.0))
+                        .child(
+                            Button::new("exit-glance-mode")
+                                .accessibility_label("Exit glance mode")
+                                .ghost()
+                                .small()
+                                .compact()
+                                .icon(IconName::Minimize2)
+                                .tooltip("Exit Glance Mode (Esc)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_glance_mode(window, cx);
+                                })),
+                        ),
+                );
+        } else {
+            workspace_div = workspace_div
+                .child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.render_title_bar(window, cx)),
+                )
+                .child(div().flex_1().min_h_0().overflow_hidden().child(main))
+                .child(self.render_status_bar(cx));
+        }
+
+        workspace_div
     }
 }
 
@@ -2267,11 +2420,22 @@ impl Workspace {
     pub(crate) fn open_external(
         &mut self,
         paths: Vec<PathBuf>,
+        glance: GlanceStart,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let documents: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
         if !documents.is_empty() {
+            let single_file = documents.len() == 1;
+            let should_glance =
+                glance.is_glance() || (single_file && AppSettings::get(cx).glance_on_external);
+            if should_glance {
+                self.saved_layout_before_glance = Some(AppSettings::get(cx).layout);
+                AppSettings::update(cx, |settings| {
+                    settings.glance_mode = true;
+                    settings.layout = Layout::Preview;
+                });
+            }
             self.open_paths(documents, window, cx);
         }
     }
@@ -2436,7 +2600,7 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             let initial_tab_count = ws.tabs.len();
             for _ in 0..15 {
                 ws.new_tab(false, window, cx);
@@ -2458,7 +2622,7 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             for _ in 0..10 {
                 ws.new_tab(false, window, cx);
             }
@@ -2486,7 +2650,7 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             assert_eq!(ws.tabs.len(), 1);
             assert_eq!(ws.active, 0);
 
@@ -2511,12 +2675,188 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), app_menu_bar, window, cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
             ws.new_document(window, cx);
             assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
             ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn toggles_glance_mode_and_restores_layout(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Split,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            assert!(!AppSettings::get(cx).glance_mode);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Split);
+
+            // Toggle on: glance_mode is true, layout forced to Preview
+            ws.toggle_glance_mode(window, cx);
+            assert!(AppSettings::get(cx).glance_mode);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
+
+            // Toggle off: glance_mode is false, previous layout (Split) is restored
+            ws.toggle_glance_mode(window, cx);
+            assert!(!AppSettings::get(cx).glance_mode);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Split);
+            ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn glance_start_initializes_in_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            assert!(AppSettings::get(cx).glance_mode);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
+            ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn switching_layout_or_new_tab_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Split,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            assert!(AppSettings::get(cx).glance_mode);
+
+            // Explicitly setting layout exits glance mode
+            ws.set_layout(&SetLayout(Layout::Editor), window, cx);
+            assert!(!AppSettings::get(cx).glance_mode);
+            assert_eq!(AppSettings::get(cx).layout, Layout::Editor);
+
+            // Re-enter glance mode, then creating a new tab exits glance mode
+            ws.toggle_glance_mode(window, cx);
+            assert!(AppSettings::get(cx).glance_mode);
+            ws.new_tab_action(&NewTab, window, cx);
+            assert!(!AppSettings::get(cx).glance_mode);
+            ws
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn escape_key_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Preview,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let doc = cx.new(|cx| {
+                DocumentView::new(
+                    "# Hello\nWorld".to_string(),
+                    None,
+                    LineEnding::Lf,
+                    window,
+                    cx,
+                )
+            });
+            ws.tabs[0] = WorkspaceTab::Document(doc);
+            assert!(AppSettings::get(cx).glance_mode);
+            ws
+        });
+        cx_window.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+            assert!(handled);
+        });
+        cx.read(|cx| {
+            assert!(!AppSettings::get(cx).glance_mode);
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn escape_closes_search_before_exiting_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let mut doc_entity = None;
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Preview,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let doc = cx.new(|cx| {
+                DocumentView::new(
+                    "# Hello\nWorld".to_string(),
+                    None,
+                    LineEnding::Lf,
+                    window,
+                    cx,
+                )
+            });
+            doc_entity = Some(doc.clone());
+            ws.tabs[0] = WorkspaceTab::Document(doc);
+            assert!(AppSettings::get(cx).glance_mode);
+            ws
+        });
+        // Open search first
+        cx_window.update(|window, cx| {
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_search(window, cx);
+                assert!(doc.is_search_open());
+            });
+            window.draw(cx).clear(cx);
+            // First Escape closes search, stays in glance mode
+            let handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+            assert!(handled);
+            assert!(!doc_entity.as_ref().unwrap().read(cx).is_search_open());
+            assert!(AppSettings::get(cx).glance_mode);
+
+            // Second Escape exits glance mode
+            window.draw(cx).clear(cx);
+            let handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+            assert!(handled);
+            assert!(!AppSettings::get(cx).glance_mode);
         });
         let _ = workspace;
     }
