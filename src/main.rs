@@ -174,12 +174,21 @@ fn main() {
             }
         });
         cx.on_action(|_: &gpui_kit::component::input::Escape, cx: &mut App| {
-            if themes::AppSettings::get(cx).glance_mode
-                && let Some(main) = cx.try_global::<MainWindow>()
-            {
+            if let Some(main) = cx.try_global::<MainWindow>() {
                 let workspace = main.workspace.clone();
                 _ = main.handle.update(cx, |_, window, cx| {
-                    if let Some(ws) = workspace.upgrade() {
+                    use gpui_kit::component::WindowExt as _;
+                    if window
+                        .root::<gpui_kit::base::Root>()
+                        .is_some_and(|r| r.is_some())
+                        && window.has_active_dialog(cx)
+                    {
+                        window.close_dialog(cx);
+                        return;
+                    }
+                    if themes::AppSettings::get(cx).glance_mode
+                        && let Some(ws) = workspace.upgrade()
+                    {
                         ws.update(cx, |ws, cx| {
                             ws.handle_escape(window, cx);
                         });

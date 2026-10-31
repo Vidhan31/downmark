@@ -127,27 +127,7 @@ pub(crate) fn is_noise_or_hidden_dir(name: &str) -> bool {
     )
 }
 
-/// Fast check to determine whether a file name represents a Markdown document.
-#[inline]
-pub(crate) fn is_markdown_file_name(name: &str) -> bool {
-    if name.starts_with('.') {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    let len = bytes.len();
-    if len >= 3
-        && bytes[len - 3] == b'.'
-        && bytes[len - 2].eq_ignore_ascii_case(&b'm')
-        && bytes[len - 1].eq_ignore_ascii_case(&b'd')
-    {
-        return true;
-    }
-    if len >= 9 && bytes[len - 9] == b'.' {
-        let ext = &name[len - 8..];
-        return ext.eq_ignore_ascii_case("markdown");
-    }
-    false
-}
+pub(crate) use crate::document::is_markdown_file_name;
 
 #[inline]
 fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {

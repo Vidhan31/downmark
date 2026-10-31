@@ -17,7 +17,7 @@ use gpui_kit::{
     assets::IconName,
     base::{TextView, TextViewState},
     component::{
-        ActiveTheme as _, ElementExt as _, Icon, RopeExt as _, Sizable as _,
+        ActiveTheme as _, ElementExt as _, Icon, RopeExt as _, Sizable as _, WindowExt as _,
         button::{Button, ButtonVariants as _},
         clipboard::Clipboard,
         h_flex,
@@ -51,7 +51,7 @@ use crate::{
     session::{self, DiskStamp, Recovery},
     settings::Layout,
     smart_edit,
-    table_overlay::ExpandedTable,
+    table_overlay,
     themes::AppSettings,
 };
 
@@ -173,7 +173,6 @@ pub(crate) struct DocumentView {
     preview_width: Pixels,
     last_window_width: Pixels,
     preview_style: gpui_kit::base::TextViewStyle,
-    expanded_table: Option<ExpandedTable>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -285,7 +284,6 @@ impl DocumentView {
             preview_width: px(0.),
             last_window_width: px(0.),
             preview_style,
-            expanded_table: None,
             _subscriptions: subscriptions,
         };
         this.load_text(text, path, line_ending, window, cx);
@@ -456,6 +454,7 @@ impl DocumentView {
         self.sync_editor(cx);
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "getter for document source text"))]
     pub(crate) fn source(&self) -> &SharedString {
         &self.source
     }
@@ -570,28 +569,27 @@ impl DocumentView {
         });
     }
 
-    pub(crate) fn is_expanded_table_open(&self) -> bool {
-        self.expanded_table.is_some()
-    }
-
     pub(crate) fn open_expanded_table(
         &mut self,
         fallback_markdown: &str,
         span: Option<Range<usize>>,
+        window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let text = span
             .and_then(|range| self.source.get(range))
             .unwrap_or(fallback_markdown);
         let markdown = SharedString::from(text.to_string());
-        self.expanded_table = Some(ExpandedTable::new(markdown, cx));
-        cx.notify();
-    }
-
-    pub(crate) fn close_expanded_table(&mut self, cx: &mut Context<'_, Self>) {
-        if self.expanded_table.take().is_some() {
-            cx.notify();
-        }
+        let base_dir = self.dir().map(Arc::<Path>::from);
+        let extensions = self.markdown_extensions.clone();
+        table_overlay::open(
+            markdown,
+            base_dir,
+            extensions,
+            crate::links::on_click,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn recovery_id(&self) -> Option<&str> {
@@ -728,7 +726,6 @@ impl DocumentView {
         self.dirty = true;
         self.set_scroll_driver(ScrollDriver::Editor);
         self.revision += 1;
-        self.expanded_table = None;
         self.search.invalidate_cache();
         self.schedule_preview(policy, cx);
         self.schedule_analysis(policy, cx);
@@ -1205,10 +1202,6 @@ impl DocumentView {
             .sync_editor(&self.preview, &self.editor, &self.analysis, cx);
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Declarative GPUI layout for editor pane"
-    )]
     fn render_editor(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let document = cx.weak_entity();
         let inset = column_inset(self.pane_width(self.editor_width, window, cx), cx);
@@ -1270,9 +1263,6 @@ impl DocumentView {
                 }
             }))
             .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
-                if this.expanded_table.is_some() {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Editor);
                 this.editor.update(cx, |editor, cx| {
                     let line_height = editor.line_height().unwrap_or(window.line_height());
@@ -1346,21 +1336,12 @@ impl DocumentView {
             // Let the margins beside the text column scroll the preview; the
             // list scrolls itself when the pointer is over its viewport.
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
-                if this.expanded_table.is_some() {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Preview);
             }))
             .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
-                if this.expanded_table.is_some() {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Preview);
             }))
             .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
-                if this.expanded_table.is_some() {
-                    return;
-                }
                 this.set_scroll_driver(ScrollDriver::Preview);
                 let list = this.preview.read(cx).list_state().clone();
                 if list.viewport_bounds().contains(&event.position) {
@@ -1420,11 +1401,12 @@ impl DocumentView {
                                                 .icon(Icon::new(IconName::Maximize))
                                                 .label("Expand table")
                                                 .tooltip("View full table across window width (Esc to close)")
-                                                .on_click(move |_, _window, cx| {
+                                                .on_click(move |_, window, cx| {
                                                     _ = document.update(cx, |this, cx| {
                                                         this.open_expanded_table(
                                                             &markdown,
                                                             span.clone(),
+                                                            window,
                                                             cx,
                                                         );
                                                     });
@@ -1498,9 +1480,6 @@ impl DocumentView {
                 let layout = AppSettings::get(cx).layout;
                 cx.defer(move |cx| {
                     _ = document.update(cx, |this, cx| {
-                        if this.expanded_table.is_some() {
-                            return;
-                        }
                         let changed = (this.preview_width - bounds.size.width).abs() >= px(1.);
                         this.preview_width = bounds.size.width;
                         if changed && layout == Layout::Split {
@@ -1536,7 +1515,7 @@ impl DocumentView {
 impl Render for DocumentView {
     #[expect(
         clippy::too_many_lines,
-        reason = "Document view layout and action registration"
+        reason = "Declarative document view layout and action handlers"
     )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.last_window_width = window.viewport_size().width;
@@ -1576,60 +1555,6 @@ impl Render for DocumentView {
             .key_context(DOCUMENT_CONTEXT)
             .size_full()
             .relative()
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.expanded_table.is_some() {
-                    match event.keystroke.key.as_str() {
-                        "escape" => this.close_expanded_table(cx),
-                        "down" => {
-                            if let Some(table) = &this.expanded_table {
-                                table.view.read(cx).list_state().scroll_by(px(60.));
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        "up" => {
-                            if let Some(table) = &this.expanded_table {
-                                table.view.read(cx).list_state().scroll_by(-px(60.));
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        "pagedown" | "space" => {
-                            if let Some(table) = &this.expanded_table {
-                                let list = table.view.read(cx).list_state().clone();
-                                let h = list.viewport_bounds().size.height;
-                                let d = if h > px(0.) { h * 0.85 } else { px(300.) };
-                                list.scroll_by(d);
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        "pageup" => {
-                            if let Some(table) = &this.expanded_table {
-                                let list = table.view.read(cx).list_state().clone();
-                                let h = list.viewport_bounds().size.height;
-                                let d = if h > px(0.) { h * 0.85 } else { px(300.) };
-                                list.scroll_by(-d);
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        "home" => {
-                            if let Some(table) = &this.expanded_table {
-                                table.view.read(cx).list_state().scroll_to(ListOffset {
-                                    item_ix: 0,
-                                    offset_in_item: px(0.),
-                                });
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        "end" => {
-                            if let Some(table) = &this.expanded_table {
-                                table.view.read(cx).list_state().scroll_to_end();
-                                table.view.update(cx, |_, cx| cx.notify());
-                            }
-                        }
-                        _ => {}
-                    }
-                    cx.stop_propagation();
-                }
-            }))
             .on_action(cx.listener(|this, _: &TidyTable, window, cx| {
                 this.tidy_table(window, cx);
             }))
@@ -1687,34 +1612,21 @@ impl Render for DocumentView {
             .on_action(cx.listener(Self::preview_scroll_top))
             .on_action(cx.listener(Self::preview_scroll_bottom))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.expanded_table.is_some() {
-                    this.close_expanded_table(cx);
-                } else if this.search_open {
+                if window
+                    .root::<gpui_kit::base::Root>()
+                    .is_some_and(|r| r.is_some())
+                    && window.has_active_dialog(cx)
+                {
+                    window.close_dialog(cx);
+                    return;
+                }
+                if this.search_open {
                     this.close_search(window, cx);
                 } else {
                     cx.propagate();
                 }
             }))
             .child(content)
-            .when_some(self.expanded_table.as_ref(), |this, table| {
-                let base_dir = self.dir().map(Arc::<Path>::from);
-                let extensions = self.markdown_extensions.clone();
-                let doc = cx.weak_entity();
-                let doc_close = doc.clone();
-                let doc_link = doc;
-                this.child(table.render(
-                    base_dir,
-                    extensions,
-                    move |_, cx| {
-                        _ = doc_close.update(cx, DocumentView::close_expanded_table);
-                    },
-                    move |url, event, window, cx| {
-                        _ = doc_link.update(cx, DocumentView::close_expanded_table);
-                        crate::links::on_click(url, event, window, cx);
-                    },
-                    cx,
-                ))
-            })
             .into_any_element()
     }
 }
@@ -1741,21 +1653,44 @@ mod tests {
 
     #[gpui_kit::test]
     fn expands_and_closes_table_overlay(cx: &mut gpui_kit::TestAppContext) {
-        let (doc, _) = cx.add_window_view(|window, cx| {
-            gpui_kit::init(cx);
+        cx.update(gpui_kit::init);
+        let mut doc_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
             cx.set_global(AppSettings(crate::settings::Settings::default()));
-            let table_md = "| A | B |\n|---|---|\n| 1 | 2 |";
-            let mut view =
-                DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx);
-            assert!(!view.is_expanded_table_open());
-            view.open_expanded_table(table_md, Some(0..table_md.len()), cx);
-            assert!(view.is_expanded_table_open());
-            assert_eq!(view.expanded_table.as_ref().unwrap().markdown, table_md);
-            view.close_expanded_table(cx);
-            assert!(!view.is_expanded_table_open());
-            view
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let table_md = "| A | B |\n|---|---|\n| 1 | 2 |";
+                let doc = cx.new(|cx| {
+                    DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx)
+                });
+                doc_entity = Some(doc.clone());
+                doc
+            })
+            .unwrap()
         });
-        let _ = doc;
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            let table_md = "| A | B |\n|---|---|\n| 1 | 2 |";
+            assert!(!window.has_active_dialog(cx));
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_expanded_table(table_md, Some(0..table_md.len()), window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+            window.close_dialog(cx);
+            assert!(!window.has_active_dialog(cx));
+
+            // Test that pressing Escape closes the table dialog
+            crate::actions::bind_keys(cx);
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_expanded_table(table_md, Some(0..table_md.len()), window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+            let handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+            assert!(handled);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

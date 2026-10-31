@@ -12,7 +12,7 @@ use std::{
 
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, KeyDownEvent, Menu,
+    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, Menu,
     MouseButton, MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions,
     Render, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Task, Window, WindowBounds, WindowControlArea,
@@ -539,18 +539,15 @@ impl Workspace {
 
     /// Prune unreferenced diagram caches and trim allocator arenas when documents close.
     fn on_document_closed(&self, window: &mut Window, cx: &App) {
-        let docs: Vec<_> = self
+        let has_open_docs = self
             .tabs
             .iter()
-            .filter_map(|tab| match tab {
-                WorkspaceTab::Document(doc) => Some(doc.read(cx)),
-                WorkspaceTab::NewTab(_) => None,
-            })
-            .collect();
-        let active_refs: Vec<&str> = docs.iter().map(|doc| doc.source().as_ref()).collect();
-        let evicted = preview_ext::SharedDiagramCache::global(cx).prune_unreferenced(&active_refs);
-        for image in evicted {
-            _ = window.drop_image(image);
+            .any(|tab| matches!(tab, WorkspaceTab::Document(_)));
+        if !has_open_docs {
+            let evicted = preview_ext::SharedDiagramCache::global(cx).prune_unreferenced(&[]);
+            for image in evicted {
+                _ = window.drop_image(image);
+            }
         }
         crate::trim_allocator_memory();
     }
@@ -869,8 +866,6 @@ impl Workspace {
 
     /// Look for open files other programs changed, moved or deleted.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.save_session(window, cx);
-
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
             .tabs
             .iter()
@@ -1655,6 +1650,14 @@ impl Workspace {
     }
 
     pub(crate) fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if window
+            .root::<gpui_kit::base::Root>()
+            .is_some_and(|r| r.is_some())
+            && window.has_active_dialog(cx)
+        {
+            window.close_dialog(cx);
+            return;
+        }
         let search_open = self
             .active_document()
             .is_some_and(|doc| doc.read(cx).is_search_open());
@@ -2315,6 +2318,14 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                if window
+                    .root::<gpui_kit::base::Root>()
+                    .is_some_and(|r| r.is_some())
+                    && window.has_active_dialog(cx)
+                {
+                    window.close_dialog(cx);
+                    return;
+                }
                 let search_open = this
                     .active_document()
                     .is_some_and(|doc| doc.read(cx).is_search_open());
@@ -2325,16 +2336,6 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(Self::toggle_glance_mode_action))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
-                    let table_open = this
-                        .active_document()
-                        .is_some_and(|doc| doc.read(cx).is_expanded_table_open());
-                    if !table_open {
-                        this.handle_escape(window, cx);
-                    }
-                }
-            }))
             .on_action(cx.listener(|this, _: &ToggleScrollSync, _, cx| {
                 this.toggle(|settings| settings.scroll_sync = !settings.scroll_sync, cx);
             }))

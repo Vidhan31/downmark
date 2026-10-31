@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use gpui_kit::{
-    App, Global, Hsla, Rgba, SharedString, Window,
+    App, Hsla, Rgba, SharedString, Window,
     base::TypographyTokens,
     component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry},
     px,
@@ -11,7 +11,7 @@ use gpui_kit::{
 
 use crate::{
     diagram::DiagramTheme,
-    settings::{Appearance, Settings, clamp_font_size},
+    settings::{Appearance, Settings},
 };
 
 static DEFAULT_MONO_FONT: OnceLock<SharedString> = OnceLock::new();
@@ -28,40 +28,7 @@ const BUNDLED_THEMES: &[&str] = &[
     include_str!("../themes/tokyonight.json"),
 ];
 
-/// The user's preferences, shared by every window.
-pub(crate) struct AppSettings(pub(crate) Settings);
-
-impl Global for AppSettings {}
-
-impl AppSettings {
-    pub(crate) fn get(cx: &App) -> &Settings {
-        &cx.global::<AppSettings>().0
-    }
-
-    /// Change the settings, persist them, and re-apply the appearance.
-    pub(crate) fn update(cx: &mut App, f: impl FnOnce(&mut Settings)) {
-        let mut settings = Self::get(cx).clone();
-        f(&mut settings);
-        settings.font_size = clamp_font_size(settings.font_size);
-        if &settings == Self::get(cx) {
-            return;
-        }
-        let appearance_changed = {
-            let current = Self::get(cx);
-            current.appearance != settings.appearance
-                || current.light_theme != settings.light_theme
-                || current.dark_theme != settings.dark_theme
-                || (current.font_size - settings.font_size).abs() > f32::EPSILON
-                || current.font_family != settings.font_family
-                || current.mono_font_family != settings.mono_font_family
-        };
-        settings.save();
-        cx.set_global(AppSettings(settings));
-        if appearance_changed {
-            apply(None, cx);
-        }
-    }
-}
+pub(crate) use crate::settings::AppSettings;
 
 pub(crate) fn init(settings: Settings, cx: &mut App) {
     let registry = ThemeRegistry::global_mut(cx);

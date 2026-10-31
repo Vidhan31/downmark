@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
 
 const RECENT_LIMIT: usize = 10;
@@ -121,6 +122,67 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Whether persistent user settings match, ignoring runtime transient display state.
+    pub(crate) fn persistent_eq(&self, other: &Self) -> bool {
+        self.appearance == other.appearance
+            && self.light_theme == other.light_theme
+            && self.dark_theme == other.dark_theme
+            && (self.font_size - other.font_size).abs() <= f32::EPSILON
+            && self.font_family == other.font_family
+            && self.mono_font_family == other.mono_font_family
+            && self.soft_wrap == other.soft_wrap
+            && self.line_numbers == other.line_numbers
+            && self.scroll_sync == other.scroll_sync
+            && self.recent_files == other.recent_files
+            && self.tracked_folders == other.tracked_folders
+            && self.tabs == other.tabs
+            && self.glance_on_external == other.glance_on_external
+            && self.restore_session == other.restore_session
+            && self.image_folder == other.image_folder
+            && self.open_links_in == other.open_links_in
+            && self.confirm_web_links == other.confirm_web_links
+    }
+}
+
+/// The user's preferences, shared by every window.
+pub(crate) struct AppSettings(pub(crate) Settings);
+
+impl Global for AppSettings {}
+
+impl AppSettings {
+    pub(crate) fn get(cx: &App) -> &Settings {
+        &cx.global::<AppSettings>().0
+    }
+
+    /// Change the settings, persist them when needed, and re-apply appearance if changed.
+    pub(crate) fn update(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+        let mut settings = Self::get(cx).clone();
+        f(&mut settings);
+        settings.font_size = clamp_font_size(settings.font_size);
+        if &settings == Self::get(cx) {
+            return;
+        }
+        let appearance_changed = {
+            let current = Self::get(cx);
+            current.appearance != settings.appearance
+                || current.light_theme != settings.light_theme
+                || current.dark_theme != settings.dark_theme
+                || (current.font_size - settings.font_size).abs() > f32::EPSILON
+                || current.font_family != settings.font_family
+                || current.mono_font_family != settings.mono_font_family
+        };
+        let persistent_changed = !settings.persistent_eq(Self::get(cx));
+        if persistent_changed {
+            settings.save();
+        }
+        cx.set_global(AppSettings(settings));
+        if appearance_changed {
+            crate::themes::apply(None, cx);
+        }
+    }
+}
+
+impl Settings {
     /// Load settings, falling back to defaults when the file is missing or
     /// unreadable. Out-of-range values are clamped.
     pub(crate) fn load() -> Self {
@@ -231,6 +293,20 @@ mod tests {
         assert_eq!(settings.layout, Layout::Preview);
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(!serialized.contains("layout"));
+    }
+
+    #[test]
+    fn persistent_eq_ignores_layout_and_glance_mode() {
+        let mut a = Settings::default();
+        let mut b = Settings::default();
+        assert!(a.persistent_eq(&b));
+
+        a.layout = Layout::Editor;
+        a.glance_mode = true;
+        assert!(a.persistent_eq(&b));
+
+        b.font_size += 2.0;
+        assert!(!a.persistent_eq(&b));
     }
 
     #[test]

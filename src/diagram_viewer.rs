@@ -78,7 +78,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", PanRight, context),
         KeyBinding::new("up", PanUp, context),
         KeyBinding::new("down", PanDown, context),
-        KeyBinding::new("escape", CloseWindow, context),
         crate::actions::key_binding("secondary-w", CloseWindow, context),
     ]);
 }
@@ -644,6 +643,8 @@ impl Render for DiagramViewer {
             .on_action(cx.listener(|this, _: &PanRight, _, cx| this.pan(-PAN_STEP, 0., cx)))
             .on_action(cx.listener(|this, _: &PanUp, _, cx| this.pan(0., PAN_STEP, cx)))
             .on_action(cx.listener(|this, _: &PanDown, _, cx| this.pan(0., -PAN_STEP, cx)))
+            .on_action(|_: &gpui_kit::component::input::Escape, window, cx| window.close_dialog(cx))
+            .on_action(|_: &gpui_kit::component::dialog::Cancel, window, cx| window.close_dialog(cx))
             .on_action(|_: &CloseWindow, window, cx| window.close_dialog(cx))
             .child(self.render_header(cx))
             .child(self.render_canvas(window, cx))
@@ -786,7 +787,11 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(window_handle, |_, window, cx| {
-            window.close_dialog(cx);
+            crate::actions::bind_keys(cx);
+            window.draw(cx).clear(cx);
+            let handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+            assert!(handled);
             assert!(!window.has_active_dialog(cx));
         })
         .unwrap();

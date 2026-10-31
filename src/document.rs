@@ -99,16 +99,31 @@ pub(crate) fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Resu
     result
 }
 
-/// Whether `path` looks like a Markdown document.
-pub(crate) fn is_markdown_path(path: &Path) -> bool {
-    path.extension()
+/// Standard file extensions recognized as Markdown documents.
+pub(crate) const MARKDOWN_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "mdown", "mkd", "mkdn", "mdx",
+];
+
+/// Whether `name` looks like a Markdown file name (ignoring hidden files starting with `.`).
+pub(crate) fn is_markdown_file_name(name: &str) -> bool {
+    if name.starts_with('.') {
+        return false;
+    }
+    Path::new(name)
+        .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" | "txt"
-            )
+            MARKDOWN_EXTENSIONS
+                .iter()
+                .any(|&candidate| candidate.eq_ignore_ascii_case(ext))
         })
+}
+
+/// Whether `path` looks like a Markdown document.
+pub(crate) fn is_markdown_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_markdown_file_name)
 }
 
 /// The name shown for a document in the title bar and dialogs.
