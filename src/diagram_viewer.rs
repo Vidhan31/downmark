@@ -644,7 +644,9 @@ impl Render for DiagramViewer {
             .on_action(cx.listener(|this, _: &PanUp, _, cx| this.pan(0., PAN_STEP, cx)))
             .on_action(cx.listener(|this, _: &PanDown, _, cx| this.pan(0., -PAN_STEP, cx)))
             .on_action(|_: &gpui_kit::component::input::Escape, window, cx| window.close_dialog(cx))
-            .on_action(|_: &gpui_kit::component::dialog::Cancel, window, cx| window.close_dialog(cx))
+            .on_action(|_: &gpui_kit::component::dialog::Cancel, window, cx| {
+                window.close_dialog(cx);
+            })
             .on_action(|_: &CloseWindow, window, cx| window.close_dialog(cx))
             .child(self.render_header(cx))
             .child(self.render_canvas(window, cx))

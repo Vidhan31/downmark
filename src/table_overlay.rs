@@ -72,85 +72,85 @@ pub(crate) fn open(
                 let markdown_for_copy = markdown_copy.clone();
                 let base_dir_for_img = base_dir.clone();
                 let on_link_for_click = Arc::clone(&on_link);
-                content
-                    .h(height)
-                    .size_full()
-                    .p_0()
-                    .child(
-                        v_flex()
-                            .id("expanded-table-container")
-                            .track_focus(&container_focus)
-                            .size_full()
-                            .overflow_hidden()
-                            .on_action(|_: &gpui_kit::component::input::Escape, window, cx| {
-                                window.close_dialog(cx);
-                            })
-                            .on_action(|_: &Cancel, window, cx| {
-                                window.close_dialog(cx);
-                            })
-                            .on_action(|_: &crate::actions::CloseWindow, window, cx| {
-                                window.close_dialog(cx);
-                            })
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .px_4()
-                                    .py_2p5()
-                                    .border_b_1()
-                                    .border_color(cx.theme().border)
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(cx.theme().foreground)
-                                            .child("Table"),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                Button::new("copy-expanded-table")
-                                                    .accessibility_label("Copy table Markdown")
-                                                    .xsmall()
-                                                    .ghost()
-                                                    .icon(Icon::new(IconName::Copy))
-                                                    .tooltip("Copy table Markdown")
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                content.h(height).size_full().p_0().child(
+                    v_flex()
+                        .id("expanded-table-container")
+                        .track_focus(&container_focus)
+                        .size_full()
+                        .overflow_hidden()
+                        .on_action(|_: &gpui_kit::component::input::Escape, window, cx| {
+                            window.close_dialog(cx);
+                        })
+                        .on_action(|_: &Cancel, window, cx| {
+                            window.close_dialog(cx);
+                        })
+                        .on_action(|_: &crate::actions::CloseWindow, window, cx| {
+                            window.close_dialog(cx);
+                        })
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .px_4()
+                                .py_2p5()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(cx.theme().foreground)
+                                        .child("Table"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("copy-expanded-table")
+                                                .accessibility_label("Copy table Markdown")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(Icon::new(IconName::Copy))
+                                                .tooltip("Copy table Markdown")
+                                                .on_click(move |_, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(
                                                             markdown_for_copy.to_string(),
-                                                        ));
-                                                    }),
-                                            )
-                                            .child(
-                                                Button::new("close-expanded-table")
-                                                    .accessibility_label("Close expanded table (Esc)")
-                                                    .xsmall()
-                                                    .ghost()
-                                                    .icon(Icon::new(IconName::Close))
-                                                    .tooltip("Close (Esc)")
-                                                    .on_click(|_, window, cx| {
-                                                        window.close_dialog(cx);
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div().flex_1().min_h_0().size_full().p_4().child(
-                                    TextView::new(&table_view)
-                                        .size_full()
-                                        .scrollable(true)
-                                        .selectable(true)
-                                        .markdown_extensions(extensions.clone())
-                                        .image_source(move |url| images::resolve(url, base_dir_for_img.as_deref()))
-                                        .on_link_click(move |url, event, window, cx| {
-                                            window.close_dialog(cx);
-                                            on_link_for_click(url, event, window, cx);
-                                        }),
+                                                        ),
+                                                    );
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("close-expanded-table")
+                                                .accessibility_label("Close expanded table (Esc)")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(Icon::new(IconName::Close))
+                                                .tooltip("Close (Esc)")
+                                                .on_click(|_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                }),
+                                        ),
                                 ),
+                        )
+                        .child(
+                            div().flex_1().min_h_0().size_full().p_4().child(
+                                TextView::new(&table_view)
+                                    .size_full()
+                                    .scrollable(true)
+                                    .selectable(true)
+                                    .markdown_extensions(extensions.clone())
+                                    .image_source(move |url| {
+                                        images::resolve(url, base_dir_for_img.as_deref())
+                                    })
+                                    .on_link_click(move |url, event, window, cx| {
+                                        window.close_dialog(cx);
+                                        on_link_for_click(url, event, window, cx);
+                                    }),
                             ),
-                    )
+                        ),
+                )
             })
     });
 }

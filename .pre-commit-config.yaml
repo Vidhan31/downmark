@@ -1,0 +1,66 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+minimum_pre_commit_version: '3.3.0'
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+# Hosted pre-commit.ci configuration
+ci:
+  autofix_commit_msg: 'chore(pre-commit): auto fixes from pre-commit.ci'
+  autoupdate_commit_msg: 'chore(pre-commit): pre-commit autoupdate'
+  autoupdate_schedule: weekly
+  skip: [cargo-fmt, cargo-clippy, cargo-test]
+  submodules: false
+
+repos:
+  # General repository hygiene & file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Whitespace and file structure
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+      # Syntax integrity
+      - id: check-yaml
+      - id: check-toml
+      # Git & filesystem sanity
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+
+  # Fast source code spell checker (precompiled binaries via PyPI)
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.51.1
+    hooks:
+      - id: typos
+
+  # Local Rust checks: Fast formatting & linting matching CI standards
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Ensure Rust code follows standard formatting rules
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust code with Clippy
+        entry: cargo clippy --locked --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-test
+        name: cargo test
+        description: Run Rust automated unit and integration tests
+        entry: cargo test --locked
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

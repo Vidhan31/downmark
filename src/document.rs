@@ -100,9 +100,7 @@ pub(crate) fn save(path: &Path, text: &str, line_ending: LineEnding) -> io::Resu
 }
 
 /// Standard file extensions recognized as Markdown documents.
-pub(crate) const MARKDOWN_EXTENSIONS: &[&str] = &[
-    "md", "markdown", "mdown", "mkd", "mkdn", "mdx",
-];
+pub(crate) const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn", "mdx"];
 
 /// Whether `name` looks like a Markdown file name (ignoring hidden files starting with `.`).
 pub(crate) fn is_markdown_file_name(name: &str) -> bool {

@@ -14,7 +14,8 @@ use gpui_kit::{
     Focusable as _, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
     MouseButton, MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache,
     ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    Window, assets::IconName,
+    Window,
+    assets::IconName,
     base::{TextView, TextViewState},
     component::{
         ActiveTheme as _, ElementExt as _, Icon, RopeExt as _, Sizable as _, WindowExt as _,
@@ -50,8 +51,7 @@ use crate::{
     search_overlay,
     session::{self, DiskStamp, Recovery},
     settings::Layout,
-    smart_edit,
-    table_overlay,
+    smart_edit, table_overlay,
     themes::AppSettings,
 };
 
@@ -454,7 +454,10 @@ impl DocumentView {
         self.sync_editor(cx);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "getter for document source text"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "getter for document source text")
+    )]
     pub(crate) fn source(&self) -> &SharedString {
         &self.source
     }
@@ -587,9 +590,8 @@ impl DocumentView {
                 let list = state.list_state().clone();
                 let viewport = list.viewport_bounds();
                 let item_bounds = list.bounds_for_item(table_ix);
-                let is_visible = item_bounds.is_some_and(|b| {
-                    b.top() >= viewport.top() && b.top() < viewport.bottom()
-                });
+                let is_visible = item_bounds
+                    .is_some_and(|b| b.top() >= viewport.top() && b.top() < viewport.bottom());
                 if !is_visible {
                     list.scroll_to(ListOffset {
                         item_ix: table_ix,

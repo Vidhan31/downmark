@@ -12,9 +12,9 @@ use std::{
 
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, Menu,
-    MouseButton, MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions,
-    Render, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, Menu, MouseButton,
+    MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions, Render,
+    ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
     Subscription, Task, Window, WindowBounds, WindowControlArea,
     assets::IconName,
     component::{
