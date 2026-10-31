@@ -46,6 +46,8 @@ pub(crate) fn init(cx: &mut App) -> Entity<AppMenuBar> {
 }
 
 fn update(app_menu_bar: &Entity<AppMenuBar>, cx: &mut App) {
+    // `gpui_kit::Menu` does not implement `Clone` and is consumed by value,
+    // so build is evaluated once for the system menu bar and once for the in-window bar.
     cx.set_menus(build(cx));
     let menus = build(cx).into_iter().map(Menu::owned).collect();
     GlobalState::global_mut(cx).set_app_menus(menus);

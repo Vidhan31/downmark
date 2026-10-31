@@ -28,6 +28,16 @@ pub(crate) enum ScrollDriver {
     Preview,
 }
 
+/// How scroll synchronization should be applied.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    /// Skip if the editor scroll position hasn't changed.
+    #[default]
+    Normal,
+    /// Force alignment even if previous position matches.
+    Force,
+}
+
 /// A source position the editor is being scrolled to.
 ///
 /// Lines off screen have no layout to measure, so the editor first jumps to
@@ -89,7 +99,6 @@ impl ScrollSynchronizer {
     /// the preview drives, it only records where the editor is, so the
     /// editor's catching up is not mistaken for the user scrolling it.
     #[expect(
-        clippy::fn_params_excessive_bools,
         clippy::cast_precision_loss,
         clippy::as_conversions,
         reason = "Scroll interpolation and line offset conversions"
@@ -99,7 +108,7 @@ impl ScrollSynchronizer {
         editor: &Entity<EditorState>,
         preview: &Entity<TextViewState>,
         analysis: &Analysis,
-        force: bool,
+        mode: SyncMode,
         cx: &mut App,
     ) {
         if !Self::syncs_scrolling(cx) {
@@ -117,7 +126,7 @@ impl ScrollSynchronizer {
             self.synced_editor_scroll = Some(position);
             return;
         }
-        if !force && self.synced_editor_scroll == Some(position) {
+        if mode != SyncMode::Force && self.synced_editor_scroll == Some(position) {
             return;
         }
         self.synced_editor_scroll = Some(position);

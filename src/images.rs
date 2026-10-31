@@ -105,10 +105,14 @@ pub(crate) fn store_image(
 /// `path` as a Markdown link, which separates folders with `/` on every
 /// system (Windows paths use `\\`).
 pub(crate) fn link_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::new();
+    for (ix, component) in path.components().enumerate() {
+        if ix > 0 {
+            out.push('/');
+        }
+        out.push_str(&component.as_os_str().to_string_lossy());
+    }
+    out
 }
 
 /// `YYYYMMDD-HHMMSS` in UTC, for naming pasted images.

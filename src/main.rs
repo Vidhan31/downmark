@@ -11,6 +11,11 @@ unsafe extern "C" {
     fn mi_collect(force: bool);
 }
 
+#[cfg(all(not(feature = "mimalloc"), target_os = "linux"))]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
 /// Trims allocator free lists and decommits unused memory back to the operating system.
 pub(crate) fn trim_allocator_memory() {
     #[cfg(feature = "mimalloc")]
@@ -23,9 +28,6 @@ pub(crate) fn trim_allocator_memory() {
     // SAFETY: `malloc_trim` is a standard GNU libc extension to release free heap memory to the OS.
     // Passing 0 padding is well-defined and operates on glibc internal memory arenas safely.
     unsafe {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
         malloc_trim(0);
     }
 }

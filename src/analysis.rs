@@ -122,6 +122,11 @@ impl BlockIndex {
         self.starts.len()
     }
 
+    #[expect(dead_code, reason = "implements is_empty alongside len")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
     #[expect(dead_code, reason = "provided for block inspection")]
     pub(crate) fn spans(&self) -> &[Range<usize>] {
         &self.spans

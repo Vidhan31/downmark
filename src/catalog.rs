@@ -242,7 +242,12 @@ impl FolderCatalog {
             return;
         }
 
-        let valid_folders: Vec<&PathBuf> = self.folders.iter().filter(|f| f.is_dir()).collect();
+        let valid_folders: Vec<&Path> = self
+            .folders
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|f| f.is_dir())
+            .collect();
         let mut results: Vec<Option<ScannedFolderGroup>> = vec![None; valid_folders.len()];
 
         std::thread::scope(|s| {

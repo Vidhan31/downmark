@@ -3,6 +3,11 @@
 //! Every command is an Action so the title bar, the menu bar, the editor's
 //! context menu and the keyboard all dispatch the same thing.
 
+#![expect(
+    clippy::unsafe_derive_deserialize,
+    reason = "GPUI Action derive macro generates internal dispatch methods that use unsafe"
+)]
+
 use gpui_kit::{Action, App, KeyBinding, SharedString, actions};
 use serde::Deserialize;
 

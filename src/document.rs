@@ -40,12 +40,8 @@ pub(crate) struct LoadedText {
 /// Read a UTF-8 text file. A byte-order mark is dropped.
 pub(crate) fn load(path: &Path) -> io::Result<LoadedText> {
     let bytes = fs::read(path)?;
-    let text = String::from_utf8(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "The file isn’t valid UTF-8 text.",
-        )
-    })?;
+    let text =
+        String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let stripped = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let line_ending = LineEnding::detect(stripped);
     let text = match line_ending {

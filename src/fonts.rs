@@ -94,9 +94,8 @@ impl FontRegistry {
         if !mono_list.is_empty() {
             let all = Self::all_fonts();
             let mut result = mono_list;
-            let seen: std::collections::HashSet<_> = result.iter().cloned().collect();
             for font in all {
-                if !seen.contains(&font) {
+                if !result.iter().any(|m| m == &font) {
                     result.push(font);
                 }
             }

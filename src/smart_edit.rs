@@ -271,25 +271,30 @@ pub(crate) fn enter(text: &str, selection: Range<usize>) -> Option<Edit> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftDirection {
+    Indent,
+    Outdent,
+}
+
 /// Nest the list items the selection touches under the item above them.
 pub(crate) fn indent(text: &str, selection: Range<usize>) -> Option<Edit> {
-    shift_items(text, selection, true)
+    shift_items(text, selection, ShiftDirection::Indent)
 }
 
 /// Move the list items the selection touches out one level.
 pub(crate) fn outdent(text: &str, selection: Range<usize>) -> Option<Edit> {
-    shift_items(text, selection, false)
+    shift_items(text, selection, ShiftDirection::Outdent)
 }
 
 #[expect(
-    clippy::fn_params_excessive_bools,
     clippy::too_many_lines,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::as_conversions,
     reason = "Signed line delta tracking across item nesting"
 )]
-fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit> {
+fn shift_items(text: &str, selection: Range<usize>, direction: ShiftDirection) -> Option<Edit> {
     if selection.end > text.len() {
         return None;
     }
@@ -337,7 +342,7 @@ fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit
                 && predicate(prefix.indent_columns())
         })
     };
-    let target = if deeper {
+    let target = if direction == ShiftDirection::Indent {
         let sibling = above(&|indent| indent <= head_indent)?;
         if prefixes[sibling].indent_columns() != head_indent {
             return None;
@@ -379,7 +384,7 @@ fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit
             continue;
         }
         let old = prefix.indent_columns();
-        let new = if deeper {
+        let new = if direction == ShiftDirection::Indent {
             old + (target - head_indent)
         } else {
             old.saturating_sub(head_indent - target)
@@ -387,7 +392,7 @@ fn shift_items(text: &str, selection: Range<usize>, deeper: bool) -> Option<Edit
         let rest = &line[prefix.quote.len() + prefix.indent.len()..];
         let mut rewritten = format!("{}{}{rest}", prefix.quote, " ".repeat(new));
         // A newly nested numbered item starts its own list at 1.
-        if deeper
+        if direction == ShiftDirection::Indent
             && ix == first
             && first_in_group
             && let Some(Item {
@@ -691,16 +696,19 @@ impl Table {
             .unwrap_or(1)
     }
 
+    fn cell(row: &[String], column: usize) -> &str {
+        row.get(column).map_or("", String::as_str)
+    }
+
     /// Render aligned, returning the text and each cell's content range
     /// (relative to the text) by row (delimiter excluded) and column.
     fn render(&self) -> (String, Vec<Vec<Range<usize>>>) {
         let columns = self.columns();
-        let cell = |row: &Vec<String>, column: usize| row.get(column).cloned().unwrap_or_default();
         let widths: Vec<usize> = (0..columns)
             .map(|column| {
                 self.rows
                     .iter()
-                    .map(|row| cell(row, column).width())
+                    .map(|row| Self::cell(row, column).width())
                     .max()
                     .unwrap_or(0)
                     .max(3)
@@ -734,7 +742,7 @@ impl Table {
             out.push('|');
             let mut row_spans = Vec::new();
             for (column, width) in widths.iter().enumerate() {
-                let content = cell(row, column);
+                let content = Self::cell(row, column);
                 let pad = width - content.width();
                 let (before, after) = match align(column) {
                     Align::Right => (pad, 0),
@@ -742,11 +750,15 @@ impl Table {
                     Align::None | Align::Left => (0, pad),
                 };
                 out.push(' ');
-                out.push_str(&" ".repeat(before));
+                for _ in 0..before {
+                    out.push(' ');
+                }
                 let start = out.len();
-                out.push_str(&content);
+                out.push_str(content);
                 row_spans.push(start..out.len());
-                out.push_str(&" ".repeat(after));
+                for _ in 0..after {
+                    out.push(' ');
+                }
                 out.push_str(" |");
             }
             spans.push(row_spans);

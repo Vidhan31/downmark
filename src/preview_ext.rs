@@ -2,7 +2,8 @@
 //! Mermaid diagrams.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash as _, Hasher as _},
     sync::{Arc, Mutex},
 };
 
@@ -626,7 +627,11 @@ impl DiagramCache {
         svg_renderer: SvgRenderer,
         cx: &mut App,
     ) -> DiagramLookup {
-        let theme_hash = content_hash(&format!("{theme:?}"));
+        let theme_hash = {
+            let mut hasher = DefaultHasher::new();
+            theme.hash(&mut hasher);
+            hasher.finish()
+        };
         let key = DiagramKey::new(source, theme_hash, scale_factor);
         let shared_cache = SharedDiagramCache::global(cx);
         let mut entries = shared_cache.entries.lock().expect("diagram cache poisoned");

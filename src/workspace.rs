@@ -211,6 +211,13 @@ impl GlanceStart {
     }
 }
 
+/// Whether a newly opened tab should be activated immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabActivation {
+    Activate,
+    Background,
+}
+
 impl Workspace {
     /// A workspace restoring the last session (when enabled) and opening
     /// `paths`.
@@ -332,7 +339,12 @@ impl Workspace {
                 if ix == previous.active {
                     active = Some(self.tabs.len());
                 }
-                self.add_tab(WorkspaceTab::Document(doc), false, window, cx);
+                self.add_tab(
+                    WorkspaceTab::Document(doc),
+                    TabActivation::Background,
+                    window,
+                    cx,
+                );
             }
         }
 
@@ -340,7 +352,12 @@ impl Workspace {
         let recovered = orphans.len() + self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count();
         for (id, recovery) in orphans {
             let doc = Self::restored_document(id, recovery, window, cx);
-            self.add_tab(WorkspaceTab::Document(doc), false, window, cx);
+            self.add_tab(
+                WorkspaceTab::Document(doc),
+                TabActivation::Background,
+                window,
+                cx,
+            );
         }
         if recovered > 0 {
             let message = if recovered == 1 {
@@ -372,7 +389,7 @@ impl Workspace {
                 let new_tab = cx.new(|cx| NewTabView::new(self.catalog.clone(), window, cx));
                 WorkspaceTab::NewTab(new_tab)
             };
-            self.add_tab(tab, false, window, cx);
+            self.add_tab(tab, TabActivation::Background, window, cx);
         }
         self.active = active.unwrap_or(0).min(self.tabs.len().saturating_sub(1));
         let single_file = paths.len() == 1;
@@ -418,14 +435,10 @@ impl Workspace {
         self.tabs.iter().position(|tab| tab.entity_id() == id)
     }
 
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "Internal tab activation flag"
-    )]
     fn add_tab(
         &mut self,
         tab: WorkspaceTab,
-        activate: bool,
+        activation: TabActivation,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -469,7 +482,7 @@ impl Workspace {
         self.tab_subscriptions
             .push((tab.entity_id(), subscriptions));
         self.tabs.push(tab);
-        if activate {
+        if activation == TabActivation::Activate {
             self.activate(self.tabs.len() - 1, window, cx);
         }
     }
@@ -486,7 +499,12 @@ impl Workspace {
             .retain(|(subscribed, _)| *subscribed != id);
         if self.tabs.is_empty() {
             let new_tab = cx.new(|cx| NewTabView::new(self.catalog.clone(), window, cx));
-            self.add_tab(WorkspaceTab::NewTab(new_tab), false, window, cx);
+            self.add_tab(
+                WorkspaceTab::NewTab(new_tab),
+                TabActivation::Background,
+                window,
+                cx,
+            );
         }
         if self.active > ix || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
@@ -504,7 +522,7 @@ impl Workspace {
     ) {
         let old = self.active_tab().entity_id();
         let position = self.active;
-        self.add_tab(tab, false, window, cx);
+        self.add_tab(tab, TabActivation::Background, window, cx);
         let new = self.tabs.pop().expect("just added");
         self.tabs.insert(position, new);
         if let Some(ix) = self.tab_index(old) {
@@ -638,7 +656,7 @@ impl Workspace {
                     if replace {
                         this.replace_active(tab, window, cx);
                     } else {
-                        this.add_tab(tab, true, window, cx);
+                        this.add_tab(tab, TabActivation::Activate, window, cx);
                     }
                     if let Some(anchor) = anchor {
                         this.reveal_anchor(&doc, &anchor, window, cx);
@@ -664,7 +682,7 @@ impl Workspace {
         let doc = cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
         let tab = WorkspaceTab::Document(doc);
         if AppSettings::get(cx).tabs {
-            self.add_tab(tab, true, window, cx);
+            self.add_tab(tab, TabActivation::Activate, window, cx);
         } else {
             self.replace_active(tab, window, cx);
         }
@@ -674,15 +692,19 @@ impl Workspace {
         if AppSettings::get(cx).glance_mode {
             AppSettings::update(cx, |settings| settings.glance_mode = false);
         }
-        self.new_tab(true, window, cx);
+        self.new_tab(TabActivation::Activate, window, cx);
     }
 
-    #[expect(clippy::fn_params_excessive_bools, reason = "Tab activation flag")]
-    fn new_tab(&mut self, activate: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn new_tab(
+        &mut self,
+        activation: TabActivation,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let new_tab = cx.new(|cx| NewTabView::new(self.catalog.clone(), window, cx));
         let tab = WorkspaceTab::NewTab(new_tab);
         if AppSettings::get(cx).tabs {
-            self.add_tab(tab, activate, window, cx);
+            self.add_tab(tab, activation, window, cx);
         } else {
             self.replace_active(tab, window, cx);
         }
@@ -1799,7 +1821,13 @@ impl Workspace {
                         let tab_name = tab.name(cx);
                         let tab_path = tab.path(cx).cloned();
 
-                        let tab_tooltip = format_tab_tooltip(&tab_name, tab_path.as_deref(), dirty);
+                        let dirty_state = if dirty {
+                            DirtyState::Dirty
+                        } else {
+                            DirtyState::Clean
+                        };
+                        let tab_tooltip =
+                            format_tab_tooltip(&tab_name, tab_path.as_deref(), dirty_state);
 
                         let tab_icon = match tab {
                             WorkspaceTab::Document(_) => IconName::FileText,
@@ -1981,7 +2009,7 @@ impl Workspace {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
-                            this.new_tab(true, window, cx);
+                            this.new_tab(TabActivation::Activate, window, cx);
                         }),
                     ),
             )
@@ -2476,12 +2504,14 @@ fn populate_popup_from_menu_items(
     popup
 }
 
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "Tab dirty state and tooltip formatting"
-)]
-fn format_tab_tooltip(name: &str, path: Option<&Path>, dirty: bool) -> SharedString {
-    if dirty {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyState {
+    Clean,
+    Dirty,
+}
+
+fn format_tab_tooltip(name: &str, path: Option<&Path>, dirty: DirtyState) -> SharedString {
+    if dirty == DirtyState::Dirty {
         if let Some(path) = path {
             SharedString::from(format!("{name} (Edited)\n{}", path.display()))
         } else {
@@ -2543,18 +2573,21 @@ mod tests {
 
     #[test]
     fn tab_tooltip_formatting() {
-        assert_eq!(format_tab_tooltip("Home", None, false).as_ref(), "Home");
         assert_eq!(
-            format_tab_tooltip("Home", None, true).as_ref(),
+            format_tab_tooltip("Home", None, DirtyState::Clean).as_ref(),
+            "Home"
+        );
+        assert_eq!(
+            format_tab_tooltip("Home", None, DirtyState::Dirty).as_ref(),
             "Home (Edited)"
         );
         let path = Path::new("/path/to/document.md");
         assert_eq!(
-            format_tab_tooltip("document.md", Some(path), false).as_ref(),
+            format_tab_tooltip("document.md", Some(path), DirtyState::Clean).as_ref(),
             "document.md\n/path/to/document.md"
         );
         assert_eq!(
-            format_tab_tooltip("document.md", Some(path), true).as_ref(),
+            format_tab_tooltip("document.md", Some(path), DirtyState::Dirty).as_ref(),
             "document.md (Edited)\n/path/to/document.md"
         );
     }
@@ -2603,7 +2636,7 @@ mod tests {
             let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             let initial_tab_count = ws.tabs.len();
             for _ in 0..15 {
-                ws.new_tab(false, window, cx);
+                ws.new_tab(TabActivation::Background, window, cx);
             }
             assert_eq!(ws.tabs.len(), initial_tab_count + 15);
             ws
@@ -2624,7 +2657,7 @@ mod tests {
             let app_menu_bar = AppMenuBar::new(cx);
             let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
             for _ in 0..10 {
-                ws.new_tab(false, window, cx);
+                ws.new_tab(TabActivation::Background, window, cx);
             }
 
             assert_eq!(ws.tabs_scroll_handle.offset().x, px(0.));
@@ -2654,7 +2687,7 @@ mod tests {
             assert_eq!(ws.tabs.len(), 1);
             assert_eq!(ws.active, 0);
 
-            ws.new_tab(true, window, cx);
+            ws.new_tab(TabActivation::Activate, window, cx);
             assert_eq!(ws.tabs.len(), 2);
             assert_eq!(ws.active, 1);
             assert!(matches!(ws.tabs[1], WorkspaceTab::NewTab(_)));

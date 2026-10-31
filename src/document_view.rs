@@ -45,7 +45,7 @@ use crate::{
     document::{LineEnding, display_name},
     format::{self, Edit},
     images, preview_ext,
-    scroll_sync::{ScrollDriver, ScrollSynchronizer},
+    scroll_sync::{ScrollDriver, ScrollSynchronizer, SyncMode},
     search::DocumentSearch,
     search_overlay,
     session::{self, DiskStamp, Recovery},
@@ -230,19 +230,19 @@ impl DocumentView {
             ),
             cx.observe(&editor, |this, editor, cx| {
                 this.last_cursor = editor.read(cx).cursor();
-                this.sync_preview(false, cx);
+                this.sync_preview(SyncMode::Normal, cx);
             }),
             // A re-parse can rebuild the preview's rows, which resets its
             // scroll position; realign once the new rows exist.
             cx.observe(&preview, |this, preview, cx| {
                 let rows = preview.read(cx).list_state().item_count();
                 if rows != this.scroll_sync.synced_preview_rows() {
-                    this.sync_preview(true, cx);
+                    this.sync_preview(SyncMode::Force, cx);
                 }
             }),
             cx.observe_global_in::<AppSettings>(window, |this, window, cx| {
                 this.apply_settings(window, cx);
-                this.sync_preview(true, cx);
+                this.sync_preview(SyncMode::Force, cx);
                 cx.notify();
             }),
             cx.observe_window_appearance(window, |this, _, cx| {
@@ -753,7 +753,7 @@ impl DocumentView {
                     if this.search_open && !this.search.query().is_empty() {
                         this.on_search_query_changed(cx);
                     }
-                    this.sync_preview(true, cx);
+                    this.sync_preview(SyncMode::Force, cx);
                     this.preview_task = None;
                     cx.notify();
                 });
@@ -765,7 +765,7 @@ impl DocumentView {
             if self.search_open && !self.search.query().is_empty() {
                 self.on_search_query_changed(cx);
             }
-            self.sync_preview(true, cx);
+            self.sync_preview(SyncMode::Force, cx);
         }
     }
 
@@ -794,7 +794,7 @@ impl DocumentView {
                 } else {
                     this.discard_recovery();
                 }
-                this.sync_preview(true, cx);
+                this.sync_preview(SyncMode::Force, cx);
                 cx.notify();
             });
         }));
@@ -1195,13 +1195,9 @@ impl DocumentView {
         self.scroll_sync.set_driver(driver);
     }
 
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "force flag indicates re-layout realignment"
-    )]
-    fn sync_preview(&mut self, force: bool, cx: &mut Context<'_, Self>) {
+    fn sync_preview(&mut self, mode: SyncMode, cx: &mut Context<'_, Self>) {
         self.scroll_sync
-            .sync_preview(&self.editor, &self.preview, &self.analysis, force, cx);
+            .sync_preview(&self.editor, &self.preview, &self.analysis, mode, cx);
     }
 
     fn sync_editor(&mut self, cx: &mut Context<'_, Self>) {
