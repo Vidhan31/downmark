@@ -737,7 +737,6 @@ impl MarkdownPlugin for MermaidPlugin {
                             .relative()
                             .w_full()
                             .max_w(px(width))
-                            .cursor_pointer()
                             .on_click(move |event, window, cx| {
                                 if !event.is_right_click() {
                                     open(window, cx);

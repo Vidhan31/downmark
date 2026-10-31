@@ -4,7 +4,8 @@ use std::cell::Cell;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::{
-    App, AppContext as _, FontWeight, IntoElement, ParentElement as _, Styled as _, Window,
+    App, AppContext as _, FontWeight, IntoElement, ParentElement as _, RenderOnce, Styled as _,
+    Window,
     component::{
         ActiveTheme as _, Icon, IndexPath, Sizable as _, WindowExt as _,
         button::Button,
@@ -78,7 +79,6 @@ pub(crate) fn open_settings(window: &mut Window, cx: &mut App) {
             }
         },
     );
-    normal_sub.detach();
 
     let code_sub = cx.subscribe(
         &code_select,
@@ -91,11 +91,12 @@ pub(crate) fn open_settings(window: &mut Window, cx: &mut App) {
             }
         },
     );
-    code_sub.detach();
 
     let fonts_synced = Cell::new(FontRegistry::is_loaded());
+    let dialog_subscriptions = Some((normal_sub, code_sub));
 
     window.open_dialog(cx, move |dialog, window, cx| {
+        let _keep_subscriptions = &dialog_subscriptions;
         if FontRegistry::is_loaded() && !fonts_synced.get() {
             fonts_synced.set(true);
             let all = FontRegistry::all_fonts();
@@ -314,73 +315,86 @@ pub(crate) fn open_settings(window: &mut Window, cx: &mut App) {
                     cx,
                 ))
                 .child(section("FILES"))
-                .child(default_app_row(default_status, cx)),
+                .child(DefaultAppRow::new(default_status)),
         )
     });
 }
 
 /// The settings row that makes Downmark the app for Markdown files.
-fn default_app_row(status: default_app::Status, cx: &App) -> impl IntoElement {
-    let is_default = status == default_app::Status::Default;
-    let description = if is_default {
-        "Markdown files you open from your desktop open in Downmark."
-    } else if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
-        "Choose Downmark for Markdown files in Windows Settings."
-    } else {
-        "Open Markdown files from your desktop in Downmark."
-    };
-    let action = if is_default {
-        h_flex()
-            .gap_1()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(IconName::Check).small())
-            .child("Default")
-            .into_any_element()
-    } else {
-        let label = if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
-            "Open Settings…"
+#[derive(IntoElement)]
+struct DefaultAppRow {
+    status: default_app::Status,
+}
+
+impl DefaultAppRow {
+    fn new(status: default_app::Status) -> Self {
+        Self { status }
+    }
+}
+
+impl RenderOnce for DefaultAppRow {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let is_default = self.status == default_app::Status::Default;
+        let description = if is_default {
+            "Markdown files you open from your desktop open in Downmark."
+        } else if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
+            "Choose Downmark for Markdown files in Windows Settings."
         } else {
-            "Make Default"
+            "Open Markdown files from your desktop in Downmark."
         };
-        Button::new("make-default")
-            .label(label)
-            .small()
-            .outline()
-            .on_click(|_, window, cx| {
-                let note = match default_app::make_default(cx) {
-                    Ok(default_app::Outcome::Done) => {
-                        Notification::success("Downmark now opens Markdown files.")
-                    }
-                    Ok(default_app::Outcome::SettingsOpened) => Notification::info(
-                        "In Settings, set Downmark as the default for .md files.",
+        let action = if is_default {
+            h_flex()
+                .gap_1()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(Icon::new(IconName::Check).small())
+                .child("Default")
+                .into_any_element()
+        } else {
+            let label = if default_app::CHOSEN_IN_SYSTEM_SETTINGS {
+                "Open settings…"
+            } else {
+                "Make default"
+            };
+            Button::new("make-default")
+                .label(label)
+                .small()
+                .outline()
+                .on_click(|_, window, cx| {
+                    let note = match default_app::make_default(cx) {
+                        Ok(default_app::Outcome::Done) => {
+                            Notification::success("Downmark now opens Markdown files.")
+                        }
+                        Ok(default_app::Outcome::SettingsOpened) => Notification::info(
+                            "In Settings, set Downmark as the default for .md files.",
+                        ),
+                        Err(message) => Notification::error(message),
+                    };
+                    window.push_notification(note, cx);
+                    window.refresh();
+                })
+                .into_any_element()
+        };
+        h_flex()
+            .gap_4()
+            .py_2()
+            .justify_between()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Default app for Markdown"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(description),
                     ),
-                    Err(message) => Notification::error(message),
-                };
-                window.push_notification(note, cx);
-                window.refresh();
-            })
-            .into_any_element()
-    };
-    h_flex()
-        .gap_4()
-        .py_2()
-        .justify_between()
-        .child(
-            v_flex()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Default app for Markdown"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description),
-                ),
-        )
-        .child(action)
+            )
+            .child(action)
+    }
 }

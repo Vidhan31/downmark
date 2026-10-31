@@ -510,7 +510,7 @@ impl DiagramViewer {
                             .disabled(!ready)
                             .on_click(cx.listener(|this, _, _, cx| this.fit(cx))),
                     )
-                    .child(div().h(px(16.)).w(px(1.)).mx_1().bg(cx.theme().border))
+                    .child(div().h_4().w_px().mx_1().bg(cx.theme().border))
                     .child(
                         Button::new("close-diagram")
                             .accessibility_label("Close diagram viewer (Esc)")

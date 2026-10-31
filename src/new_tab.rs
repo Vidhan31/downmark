@@ -139,14 +139,13 @@ impl NewTabView {
             ))
             .flex_1()
             .min_w(px(280.))
-            .h(px(44.))
+            .h_11()
             .px_3()
             .gap_3()
             .rounded_md()
             .border_1()
             .border_color(border_color)
             .bg(bg_color)
-            .cursor_pointer()
             .hover(|s| s.bg(theme.list_hover))
             .on_mouse_down(
                 MouseButton::Left,
@@ -635,7 +634,6 @@ impl Render for NewTabView {
                                                             .py_0p5()
                                                             .rounded_full()
                                                             .border_1()
-                                                            .cursor_pointer()
                                                             .text_xs()
                                                             .when(is_all, |s| {
                                                                 s.bg(theme.primary)
@@ -672,7 +670,6 @@ impl Render for NewTabView {
                                                             .py_0p5()
                                                             .rounded_full()
                                                             .border_1()
-                                                            .cursor_pointer()
                                                             .text_xs()
                                                             .when(is_selected, |s| {
                                                                 s.bg(theme.primary)
@@ -734,7 +731,7 @@ impl Render for NewTabView {
                                                     .gap_2()
                                                     .child(
                                                         Icon::new(IconName::Search)
-                                                            .size(px(24.))
+                                                            .size_6()
                                                             .text_color(theme.muted_foreground),
                                                     )
                                                     .child(

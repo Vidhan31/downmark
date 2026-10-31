@@ -106,7 +106,7 @@ pub(crate) fn confirm_external_link(url: String, window: &mut Window, cx: &mut A
                     )
                     .child(
                         Button::new("open")
-                            .label(if web { "Open in Browser" } else { "Open" })
+                            .label(if web { "Open in browser" } else { "Open" })
                             .primary()
                             .on_click(move |_, window, cx| {
                                 window.close_dialog(cx);

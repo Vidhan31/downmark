@@ -1545,7 +1545,7 @@ impl DocumentView {
                 let doc_prev = doc.clone();
                 let doc_next = doc.clone();
                 let doc_close = doc;
-                this.child(search_overlay::render_search_overlay(
+                this.child(search_overlay::SearchOverlay::new(
                     &self.search_input,
                     &match_display,
                     total_matches,
@@ -1558,7 +1558,6 @@ impl DocumentView {
                     move |window, cx| {
                         _ = doc_close.update(cx, |this, cx| this.close_search(window, cx));
                     },
-                    cx,
                 ))
             })
             .on_prepaint(move |bounds, _, cx| {

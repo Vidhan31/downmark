@@ -1152,7 +1152,7 @@ impl Workspace {
                         .justify_end()
                         .child(
                             Button::new("discard")
-                                .label("Don’t save")
+                                .label("Discard changes")
                                 .outline()
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
@@ -1837,13 +1837,15 @@ impl Workspace {
                             WorkspaceTab::NewTab(_) => IconName::House,
                         };
 
+                        let tab_id = tab.entity_id();
+
                         h_flex()
-                            .id(("tab", ix))
+                            .id(("tab", tab_id))
                             .group("tab")
                             .role(gpui_kit::Role::Tab)
                             .aria_selected(active)
                             .aria_label(format!("Tab: {tab_name}"))
-                            .h(px(28.))
+                            .h_7()
                             .w(tab_width)
                             .flex_none()
                             .px_2()
@@ -1852,7 +1854,6 @@ impl Workspace {
                             .items_center()
                             .rounded_md()
                             .text_sm()
-                            .cursor_pointer()
                             .relative()
                             .overflow_hidden()
                             .when(active, |this| {
@@ -1895,7 +1896,7 @@ impl Workspace {
                             )
                             .child(
                                 div()
-                                    .id(("workspace-tab-close", ix))
+                                    .id(("workspace-tab-close", tab_id))
                                     .role(gpui_kit::Role::Button)
                                     .aria_label(format!("Close tab {tab_name}"))
                                     .tooltip(|window, cx| {
@@ -1997,9 +1998,8 @@ impl Workspace {
                         })
                         .build(window, cx)
                     })
-                    .cursor_pointer()
                     .flex_none()
-                    .size(px(24.))
+                    .size_6()
                     .flex()
                     .items_center()
                     .justify_center()
