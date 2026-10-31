@@ -101,33 +101,43 @@ pub(crate) struct Heading {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct BlockIndex {
     /// Zero-based start line of every top-level block, ascending.
-    starts: Vec<usize>,
+    pub(crate) starts: Vec<usize>,
     /// Byte offsets of every top-level block in the Markdown source.
-    spans: Vec<Range<usize>>,
+    pub(crate) spans: Vec<Range<usize>>,
+    /// Whether each top-level block is a table.
+    pub(crate) tables: Vec<bool>,
     /// Total number of lines in the document.
     line_count: usize,
 }
 
 impl BlockIndex {
-    pub(crate) fn new(starts: Vec<usize>, spans: Vec<Range<usize>>, line_count: usize) -> Self {
+    pub(crate) fn new(
+        starts: Vec<usize>,
+        spans: Vec<Range<usize>>,
+        tables: Vec<bool>,
+        line_count: usize,
+    ) -> Self {
         debug_assert!(starts.windows(2).all(|pair| pair[0] <= pair[1]));
         Self {
             starts,
             spans,
+            tables,
             line_count: line_count.max(1),
         }
+    }
+
+    pub(crate) fn is_table(&self, block_ix: usize) -> bool {
+        self.tables.get(block_ix).copied().unwrap_or(false)
     }
 
     pub(crate) fn len(&self) -> usize {
         self.starts.len()
     }
 
-    #[expect(dead_code, reason = "implements is_empty alongside len")]
     pub(crate) fn is_empty(&self) -> bool {
         self.starts.is_empty()
     }
 
-    #[expect(dead_code, reason = "provided for block inspection")]
     pub(crate) fn spans(&self) -> &[Range<usize>] {
         &self.spans
     }
@@ -193,6 +203,7 @@ impl Analysis {
         let stats = Stats::of(source);
         let mut block_starts = Vec::new();
         let mut spans = Vec::new();
+        let mut tables = Vec::new();
         let mut outline = Vec::new();
 
         if let Ok(Node::Root(root)) = markdown::to_mdast(source, &preview_parse_options()) {
@@ -203,6 +214,7 @@ impl Analysis {
                 let line = position.start.line.saturating_sub(1);
                 block_starts.push(line);
                 spans.push(position.start.offset..position.end.offset);
+                tables.push(matches!(node, Node::Table(_)));
                 if let Node::Heading(heading) = node {
                     let text = plain_text(&heading.children);
                     if !text.is_empty() {
@@ -218,7 +230,7 @@ impl Analysis {
 
         Self {
             stats,
-            blocks: BlockIndex::new(block_starts, spans, stats.lines),
+            blocks: BlockIndex::new(block_starts, spans, tables, stats.lines),
             outline,
             content_hash: content_hash(source),
         }
@@ -309,7 +321,12 @@ mod tests {
 
     #[test]
     fn maps_lines_to_blocks_and_back() {
-        let index = BlockIndex::new(vec![0, 2, 10], vec![0..5, 6..15, 16..25], 20);
+        let index = BlockIndex::new(
+            vec![0, 2, 10],
+            vec![0..5, 6..15, 16..25],
+            vec![false, false, false],
+            20,
+        );
         assert_eq!(index.block_at_line(0.), Some((0, 0.)));
         assert_eq!(index.block_at_line(6.), Some((1, 0.5)));
         assert_eq!(index.block_at_line(15.), Some((2, 0.5)));

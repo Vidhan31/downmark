@@ -11,14 +11,14 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
-    MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache, ScrollEvent,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    assets::IconName,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
+    MouseButton, MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache,
+    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
+    Window, assets::IconName,
     base::{TextView, TextViewState},
     component::{
         ActiveTheme as _, ElementExt as _, Icon, RopeExt as _, Sizable as _, WindowExt as _,
-        button::{Button, ButtonVariants as _},
+        button::{Button, ButtonVariants},
         clipboard::Clipboard,
         h_flex,
         input::{
@@ -563,10 +563,47 @@ impl DocumentView {
 
     fn scroll_to_match(&mut self, target_range: &Range<usize>, cx: &mut Context<'_, Self>) {
         self.set_scroll_driver(ScrollDriver::Preview);
-        self.preview.update(cx, |state, cx| {
-            _ = state.reveal_range(target_range.clone(), cx);
-            cx.notify();
-        });
+        let rendered_text = self.preview.read(cx).rendered_text();
+
+        if self.analysis.blocks.is_empty() && !self.source.is_empty() {
+            self.analysis = Arc::new(Analysis::of(&self.source));
+        }
+
+        // Check if the match falls inside a shortened table block.
+        let mut target_table_ix = None;
+        for (i, span) in self.analysis.blocks.spans().iter().enumerate() {
+            if self.analysis.blocks.is_table(i)
+                && let Some(rendered_span) = rendered_text.range_for_source(span.clone())
+                && target_range.start >= rendered_span.start
+                && target_range.end <= rendered_span.end
+            {
+                target_table_ix = Some(i);
+                break;
+            }
+        }
+
+        if let Some(table_ix) = target_table_ix {
+            self.preview.update(cx, |state, cx| {
+                let list = state.list_state().clone();
+                let viewport = list.viewport_bounds();
+                let item_bounds = list.bounds_for_item(table_ix);
+                let is_visible = item_bounds.is_some_and(|b| {
+                    b.top() >= viewport.top() && b.top() < viewport.bottom()
+                });
+                if !is_visible {
+                    list.scroll_to(ListOffset {
+                        item_ix: table_ix,
+                        offset_in_item: Pixels::ZERO,
+                    });
+                }
+                cx.notify();
+            });
+        } else {
+            self.preview.update(cx, |state, cx| {
+                _ = state.reveal_range(target_range.clone(), cx);
+                cx.notify();
+            });
+        }
     }
 
     pub(crate) fn open_expanded_table(
@@ -1313,7 +1350,6 @@ impl DocumentView {
     )]
     fn render_preview(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let document = cx.weak_entity();
-        let reveal_doc = cx.weak_entity();
         let base_dir = self.dir().map(Arc::<Path>::from);
         let inset = column_inset(self.pane_width(self.preview_width, window, cx), cx);
         let is_empty = self.source.trim().is_empty();
@@ -1381,26 +1417,91 @@ impl DocumentView {
                                     let row_count = table_data.rows.len();
                                     let is_long = row_count > 6;
 
+                                    let search_query = document.upgrade().and_then(|doc| {
+                                        let view = doc.read(cx);
+                                        if view.search_open && !view.search.query().trim().is_empty() {
+                                            Some(view.search.query().trim().to_lowercase())
+                                        } else {
+                                            None
+                                        }
+                                    });
+
+                                    let table_matches_count = search_query.as_ref().map_or(0, |query| {
+                                        let mut count = 0;
+                                        for header in &table_data.headers {
+                                            count += header.to_lowercase().matches(query.as_str()).count();
+                                        }
+                                        for row in &table_data.rows {
+                                            for cell in row {
+                                                count += cell.to_lowercase().matches(query.as_str()).count();
+                                            }
+                                        }
+                                        count
+                                    });
+
+                                    let has_matches = table_matches_count > 0;
+                                    let show_info = is_long || has_matches;
+
+                                    let info_text = if has_matches {
+                                        let match_label = if table_matches_count == 1 {
+                                            "1 search match in table".to_string()
+                                        } else {
+                                            format!("{table_matches_count} search matches in table")
+                                        };
+                                        if is_long {
+                                            format!("{match_label} ({row_count} rows total, preview shortened)")
+                                        } else {
+                                            match_label
+                                        }
+                                    } else if is_long {
+                                        format!("{row_count} rows total (preview shortened)")
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    let btn_label = if has_matches {
+                                        "Expand table (view matches)"
+                                    } else {
+                                        "Expand table"
+                                    };
+
+                                    let btn_tooltip = if has_matches {
+                                        "View full table with highlighted matches (Esc to close)"
+                                    } else {
+                                        "View full table across window width (Esc to close)"
+                                    };
+
                                     h_flex()
                                         .items_center()
-                                        .when(is_long, |el| el.justify_between().w_full().px_1())
-                                        .when(!is_long, gpui_kit::Styled::justify_end)
+                                        .when(show_info, |el| el.justify_between().w_full().px_1())
+                                        .when(!show_info, gpui_kit::Styled::justify_end)
                                         .gap_1()
-                                        .when(is_long, |el| {
+                                        .when(show_info, |el| {
                                             el.child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(format!("{row_count} rows total (preview shortened)")),
+                                                    .font_weight(if has_matches {
+                                                        FontWeight::MEDIUM
+                                                    } else {
+                                                        FontWeight::NORMAL
+                                                    })
+                                                    .text_color(if has_matches {
+                                                        cx.theme().warning
+                                                    } else {
+                                                        cx.theme().muted_foreground
+                                                    })
+                                                    .child(info_text),
                                             )
                                         })
                                         .child(
                                             Button::new(btn_id)
+                                                .role(gpui_kit::base::RoleOverride::Presentational)
                                                 .xsmall()
-                                                .ghost()
+                                                .when(has_matches, ButtonVariants::warning)
+                                                .when(!has_matches, ButtonVariants::ghost)
                                                 .icon(Icon::new(IconName::Maximize))
-                                                .label("Expand table")
-                                                .tooltip("View full table across window width (Esc to close)")
+                                                .label(btn_label)
+                                                .tooltip(btn_tooltip)
                                                 .on_click(move |_, window, cx| {
                                                     _ = document.update(cx, |this, cx| {
                                                         this.open_expanded_table(
@@ -1415,23 +1516,7 @@ impl DocumentView {
                                         .into_any_element()
                                 }
                             })
-                            .on_link_click(crate::links::on_click)
-                            .on_reveal(move |line, _, cx| {
-                                _ = reveal_doc.update(cx, |this, cx| {
-                                    let list = this.preview.read(cx).list_state().clone();
-                                    let viewport = list.viewport_bounds();
-                                    if viewport.size.height <= px(0.) {
-                                        return;
-                                    }
-                                    if line.top() < viewport.top() {
-                                        list.scroll_by(viewport.top() - line.top() + px(24.));
-                                        this.preview.update(cx, |_, cx| cx.notify());
-                                    } else if line.bottom() > viewport.bottom() {
-                                        list.scroll_by(viewport.bottom() - line.bottom() - px(24.));
-                                        this.preview.update(cx, |_, cx| cx.notify());
-                                    }
-                                });
-                            }),
+                            .on_link_click(crate::links::on_click),
                     ),
             )
             .when(is_empty, |this| {
@@ -1843,5 +1928,57 @@ mod tests {
             view
         });
         let _ = doc;
+    }
+
+    #[gpui_kit::test]
+    fn find_text_inside_table_reveals_match_without_crash(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut doc_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                layout: Layout::Preview,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let md = "# Intro\n\n| Column 1 | Column 2 |\n| --- | --- |\n| Item Alpha | TargetMatch |\n| Item Gamma | Item Delta |\n";
+                let doc = cx.new(|cx| {
+                    DocumentView::new(md.to_string(), None, LineEnding::Lf, window, cx)
+                });
+                doc_entity = Some(doc.clone());
+                doc
+            })
+            .unwrap()
+        });
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            use gpui_kit::component::WindowExt as _;
+
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_search(window, cx);
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value("TargetMatch", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+                assert_eq!(doc.search.total_matches(), 1);
+            });
+            window.draw(cx).clear(cx);
+
+            // Verify table is recognized in analysis
+            doc_entity.as_ref().unwrap().read_with(cx, |doc, _| {
+                assert!(doc.analysis.blocks.is_table(1));
+            });
+
+            // Test opening expanded table with active search
+            assert!(!window.has_active_dialog(cx));
+            let table_md = "| Column 1 | Column 2 |\n| --- | --- |\n| Item Alpha | TargetMatch |\n| Item Gamma | Item Delta |";
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_expanded_table(table_md, None, window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            window.close_dialog(cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
     }
 }
