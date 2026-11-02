@@ -254,7 +254,7 @@ pub(crate) fn content_hash(source: &str) -> u64 {
     hasher.finish()
 }
 
-fn plain_text(nodes: &[Node]) -> String {
+pub(crate) fn plain_text(nodes: &[Node]) -> String {
     let mut out = String::new();
     for node in nodes {
         match node {

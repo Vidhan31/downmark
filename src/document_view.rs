@@ -11,17 +11,13 @@ use std::{
 
 use gpui_kit::{
     App, AppContext as _, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
-    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset,
-    MouseButton, MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache,
-    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    Window,
-    assets::IconName,
+    Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
+    MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache, ScrollEvent,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     base::{TextView, TextViewState},
     component::{
-        ActiveTheme as _, ElementExt as _, Icon, RopeExt as _, Sizable as _, WindowExt as _,
-        button::{Button, ButtonVariants},
+        ActiveTheme as _, ElementExt as _, RopeExt as _, WindowExt as _,
         clipboard::Clipboard,
-        h_flex,
         input::{
             Copy, Cut, Editor, EditorState, Enter, Escape, IndentInline, InputEvent, InputState,
             OutdentInline, Paste, Search, SelectAll, TabSize,
@@ -39,8 +35,8 @@ use crate::{
     actions::{
         Bold, BulletList, CodeBlock, DOCUMENT_CONTEXT, FindInPreview, Heading, InlineCode,
         InsertLink, Italic, NumberedList, PREVIEW_CONTEXT, PreviewPageDown, PreviewPageUp,
-        PreviewScrollBottom, PreviewScrollDown, PreviewScrollTop, PreviewScrollUp, Quote,
-        Strikethrough, TaskList, TidyTable,
+        PreviewScrollBottom, PreviewScrollDown, PreviewScrollLeft, PreviewScrollRight,
+        PreviewScrollTop, PreviewScrollUp, Quote, Strikethrough, TaskList, TidyTable, ViewTable,
     },
     analysis::{Analysis, content_hash},
     document::{LineEnding, display_name},
@@ -454,6 +450,45 @@ impl DocumentView {
         self.sync_editor(cx);
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "Action listener matches GPUI listener signature"
+    )]
+    fn preview_scroll_left(
+        &mut self,
+        _: &PreviewScrollLeft,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(active) = cx.try_global::<preview_ext::ActiveTableScrollHandle>() {
+            let handle = active.0.clone();
+            let mut offset = handle.offset();
+            offset.x = (offset.x + px(120.)).min(px(0.));
+            handle.set_offset(offset);
+            window.refresh();
+        }
+    }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "Action listener matches GPUI listener signature"
+    )]
+    fn preview_scroll_right(
+        &mut self,
+        _: &PreviewScrollRight,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(active) = cx.try_global::<preview_ext::ActiveTableScrollHandle>() {
+            let handle = active.0.clone();
+            let max = handle.max_offset();
+            let mut offset = handle.offset();
+            offset.x = (offset.x - px(120.)).max(-max.x);
+            handle.set_offset(offset);
+            window.refresh();
+        }
+    }
+
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "getter for document source text")
@@ -620,7 +655,7 @@ impl DocumentView {
             .unwrap_or(fallback_markdown);
         let markdown = SharedString::from(text.to_string());
         let base_dir = self.dir().map(Arc::<Path>::from);
-        let extensions = self.markdown_extensions.clone();
+        let extensions = preview_ext::table_overlay_extensions(&self.preview);
         table_overlay::open(
             markdown,
             base_dir,
@@ -1376,8 +1411,18 @@ impl DocumentView {
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
                 this.set_scroll_driver(ScrollDriver::Preview);
             }))
-            .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.set_scroll_driver(ScrollDriver::Preview);
+                let key = event.keystroke.key.to_lowercase();
+                match key.as_str() {
+                    "left" | "arrowleft" | "h" => {
+                        this.preview_scroll_left(&PreviewScrollLeft, window, cx);
+                    }
+                    "right" | "arrowright" | "l" => {
+                        this.preview_scroll_right(&PreviewScrollRight, window, cx);
+                    }
+                    _ => {}
+                }
             }))
             .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                 this.set_scroll_driver(ScrollDriver::Preview);
@@ -1405,118 +1450,6 @@ impl DocumentView {
                             .image_source(move |url| images::resolve(url, base_dir.as_deref()))
                             .code_block_actions(|code_block, _, _| {
                                 Clipboard::new("copy-code").value(code_block.code())
-                            })
-                            .table_actions({
-                                let document = document.clone();
-                                move |table_data, _window, cx| {
-                                    let document = document.clone();
-                                    let markdown = table_data.markdown.clone();
-                                    let span = table_data.span.clone();
-                                    let btn_id = SharedString::from(format!(
-                                        "expand-table-{}",
-                                        span.as_ref().map_or(0, |s| s.start)
-                                    ));
-                                    let row_count = table_data.rows.len();
-                                    let is_long = row_count > 6;
-
-                                    let search_query = document.upgrade().and_then(|doc| {
-                                        let view = doc.read(cx);
-                                        if view.search_open && !view.search.query().trim().is_empty() {
-                                            Some(view.search.query().trim().to_lowercase())
-                                        } else {
-                                            None
-                                        }
-                                    });
-
-                                    let table_matches_count = search_query.as_ref().map_or(0, |query| {
-                                        let mut count = 0;
-                                        for header in &table_data.headers {
-                                            count += header.to_lowercase().matches(query.as_str()).count();
-                                        }
-                                        for row in &table_data.rows {
-                                            for cell in row {
-                                                count += cell.to_lowercase().matches(query.as_str()).count();
-                                            }
-                                        }
-                                        count
-                                    });
-
-                                    let has_matches = table_matches_count > 0;
-                                    let show_info = is_long || has_matches;
-
-                                    let info_text = if has_matches {
-                                        let match_label = if table_matches_count == 1 {
-                                            "1 search match in table".to_string()
-                                        } else {
-                                            format!("{table_matches_count} search matches in table")
-                                        };
-                                        if is_long {
-                                            format!("{match_label} ({row_count} rows total, preview shortened)")
-                                        } else {
-                                            match_label
-                                        }
-                                    } else if is_long {
-                                        format!("{row_count} rows total (preview shortened)")
-                                    } else {
-                                        String::new()
-                                    };
-
-                                    let btn_label = if has_matches {
-                                        "Expand table (view matches)"
-                                    } else {
-                                        "Expand table"
-                                    };
-
-                                    let btn_tooltip = if has_matches {
-                                        "View full table with highlighted matches (Esc to close)"
-                                    } else {
-                                        "View full table across window width (Esc to close)"
-                                    };
-
-                                    h_flex()
-                                        .items_center()
-                                        .when(show_info, |el| el.justify_between().w_full().px_1())
-                                        .when(!show_info, gpui_kit::Styled::justify_end)
-                                        .gap_1()
-                                        .when(show_info, |el| {
-                                            el.child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(if has_matches {
-                                                        FontWeight::MEDIUM
-                                                    } else {
-                                                        FontWeight::NORMAL
-                                                    })
-                                                    .text_color(if has_matches {
-                                                        cx.theme().warning
-                                                    } else {
-                                                        cx.theme().muted_foreground
-                                                    })
-                                                    .child(info_text),
-                                            )
-                                        })
-                                        .child(
-                                            Button::new(btn_id)
-                                                .role(gpui_kit::base::RoleOverride::Presentational)
-                                                .xsmall()
-                                                .when(has_matches, ButtonVariants::warning)
-                                                .when(!has_matches, ButtonVariants::ghost)
-                                                .icon(Icon::new(IconName::Maximize))
-                                                .label(btn_label)
-                                                .tooltip(btn_tooltip)
-                                                .on_click(move |_, window, cx| {
-                                                    _ = document.update(cx, |this, cx| {
-                                                        this.open_expanded_table(
-                                                            &markdown,
-                                                            span.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }),
-                                        )
-                                        .into_any_element()
-                                }
                             })
                             .on_link_click(crate::links::on_click),
                     ),
@@ -1697,6 +1630,11 @@ impl Render for DocumentView {
             .on_action(cx.listener(Self::preview_page_up))
             .on_action(cx.listener(Self::preview_scroll_top))
             .on_action(cx.listener(Self::preview_scroll_bottom))
+            .on_action(cx.listener(Self::preview_scroll_left))
+            .on_action(cx.listener(Self::preview_scroll_right))
+            .on_action(cx.listener(|this, action: &ViewTable, window, cx| {
+                this.open_expanded_table(&action.0, None, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 if window
                     .root::<gpui_kit::base::Root>()
@@ -1718,8 +1656,10 @@ impl Render for DocumentView {
 }
 
 fn make_preview_style(cx: &App) -> gpui_kit::base::TextViewStyle {
+    let mut table_style = gpui_kit::StyleRefinement::default();
+    table_style.overflow.x = Some(gpui_kit::Overflow::Scroll);
     gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
-        .with_table(gpui_kit::StyleRefinement::default().max_h(px(280.)))
+        .with_table(table_style)
 }
 
 /// Horizontal inset that keeps text within a readable column, centered in a
@@ -1774,6 +1714,21 @@ mod tests {
             let handled =
                 window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
             assert!(handled);
+            assert!(!window.has_active_dialog(cx));
+
+            // Test that right/left arrow keys are handled in the table overlay
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_expanded_table(table_md, Some(0..table_md.len()), window, cx);
+            });
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
+            let right_handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("right").unwrap(), cx);
+            assert!(right_handled);
+            let left_handled =
+                window.dispatch_keystroke(gpui_kit::Keystroke::parse("left").unwrap(), cx);
+            assert!(left_handled);
+            window.close_dialog(cx);
             assert!(!window.has_active_dialog(cx));
         })
         .unwrap();
@@ -1926,6 +1881,12 @@ mod tests {
             view.preview_scroll_top(&crate::actions::PreviewScrollTop, window, cx);
             assert_eq!(view.scroll_sync.driver(), ScrollDriver::Preview);
 
+            // Test horizontal table scroll actions with active scroll handle
+            let handle = gpui_kit::ScrollHandle::new();
+            cx.set_global(preview_ext::ActiveTableScrollHandle(handle));
+            view.preview_scroll_right(&crate::actions::PreviewScrollRight, window, cx);
+            view.preview_scroll_left(&crate::actions::PreviewScrollLeft, window, cx);
+
             view
         });
         let _ = doc;
@@ -1981,5 +1942,24 @@ mod tests {
             assert!(!window.has_active_dialog(cx));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn preview_table_style_enables_horizontal_scroll_without_max_height(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let style = make_preview_style(cx);
+            assert_eq!(
+                style.table().overflow.x,
+                Some(gpui_kit::Overflow::Scroll),
+                "Table style must enable horizontal scrolling"
+            );
+            assert_eq!(
+                style.table().max_size.height,
+                None,
+                "Table style must not clamp height"
+            );
+        });
     }
 }

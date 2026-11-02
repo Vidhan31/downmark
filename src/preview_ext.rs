@@ -16,7 +16,7 @@ use gpui_kit::{
     base::{TextView, TextViewState},
     component::{
         ActiveTheme as _, Icon, Sizable as _,
-        button::Button,
+        button::{Button, ButtonVariants as _},
         h_flex,
         text::{
             InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode,
@@ -31,8 +31,8 @@ use gpui_kit::{
 };
 
 use crate::{
-    actions::ViewDiagram,
-    analysis::content_hash,
+    actions::{ViewDiagram, ViewTable},
+    analysis::{content_hash, plain_text},
     diagram::{self, DiagramTheme},
     math::{self, MathStyle},
 };
@@ -58,11 +58,45 @@ pub(crate) fn markdown_extensions(preview: &gpui_kit::Entity<TextViewState>) -> 
     let alert = AlertPlugin {
         body_extensions: with_math(MarkdownExtensions::default()),
     };
+    let table = TableBlockPlugin {
+        body_extensions: with_math(
+            MarkdownExtensions::default()
+                .frontmatter()
+                .plugin(gpui_kit::component::text::FrontmatterPlugin::new()),
+        ),
+    };
     with_math(
         MarkdownExtensions::default()
             .frontmatter()
             .plugin(gpui_kit::component::text::FrontmatterPlugin::new())
-            .plugin(alert),
+            .plugin(alert)
+            .plugin(table),
+    )
+}
+
+/// Extensions for the expanded table overlay dialog (without `TableBlockPlugin` to avoid nested buttons).
+pub(crate) fn table_overlay_extensions(
+    preview: &gpui_kit::Entity<TextViewState>,
+) -> MarkdownExtensions {
+    let cache = MathCache::new(preview);
+    let diagrams = DiagramCache::new(preview);
+    let with_math = |extensions: MarkdownExtensions| {
+        extensions
+            .plugin(BlockMathPlugin {
+                cache: cache.clone(),
+            })
+            .plugin(InlineMathPlugin {
+                cache: cache.clone(),
+            })
+            .plugin(MermaidPlugin {
+                cache: diagrams.clone(),
+            })
+            .plugin(LinkTooltipPlugin)
+    };
+    with_math(
+        MarkdownExtensions::default()
+            .frontmatter()
+            .plugin(gpui_kit::component::text::FrontmatterPlugin::new()),
     )
 }
 
@@ -209,6 +243,264 @@ impl MarkdownPlugin for AlertPlugin {
                         .w_full(),
                 )
             })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ActiveTableScrollHandle(pub(crate) gpui_kit::ScrollHandle);
+impl gpui_kit::Global for ActiveTableScrollHandle {}
+
+/// Calculates the estimated display width in pixels for a Markdown table
+/// so it can be rendered at full width in horizontal scroll containers.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "Table width approximation from character count"
+)]
+pub(crate) fn table_content_width(markdown: &str) -> f32 {
+    let mut col_max_chars: Vec<usize> = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        // Skip delimiter row like |---|:---|---:|
+        let is_sep = trimmed
+            .chars()
+            .all(|c| c == '|' || c == '-' || c == ':' || c.is_whitespace());
+        if is_sep {
+            continue;
+        }
+        let cells: Vec<&str> = trimmed.trim_matches('|').split('|').collect();
+        if cells.len() > col_max_chars.len() {
+            col_max_chars.resize(cells.len(), 0);
+        }
+        for (i, cell) in cells.iter().enumerate() {
+            let trimmed_cell = cell.trim();
+            let cell_width = trimmed_cell
+                .split("<br>")
+                .map(|segment| unicode_width::UnicodeWidthStr::width(segment.trim()))
+                .max()
+                .unwrap_or(0);
+            col_max_chars[i] = col_max_chars[i].max(cell_width);
+        }
+    }
+    if col_max_chars.is_empty() {
+        return 0.0;
+    }
+    let total: f32 = col_max_chars
+        .iter()
+        .map(|&chars| {
+            let text_px = ((chars as f32) * 9.5).clamp(60.0, 600.0);
+            text_px + 33.0
+        })
+        .sum::<f32>()
+        + 2.0;
+    total
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableBlockData {
+    markdown: String,
+}
+
+struct TableBlockPlugin {
+    body_extensions: MarkdownExtensions,
+}
+
+impl MarkdownPlugin for TableBlockPlugin {
+    fn is_block(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "table-block"
+    }
+
+    fn parse(&self, node: &Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
+        let Node::Table(table) = node else {
+            return None;
+        };
+        let source = cx.node_source(node)?;
+        let text = plain_text(&table.children);
+        Some(
+            MarkdownNode::new(
+                "table-block",
+                TableBlockData {
+                    markdown: source.to_string(),
+                },
+            )
+            .text(text)
+            .markdown(source),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Declarative layout for table scroller and controls"
+    )]
+    fn render(&self, node: &MarkdownNode, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let data = node
+            .data::<TableBlockData>()
+            .expect("table block node data");
+        let markdown = SharedString::from(data.markdown.clone());
+        let hash = content_hash(&data.markdown);
+        let id = SharedString::from(format!("table-{hash}"));
+        let markdown_expand = markdown.clone();
+        let markdown_copy = markdown;
+
+        let table_width = table_content_width(&data.markdown);
+
+        let scroll_handle = window
+            .use_keyed_state(format!("{id}-scroller"), cx, |_, _| {
+                gpui_kit::ScrollHandle::new()
+            })
+            .read(cx)
+            .clone();
+
+        let table_focus = window
+            .use_keyed_state(format!("{id}-focus"), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
+
+        if cx.try_global::<ActiveTableScrollHandle>().is_none() {
+            cx.set_global(ActiveTableScrollHandle(scroll_handle.clone()));
+        }
+
+        let scroll_handle_for_keys = scroll_handle.clone();
+        let scroll_handle_for_wheel = scroll_handle.clone();
+        let scroll_handle_for_scrollbar = scroll_handle.clone();
+        let scroll_handle_for_active = scroll_handle.clone();
+        let scroll_handle_for_click = scroll_handle.clone();
+        let focus_for_click = table_focus.clone();
+
+        let table_view_style =
+            gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx));
+
+        v_flex()
+            .id(id.clone())
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_end()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(SharedString::from(format!("{id}-expand")))
+                            .accessibility_label("Expand table")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::new(IconName::Maximize))
+                            .label("Expand table")
+                            .tooltip("View full table across window width (Esc to close)")
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(ViewTable(markdown_expand.clone())),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("{id}-copy")))
+                            .accessibility_label("Copy table Markdown")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::new(IconName::Copy))
+                            .label("Copy table")
+                            .tooltip("Copy table Markdown")
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                    markdown_copy.to_string(),
+                                ));
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id(format!("{id}-wrapper"))
+                    .w_full()
+                    .relative()
+                    .track_focus(&table_focus)
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, window, cx| {
+                        window.focus(&focus_for_click, cx);
+                        cx.set_global(ActiveTableScrollHandle(scroll_handle_for_click.clone()));
+                    })
+                    .on_mouse_move(move |_, _, cx| {
+                        cx.set_global(ActiveTableScrollHandle(scroll_handle_for_active.clone()));
+                    })
+                    .capture_key_down(move |event, window, cx| {
+                        let key = event.keystroke.key.to_lowercase();
+                        let mut offset = scroll_handle_for_keys.offset();
+                        let max = scroll_handle_for_keys.max_offset();
+                        match key.as_str() {
+                            "left" | "arrowleft" | "h" => {
+                                offset.x = (offset.x + px(120.)).min(px(0.));
+                                scroll_handle_for_keys.set_offset(offset);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                            "right" | "arrowright" | "l" => {
+                                offset.x = (offset.x - px(120.)).max(-max.x);
+                                scroll_handle_for_keys.set_offset(offset);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                            "home" => {
+                                offset.x = px(0.);
+                                scroll_handle_for_keys.set_offset(offset);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                            "end" => {
+                                offset.x = -max.x;
+                                scroll_handle_for_keys.set_offset(offset);
+                                window.refresh();
+                                cx.stop_propagation();
+                            }
+                            _ => {}
+                        }
+                    })
+                    .child(
+                        div()
+                            .id(format!("{id}-scroll-viewport"))
+                            .w_full()
+                            .overflow_x_scroll()
+                            .track_scroll(&scroll_handle)
+                            .on_scroll(move |event, window, _cx| {
+                                if event.modifiers.shift
+                                    && event.delta.pixel_delta(px(16.)).y != px(0.)
+                                {
+                                    let delta_y = event.delta.pixel_delta(px(16.)).y;
+                                    let mut offset = scroll_handle_for_wheel.offset();
+                                    let max = scroll_handle_for_wheel.max_offset();
+                                    offset.x = (offset.x + delta_y).clamp(-max.x, px(0.));
+                                    scroll_handle_for_wheel.set_offset(offset);
+                                    window.refresh();
+                                }
+                            })
+                            .child(
+                                div()
+                                    .min_w_full()
+                                    .when(table_width > 0.0, |this| this.w(px(table_width)))
+                                    .child(
+                                        TextView::markdown(
+                                            SharedString::from(format!("{id}-view")),
+                                            data.markdown.clone(),
+                                        )
+                                        .style(table_view_style)
+                                        .markdown_extensions(self.body_extensions.clone())
+                                        .selectable(true)
+                                        .on_link_click(crate::links::on_click)
+                                        .w_full(),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        gpui_kit::base::Scrollbar::horizontal(&scroll_handle_for_scrollbar)
+                            .viewport_from_layout(),
+                    ),
+            )
     }
 }
 
@@ -999,5 +1291,62 @@ mod tests {
 
         cache.clear();
         assert!(!cache.contains_key(&key));
+    }
+
+    #[gpui_kit::test]
+    fn parses_and_renders_table_with_top_actions(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let md = "| H1 | H2 |\n|---|---|\n| C1 | C2 |";
+        let (window_handle, _) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_, cx| {
+                let entity = cx.new(|cx| TextViewState::markdown(md, cx));
+                let extensions = markdown_extensions(&entity);
+                cx.new(|_| {
+                    struct TableTestRoot {
+                        text: SharedString,
+                        extensions: MarkdownExtensions,
+                    }
+                    impl gpui_kit::Render for TableTestRoot {
+                        fn render(
+                            &mut self,
+                            _: &mut Window,
+                            _: &mut gpui_kit::Context<'_, Self>,
+                        ) -> impl IntoElement {
+                            TextView::markdown("table-test", self.text.clone())
+                                .markdown_extensions(self.extensions.clone())
+                        }
+                    }
+                    TableTestRoot {
+                        text: md.into(),
+                        extensions,
+                    }
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window_handle, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            window.draw(cx).clear(cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn table_content_width_calculates_dimensions() {
+        assert_eq!(table_content_width(""), 0.0);
+        assert_eq!(table_content_width("Just plain text\nwithout tables"), 0.0);
+
+        let small = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let width_small = table_content_width(small);
+        assert!(width_small > 0.0);
+
+        let wide = "| Col 1 | Col 2 | Col 3 | Col 4 |\n|---|---|---|---|\n| Very long text with multiple words that should expand the column | Second column | Third | Fourth |";
+        let width_wide = table_content_width(wide);
+        assert!(width_wide > width_small);
+
+        let with_breaks = "| A |\n|---|\n| First line<br>Second longer line of text |";
+        assert!(table_content_width(with_breaks) > 0.0);
     }
 }

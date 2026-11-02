@@ -60,6 +60,8 @@ actions!(
         PreviewPageUp,
         PreviewScrollTop,
         PreviewScrollBottom,
+        PreviewScrollLeft,
+        PreviewScrollRight,
     ]
 );
 
@@ -106,6 +108,11 @@ pub(crate) struct FollowLink {
 #[derive(Action, Clone, PartialEq, Deserialize)]
 #[action(namespace = downmark, no_json)]
 pub(crate) struct ViewDiagram(pub(crate) SharedString);
+
+/// Show the Markdown table with this source in a modal overlay dialog.
+#[derive(Action, Clone, PartialEq, Deserialize)]
+#[action(namespace = downmark, no_json)]
+pub(crate) struct ViewTable(pub(crate) SharedString);
 
 /// The key context of the workspace view.
 pub(crate) const WORKSPACE_CONTEXT: &str = "Workspace";
@@ -196,6 +203,12 @@ pub(crate) fn bind_keys(cx: &mut App) {
         key_binding("shift-space", PreviewPageUp, preview),
         key_binding("home", PreviewScrollTop, preview),
         key_binding("end", PreviewScrollBottom, preview),
+        key_binding("left", PreviewScrollLeft, preview),
+        key_binding("right", PreviewScrollRight, preview),
+        key_binding("shift-left", PreviewScrollLeft, preview),
+        key_binding("shift-right", PreviewScrollRight, preview),
+        key_binding("h", PreviewScrollLeft, preview),
+        key_binding("l", PreviewScrollRight, preview),
     ]);
 }
 

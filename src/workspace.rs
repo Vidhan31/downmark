@@ -41,7 +41,7 @@ use crate::{
         NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab, Quit,
         RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
         ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
-        ToggleTabs, ViewDiagram, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+        ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
     },
     analysis::{Analysis, content_hash},
     catalog::FolderCatalog,
@@ -1297,6 +1297,19 @@ impl Workspace {
         diagram_viewer::open(&action.0, format!("Diagram — {name}"), window, cx);
     }
 
+    /// Show an expanded table of the active document in a modal.
+    fn view_table(&mut self, action: &ViewTable, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(doc) = self.active_document() else {
+            return;
+        };
+        doc.update(cx, |doc, cx| {
+            doc.open_expanded_table(&action.0, None, window, cx);
+        });
+    }
+
     /// Show the Markdown file `path` (in a new tab, or in place of the
     /// active document), scrolled to `anchor`.
     #[expect(clippy::fn_params_excessive_bools, reason = "Link tab placement flag")]
@@ -2267,6 +2280,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::follow_link))
             .on_action(cx.listener(Self::view_diagram))
+            .on_action(cx.listener(Self::view_table))
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::reveal_in_folder))
@@ -2893,5 +2907,50 @@ mod tests {
             assert!(!AppSettings::get(cx).glance_mode);
         });
         let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn view_table_opens_overlay_dialog(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let table_md = "| A | B |\n|---|---|\n| 1 | 2 |";
+                let doc = cx.new(|cx| {
+                    DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx)
+                });
+                let entity = cx.new(|cx| {
+                    let mut ws =
+                        Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+                    ws.tabs[0] = WorkspaceTab::Document(doc);
+                    ws
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        cx.update_window(window_handle, |_, window, cx| {
+            use gpui_kit::component::WindowExt as _;
+            assert!(!window.has_active_dialog(cx));
+            ws_entity.as_ref().unwrap().update(cx, |ws, cx| {
+                ws.view_table(
+                    &ViewTable("| A | B |\n|---|---|\n| 1 | 2 |".into()),
+                    window,
+                    cx,
+                );
+            });
+            assert!(window.has_active_dialog(cx));
+            window.close_dialog(cx);
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
     }
 }
