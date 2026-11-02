@@ -162,21 +162,43 @@ pub(crate) fn open(
                                         .overflow_y_scroll()
                                         .track_scroll(&scroll_handle)
                                         .on_scroll(move |event, window, _cx| {
-                                            if event.modifiers.shift
-                                                && event.delta.pixel_delta(px(16.)).y != px(0.)
-                                            {
-                                                let delta_y = event.delta.pixel_delta(px(16.)).y;
-                                                let mut offset = scroll_handle_for_wheel.offset();
-                                                let max = scroll_handle_for_wheel.max_offset();
-                                                offset.x =
-                                                    (offset.x + delta_y).clamp(-max.x, px(0.));
-                                                scroll_handle_for_wheel.set_offset(offset);
-                                                window.refresh();
+                                            let delta = event.delta.pixel_delta(px(16.));
+                                            let mut offset = scroll_handle_for_wheel.offset();
+                                            let max = scroll_handle_for_wheel.max_offset();
+                                            if event.modifiers.shift {
+                                                let h_delta = if delta.x == px(0.) {
+                                                    delta.y
+                                                } else {
+                                                    delta.x
+                                                };
+                                                if h_delta != px(0.) {
+                                                    offset.x =
+                                                        (offset.x + h_delta).clamp(-max.x, px(0.));
+                                                    scroll_handle_for_wheel.set_offset(offset);
+                                                    window.refresh();
+                                                }
+                                            } else {
+                                                let mut changed = false;
+                                                if delta.x != px(0.) {
+                                                    offset.x =
+                                                        (offset.x + delta.x).clamp(-max.x, px(0.));
+                                                    changed = true;
+                                                }
+                                                if delta.y != px(0.) {
+                                                    offset.y =
+                                                        (offset.y + delta.y).clamp(-max.y, px(0.));
+                                                    changed = true;
+                                                }
+                                                if changed {
+                                                    scroll_handle_for_wheel.set_offset(offset);
+                                                    window.refresh();
+                                                }
                                             }
                                         })
                                         .p_4()
                                         .child({
-                                            let table_view_style = crate::themes::preview_style(cx);
+                                            let table_view_style = crate::themes::preview_style(cx)
+                                                .with_table(gpui_kit::StyleRefinement::default());
                                             div()
                                                 .min_w_full()
                                                 .when(table_width > 0.0, |this| {

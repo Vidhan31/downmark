@@ -375,7 +375,8 @@ impl MarkdownPlugin for TableBlockPlugin {
         let scroll_handle_for_click = scroll_handle.clone();
         let focus_for_click = table_focus.clone();
 
-        let table_view_style = crate::themes::preview_style(cx);
+        let table_view_style =
+            crate::themes::preview_style(cx).with_table(gpui_kit::StyleRefinement::default());
 
         v_flex()
             .id(id.clone())
@@ -466,15 +467,19 @@ impl MarkdownPlugin for TableBlockPlugin {
                             .id(format!("{id}-scroll-viewport"))
                             .w_full()
                             .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                             .track_scroll(&scroll_handle)
                             .on_scroll(move |event, window, _cx| {
-                                if event.modifiers.shift
-                                    && event.delta.pixel_delta(px(16.)).y != px(0.)
-                                {
-                                    let delta_y = event.delta.pixel_delta(px(16.)).y;
+                                let delta = event.delta.pixel_delta(px(16.));
+                                let h_delta = if event.modifiers.shift {
+                                    if delta.x == px(0.) { delta.y } else { delta.x }
+                                } else {
+                                    delta.x
+                                };
+                                if h_delta != px(0.) {
                                     let mut offset = scroll_handle_for_wheel.offset();
                                     let max = scroll_handle_for_wheel.max_offset();
-                                    offset.x = (offset.x + delta_y).clamp(-max.x, px(0.));
+                                    offset.x = (offset.x + h_delta).clamp(-max.x, px(0.));
                                     scroll_handle_for_wheel.set_offset(offset);
                                     window.refresh();
                                 }
