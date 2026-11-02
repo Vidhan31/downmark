@@ -176,15 +176,7 @@ pub(crate) fn open(
                                         })
                                         .p_4()
                                         .child({
-                                            let mut table_style =
-                                                gpui_kit::StyleRefinement::default();
-                                            table_style.overflow.x =
-                                                Some(gpui_kit::Overflow::Scroll);
-                                            let table_view_style =
-                                                gpui_kit::base::TextViewStyle::from_theme(
-                                                    &gpui_kit::base::Theme::global(cx),
-                                                )
-                                                .with_table(table_style);
+                                            let table_view_style = crate::themes::preview_style(cx);
                                             div()
                                                 .min_w_full()
                                                 .when(table_width > 0.0, |this| {

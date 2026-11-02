@@ -238,6 +238,7 @@ impl MarkdownPlugin for AlertPlugin {
             .when(!alert.body.is_empty(), |this| {
                 this.child(
                     TextView::markdown(id, alert.body.clone())
+                        .style(crate::themes::preview_style(cx))
                         .markdown_extensions(self.body_extensions.clone())
                         .on_link_click(crate::links::on_click)
                         .w_full(),
@@ -374,8 +375,7 @@ impl MarkdownPlugin for TableBlockPlugin {
         let scroll_handle_for_click = scroll_handle.clone();
         let focus_for_click = table_focus.clone();
 
-        let table_view_style =
-            gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx));
+        let table_view_style = crate::themes::preview_style(cx);
 
         v_flex()
             .id(id.clone())

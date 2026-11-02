@@ -16,7 +16,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
     base::{TextView, TextViewState},
     component::{
-        ActiveTheme as _, ElementExt as _, RopeExt as _, WindowExt as _,
+        ActiveTheme as _, ElementExt as _, RopeExt as _, Theme, WindowExt as _,
         clipboard::Clipboard,
         input::{
             Copy, Cut, Editor, EditorState, Enter, Escape, IndentInline, InputEvent, InputState,
@@ -47,7 +47,7 @@ use crate::{
     search_overlay,
     session::{self, DiskStamp, Recovery},
     settings::Layout,
-    smart_edit, table_overlay,
+    smart_edit, table_overlay, themes,
     themes::AppSettings,
 };
 
@@ -241,6 +241,10 @@ impl DocumentView {
                 cx.notify();
             }),
             cx.observe_window_appearance(window, |this, _, cx| {
+                this.preview_style = make_preview_style(cx);
+                cx.notify();
+            }),
+            cx.observe_global_in::<Theme>(window, |this, _, cx| {
                 this.preview_style = make_preview_style(cx);
                 cx.notify();
             }),
@@ -1656,10 +1660,7 @@ impl Render for DocumentView {
 }
 
 fn make_preview_style(cx: &App) -> gpui_kit::base::TextViewStyle {
-    let mut table_style = gpui_kit::StyleRefinement::default();
-    table_style.overflow.x = Some(gpui_kit::Overflow::Scroll);
-    gpui_kit::base::TextViewStyle::from_theme(&gpui_kit::base::Theme::global(cx))
-        .with_table(table_style)
+    themes::preview_style(cx)
 }
 
 /// Horizontal inset that keeps text within a readable column, centered in a

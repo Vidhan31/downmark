@@ -201,6 +201,76 @@ pub(crate) fn diagram_theme(cx: &App) -> DiagramTheme {
     }
 }
 
+/// The color used for inline code snippet text in the current theme.
+pub(crate) fn inline_code_color(cx: &App) -> Hsla {
+    let Some(theme) = cx.try_global::<Theme>() else {
+        return cx.try_global::<gpui_kit::base::Theme>().map_or_else(
+            || gpui_kit::rgb(0x0005_50ae).into(),
+            |b| b.tokens.colors.primary,
+        );
+    };
+
+    let fg = Rgba::from(theme.foreground);
+
+    // 1. Check syntax highlight theme for code span
+    if let Some(color) = theme
+        .highlight_theme
+        .style("text.code.span")
+        .and_then(|s| s.color)
+    {
+        return color;
+    }
+
+    // 2. Check syntax highlight theme for literal text if distinct from foreground
+    if let Some(color) = theme
+        .highlight_theme
+        .style("text.literal")
+        .and_then(|s| s.color)
+    {
+        let rgba = Rgba::from(color);
+        let dist = (rgba.r - fg.r).abs() + (rgba.g - fg.g).abs() + (rgba.b - fg.b).abs();
+        if dist > 0.08 {
+            return color;
+        }
+    }
+
+    // 3. Fallback to string syntax highlight if distinct from foreground
+    if let Some(color) = theme.highlight_theme.style("string").and_then(|s| s.color) {
+        let rgba = Rgba::from(color);
+        let dist = (rgba.r - fg.r).abs() + (rgba.g - fg.g).abs() + (rgba.b - fg.b).abs();
+        if dist > 0.08 {
+            return color;
+        }
+    }
+
+    // 4. Fallback to primary theme color
+    theme.primary
+}
+
+/// The default `TextViewStyle` for markdown preview rendering, ensuring inline
+/// code snippets and other elements reflect the theme's colors.
+pub(crate) fn preview_style(cx: &App) -> gpui_kit::base::TextViewStyle {
+    let mut table_style = gpui_kit::StyleRefinement::default();
+    table_style.overflow.x = Some(gpui_kit::Overflow::Scroll);
+
+    let code_color = inline_code_color(cx);
+    let base_style = cx.try_global::<gpui_kit::base::Theme>().map_or_else(
+        gpui_kit::base::TextViewStyle::default,
+        gpui_kit::base::TextViewStyle::from_theme,
+    );
+
+    let mut inline_code = base_style.inline_code();
+    inline_code.color = Some(code_color);
+
+    let mut inline_code_style = base_style.inline_code_style().clone();
+    inline_code_style.text.color = Some(code_color);
+
+    base_style
+        .with_table(table_style)
+        .with_inline_code(inline_code)
+        .with_inline_code_style(inline_code_style)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +285,37 @@ mod tests {
             hex_over(gpui_kit::rgb(0x0009_69da).into(), black),
             "#0969da"
         );
+    }
+
+    #[gpui_kit::test]
+    fn inline_code_snippet_has_theme_color(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            init(Settings::default(), cx);
+            let style = preview_style(cx);
+
+            let code_color = inline_code_color(cx);
+            assert_eq!(
+                style.inline_code().color,
+                Some(code_color),
+                "inline_code highlight style must have the theme's code color"
+            );
+            assert_eq!(
+                style.inline_code_style().text.color,
+                Some(code_color),
+                "inline_code_style refinement must have the theme's code color"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn preview_style_fallback_without_theme(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            let style = preview_style(cx);
+            assert!(
+                style.inline_code().color.is_some(),
+                "must provide a fallback code color even if Theme global is uninitialized"
+            );
+        });
     }
 }
