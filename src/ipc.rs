@@ -3,11 +3,13 @@
 use std::{
     io::{BufRead as _, BufReader, Write as _},
     path::PathBuf,
-    time::Duration,
 };
 
 #[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::{
+    os::unix::net::{UnixListener, UnixStream},
+    time::Duration,
+};
 
 use futures::StreamExt as _;
 use gpui_kit::{AnyWindowHandle, App, WeakEntity};
@@ -213,11 +215,19 @@ pub(crate) fn start_server(
             return;
         }
 
+        #[derive(Clone, Copy)]
+        struct SendHandle(HANDLE);
+
+        // SAFETY: Win32 HANDLE represents an OS resource that can be safely transferred across threads.
+        unsafe impl Send for SendHandle {}
+
+        let send_handle = SendHandle(handle);
         let (ipc_tx, mut ipc_rx) = futures::channel::mpsc::unbounded::<LaunchConfig>();
 
         std::thread::Builder::new()
             .name("downmark-ipc".into())
             .spawn(move || {
+                let handle = send_handle.0;
                 loop {
                     // SAFETY: ConnectNamedPipe blocks waiting for a client to connect to the pipe.
                     let connected = unsafe { ConnectNamedPipe(handle, ptr::null_mut()) };

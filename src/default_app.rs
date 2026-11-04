@@ -151,6 +151,10 @@ pub(crate) fn install_shell_command() -> Result<String, String> {
             Ok("Shell command installation is only supported on Unix-like systems".to_string())
         }
     }
+    #[cfg(windows)]
+    {
+        Err("Shell command installation is not needed or supported on this platform".to_string())
+    }
 }
 
 /// Whether becoming the default is up to the user, in the system's settings.
