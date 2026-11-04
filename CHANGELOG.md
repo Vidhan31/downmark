@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-04
+
+### Added
+- Command-line interface with options to select the view layout (`--preview`, `--editor`, `--split`), jump to a line number (`--line`, `file:line`, or `file +line`), and jump to a heading (`--heading`).
+- Single-instance window reuse. Opening a document from the terminal or file manager brings the active window forward and creates a new tab instead of launching a separate instance. Unix systems communicate through local domain sockets; Windows systems use named pipes.
+- Flag `--new-window` (`-n`) to bypass single-instance reuse and create a separate window.
+- Menu action to install the `downmark` shell command into `~/.local/bin` on Linux or `/usr/local/bin` on macOS.
+- Automatic handling for macOS process serial number flags (`-psn_*`) passed by Finder or the Dock.
+
 ## [1.1.0] - 2026-11-02
 
 ### Added
@@ -35,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of Downmark, a fast, native Markdown editor and viewer built with GPUI.
 
-[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Vidhan31/downmark/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Vidhan31/downmark/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Vidhan31/downmark/releases/tag/v1.0.0
