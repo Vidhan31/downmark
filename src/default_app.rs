@@ -63,50 +63,93 @@ pub(crate) fn make_default(cx: &mut App) -> Result<Outcome, String> {
     Ok(outcome)
 }
 
+/// Whether this platform needs an explicit shell command installation action in the UI.
+///
+/// On Windows, the command-line alias is already registered automatically via MSIX
+/// (`AppExecutionAlias`), and on Unix systems if the binary is already placed in a
+/// system binary path like `/usr/bin`, no user setup is needed.
+#[must_use]
+pub(crate) fn can_install_shell_command() -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    if std::env::var_os("FLATPAK_ID").is_none()
+        && let Ok(exe) = std::env::current_exe()
+        && (exe.starts_with("/usr/bin") || exe.starts_with("/usr/local/bin"))
+    {
+        return false;
+    }
+    true
+}
+
 /// Installs a `downmark` launcher script or symlink in `~/.local/bin/downmark`.
 ///
 /// # Errors
 ///
 /// Returns an error message if creating the directory or wrapper fails.
 pub(crate) fn install_shell_command() -> Result<String, String> {
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| "Cannot determine HOME directory".to_string())?;
-    let local_bin = std::path::PathBuf::from(home).join(".local").join("bin");
-    std::fs::create_dir_all(&local_bin)
-        .map_err(|e| format!("Could not create ~/.local/bin: {e}"))?;
-    let dest = local_bin.join("downmark");
+    if !can_install_shell_command() {
+        return Err(
+            "Shell command installation is not needed or supported on this platform".to_string(),
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| "Cannot determine HOME directory".to_string())?;
+        let local_bin = std::path::PathBuf::from(home).join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin)
+            .map_err(|e| format!("Could not create ~/.local/bin: {e}"))?;
+        let dest = local_bin.join("downmark");
 
-    if let Some(flatpak_id) = std::env::var_os("FLATPAK_ID") {
-        let id = flatpak_id.to_string_lossy();
-        let script = format!("#!/bin/sh\nexec flatpak run {id} \"$@\"\n");
-        std::fs::write(&dest, script)
-            .map_err(|e| format!("Could not write wrapper script: {e}"))?;
+        if let Some(flatpak_id) = std::env::var_os("FLATPAK_ID") {
+            let id = flatpak_id.to_string_lossy();
+            let script = format!("#!/bin/sh\nexec flatpak run {id} \"$@\"\n");
+            std::fs::write(&dest, script)
+                .map_err(|e| format!("Could not write wrapper script: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            }
+            return Ok("Installed 'downmark' wrapper script to ~/.local/bin/downmark".to_string());
+        }
+
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Could not get current executable path: {e}"))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
-        }
-        return Ok("Installed 'downmark' wrapper script to ~/.local/bin/downmark".to_string());
-    }
+            // On macOS, /usr/local/bin is in default system $PATH.
+            // Try /usr/local/bin if writable, else fall back to ~/.local/bin.
+            #[cfg(target_os = "macos")]
+            let target = {
+                let usr_local_bin = std::path::PathBuf::from("/usr/local/bin");
+                let probe = usr_local_bin.join(".downmark-write-test");
+                if usr_local_bin.exists() && std::fs::write(&probe, b"").is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    usr_local_bin.join("downmark")
+                } else {
+                    dest
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let target = dest;
 
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Could not get current executable path: {e}"))?;
-    #[cfg(unix)]
-    {
-        if dest.exists() || dest.is_symlink() {
-            let _ = std::fs::remove_file(&dest);
+            if target.exists() || target.is_symlink() {
+                let _ = std::fs::remove_file(&target);
+            }
+            std::os::unix::fs::symlink(&current_exe, &target)
+                .map_err(|e| format!("Could not create symlink at {}: {e}", target.display()))?;
+            Ok(format!(
+                "Installed 'downmark' command to {}",
+                target.display()
+            ))
         }
-        std::os::unix::fs::symlink(&current_exe, &dest)
-            .map_err(|e| format!("Could not create symlink: {e}"))?;
-        Ok(format!(
-            "Installed 'downmark' command to {}",
-            dest.display()
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = current_exe;
-        Ok("Shell command installation is only supported on Unix-like systems".to_string())
+        #[cfg(not(unix))]
+        {
+            let _ = current_exe;
+            Ok("Shell command installation is only supported on Unix-like systems".to_string())
+        }
     }
 }
 
@@ -603,5 +646,12 @@ mod tests {
         let entry = desktop_entry("/home/me/Apps/Downmark $1 \"x\" 100%");
         assert!(entry.contains("Exec=\"/home/me/Apps/Downmark \\\\$1 \\\\\"x\\\\\" 100%%\" %F\n"));
         assert!(entry.contains("MimeType=text/markdown;text/x-markdown;\n"));
+    }
+
+    #[test]
+    fn test_can_install_shell_command() {
+        if cfg!(windows) {
+            assert!(!can_install_shell_command());
+        }
     }
 }

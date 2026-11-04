@@ -162,6 +162,9 @@ where
                 return Err("invalid line number '0': line numbers start at 1".to_string());
             }
             line_target = Some(line);
+        } else if arg.starts_with("-psn") {
+            // macOS Launch Services passes a process serial number like -psn_0_123456
+            // when launching from Finder or Dock; ignore it.
         } else if arg.starts_with('-') && arg != "-" {
             return Err(format!(
                 "unrecognized option '{arg}'\nTry 'downmark --help' for more information."
@@ -241,6 +244,23 @@ mod tests {
             Ok(CliAction::Version)
         );
         assert_eq!(parse_args([OsString::from("-V")]), Ok(CliAction::Version));
+    }
+
+    #[test]
+    fn ignores_macos_process_serial_number() {
+        let action = parse_args([OsString::from("-psn_0_1234567"), OsString::from("test.md")]);
+        assert_eq!(
+            action,
+            Ok(CliAction::Run(LaunchConfig {
+                files: vec![FileTarget {
+                    path: PathBuf::from("test.md"),
+                    target: None,
+                }],
+                layout: None,
+                glance: GlanceStart::Normal,
+                new_window: false,
+            }))
+        );
     }
 
     #[test]

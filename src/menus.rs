@@ -22,6 +22,7 @@ use crate::{
         TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap,
         ToggleTabs, ZoomIn, ZoomOut, ZoomReset,
     },
+    default_app,
     document::display_name,
     settings::{Appearance, Layout},
     themes::{AppSettings, theme_names},
@@ -220,10 +221,13 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
         ),
     ];
 
-    let mut help = vec![
-        MenuItem::action("Markdown guide", OpenMarkdownGuide),
-        MenuItem::action("Install shell command…", InstallShellCommand),
-    ];
+    let mut help = vec![MenuItem::action("Markdown guide", OpenMarkdownGuide)];
+    if default_app::can_install_shell_command() {
+        help.push(MenuItem::action(
+            "Install shell command…",
+            InstallShellCommand,
+        ));
+    }
     if !macos {
         help.push(MenuItem::separator());
         help.push(MenuItem::action("About Downmark", About));
@@ -231,17 +235,22 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
 
     let mut menus = Vec::new();
     if macos {
-        menus.push(menu(
-            "Downmark",
-            vec![
-                MenuItem::action("About Downmark", About),
-                MenuItem::separator(),
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::action("Install shell command…", InstallShellCommand),
-                MenuItem::separator(),
-                MenuItem::action("Quit Downmark", Quit),
-            ],
-        ));
+        let mut downmark_items = vec![
+            MenuItem::action("About Downmark", About),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
+        ];
+        if default_app::can_install_shell_command() {
+            downmark_items.push(MenuItem::action(
+                "Install shell command…",
+                InstallShellCommand,
+            ));
+        }
+        downmark_items.extend([
+            MenuItem::separator(),
+            MenuItem::action("Quit Downmark", Quit),
+        ]);
+        menus.push(menu("Downmark", downmark_items));
     }
     menus.extend([
         menu("File", file),

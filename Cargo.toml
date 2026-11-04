@@ -138,7 +138,12 @@ core-foundation-sys = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.100"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_UI_Shell",
+] }
 
 [build-dependencies]
 # Windows only (build.rs checks the target): the exe's icon and version info.
