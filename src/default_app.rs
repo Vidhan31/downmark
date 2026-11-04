@@ -63,6 +63,53 @@ pub(crate) fn make_default(cx: &mut App) -> Result<Outcome, String> {
     Ok(outcome)
 }
 
+/// Installs a `downmark` launcher script or symlink in `~/.local/bin/downmark`.
+///
+/// # Errors
+///
+/// Returns an error message if creating the directory or wrapper fails.
+pub(crate) fn install_shell_command() -> Result<String, String> {
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| "Cannot determine HOME directory".to_string())?;
+    let local_bin = std::path::PathBuf::from(home).join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin)
+        .map_err(|e| format!("Could not create ~/.local/bin: {e}"))?;
+    let dest = local_bin.join("downmark");
+
+    if let Some(flatpak_id) = std::env::var_os("FLATPAK_ID") {
+        let id = flatpak_id.to_string_lossy();
+        let script = format!("#!/bin/sh\nexec flatpak run {id} \"$@\"\n");
+        std::fs::write(&dest, script)
+            .map_err(|e| format!("Could not write wrapper script: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        }
+        return Ok("Installed 'downmark' wrapper script to ~/.local/bin/downmark".to_string());
+    }
+
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Could not get current executable path: {e}"))?;
+    #[cfg(unix)]
+    {
+        if dest.exists() || dest.is_symlink() {
+            let _ = std::fs::remove_file(&dest);
+        }
+        std::os::unix::fs::symlink(&current_exe, &dest)
+            .map_err(|e| format!("Could not create symlink: {e}"))?;
+        Ok(format!(
+            "Installed 'downmark' command to {}",
+            dest.display()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = current_exe;
+        Ok("Shell command installation is only supported on Unix-like systems".to_string())
+    }
+}
+
 /// Whether becoming the default is up to the user, in the system's settings.
 pub(crate) const CHOSEN_IN_SYSTEM_SETTINGS: bool = cfg!(windows);
 

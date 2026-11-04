@@ -45,6 +45,10 @@ impl Layout {
     pub(crate) fn shows_editor(self) -> bool {
         self != Layout::Preview
     }
+
+    pub(crate) fn shows_preview(self) -> bool {
+        self != Layout::Editor
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

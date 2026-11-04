@@ -35,6 +35,7 @@ pub(crate) fn trim_allocator_memory() {
 mod actions;
 mod analysis;
 mod catalog;
+mod cli;
 mod default_app;
 mod diagram;
 mod diagram_viewer;
@@ -44,6 +45,7 @@ mod document_view;
 mod fonts;
 mod format;
 mod images;
+mod ipc;
 mod links;
 mod math;
 mod menus;
@@ -66,14 +68,17 @@ use std::{path::PathBuf, sync::Arc};
 use futures::StreamExt as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Bounds, Global, WeakEntity, WindowBounds, WindowKind,
-    WindowOptions, component::TitleBar, px, size,
+    WindowOptions,
+    component::{TitleBar, WindowExt as _, notification::Notification},
+    px, size,
 };
 
 use crate::{
     actions::{
-        About, OpenMarkdownGuide, OpenSettings, Quit, SetAppearance, SetTheme, ToggleGlanceMode,
+        About, InstallShellCommand, OpenMarkdownGuide, OpenSettings, Quit, SetAppearance, SetTheme,
+        ToggleGlanceMode,
     },
-    settings::Settings,
+    settings::{Layout, Settings},
     workspace::{GlanceStart, Workspace},
 };
 
@@ -94,21 +99,34 @@ impl Global for MainWindow {}
     reason = "Application startup, arguments parsing, global actions and lifecycle setup"
 )]
 fn main() {
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let glance = if args.iter().any(|arg| {
-        let s = arg.to_string_lossy();
-        s == "--glance" || s == "-g"
-    }) {
-        GlanceStart::Glance
-    } else {
-        GlanceStart::Normal
+    let launch_config = match cli::parse_args(std::env::args_os().skip(1)) {
+        Ok(cli::CliAction::Help) => {
+            #[expect(clippy::print_stdout, reason = "CLI --help output")]
+            {
+                print!("{}", cli::HELP_TEXT);
+            }
+            return;
+        }
+        Ok(cli::CliAction::Version) => {
+            #[expect(clippy::print_stdout, reason = "CLI --version output")]
+            {
+                println!("downmark {}", env!("CARGO_PKG_VERSION"));
+            }
+            return;
+        }
+        Ok(cli::CliAction::Run(config)) => config,
+        Err(err) => {
+            #[expect(clippy::print_stderr, reason = "CLI argument parsing error")]
+            {
+                eprintln!("downmark: {err}");
+            }
+            std::process::exit(1);
+        }
     };
-    let paths: Vec<PathBuf> = args
-        .into_iter()
-        .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-        .map(PathBuf::from)
-        .map(|path| path.canonicalize().unwrap_or(path))
-        .collect();
+
+    if !launch_config.new_window && ipc::try_forward_to_existing(&launch_config) {
+        return;
+    }
 
     // macOS delivers "Open with" and double-clicked files as URLs, outside
     // the app's context; they are handed over through a channel.
@@ -158,6 +176,18 @@ fn main() {
         });
         cx.on_action(|action: &SetTheme, cx: &mut App| themes::select_theme(&action.0, cx));
         cx.on_action(|_: &About, cx: &mut App| with_window(cx, dialogs::open_about));
+        cx.on_action(|_: &InstallShellCommand, cx: &mut App| {
+            with_window(cx, |window, cx| {
+                match default_app::install_shell_command() {
+                    Ok(msg) => {
+                        window.push_notification(Notification::info(msg), cx);
+                    }
+                    Err(err) => {
+                        window.push_notification(Notification::error(err), cx);
+                    }
+                }
+            });
+        });
         cx.on_action(|_: &OpenSettings, cx: &mut App| {
             with_window(cx, settings_dialog::open_settings);
         });
@@ -206,6 +236,7 @@ fn main() {
                     .any(|window| window.window_id() == main.handle.window_id())
             });
             if !main_open {
+                ipc::cleanup_socket();
                 cx.quit();
             }
         })
@@ -220,7 +251,13 @@ fn main() {
         })
         .detach();
 
-        open_window(paths, glance, app_menu_bar, cx);
+        open_window(
+            launch_config.files,
+            launch_config.layout,
+            launch_config.glance,
+            app_menu_bar,
+            cx,
+        );
         cx.activate(true);
     });
 }
@@ -244,11 +281,16 @@ fn open_paths(
             return;
         }
     }
-    open_window(paths, glance, app_menu_bar, cx);
+    let files = paths
+        .into_iter()
+        .map(|path| cli::FileTarget { path, target: None })
+        .collect();
+    open_window(files, None, glance, app_menu_bar, cx);
 }
 
 fn open_window(
-    paths: Vec<PathBuf>,
+    files: Vec<cli::FileTarget>,
+    layout: Option<Layout>,
     glance: GlanceStart,
     app_menu_bar: gpui_kit::Entity<gpui_kit::component::menu::AppMenuBar>,
     cx: &mut App,
@@ -276,11 +318,15 @@ fn open_window(
 
     let result = gpui_kit::open_window(options, cx, move |window, cx| {
         themes::apply(Some(window), cx);
-        let workspace = cx.new(|cx| Workspace::new(paths, glance, app_menu_bar, window, cx));
+        let workspace =
+            cx.new(|cx| Workspace::new(files, layout, glance, app_menu_bar, window, cx));
+        let handle = window.window_handle();
+        let weak_ws = workspace.downgrade();
         cx.set_global(MainWindow {
-            handle: window.window_handle(),
-            workspace: workspace.downgrade(),
+            handle,
+            workspace: weak_ws.clone(),
         });
+        ipc::start_server(handle, weak_ws, cx);
         workspace
     });
     if let Err(err) = result {

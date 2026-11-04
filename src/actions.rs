@@ -28,6 +28,7 @@ actions!(
         PreviousTab,
         Quit,
         About,
+        InstallShellCommand,
         OpenMarkdownGuide,
         ToggleScrollSync,
         ToggleSoftWrap,

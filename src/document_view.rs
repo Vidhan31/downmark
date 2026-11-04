@@ -149,6 +149,8 @@ pub(crate) struct DocumentView {
     preview_task: Option<Task<()>>,
     /// A heading to show once the outline is known, from following a link.
     pending_anchor: Option<String>,
+    /// A line to reveal once analysis has indexed the document blocks.
+    pending_line: Option<usize>,
 
     recovery_id: String,
     recovery_written: bool,
@@ -176,6 +178,10 @@ impl EventEmitter<DocumentEvent> for DocumentView {}
 
 impl DocumentView {
     /// A document showing `text`, saved at `path` when it has one.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Initializes editor, preview, sync, and analysis tasks"
+    )]
     pub(crate) fn new(
         text: String,
         path: Option<PathBuf>,
@@ -271,6 +277,7 @@ impl DocumentView {
             analysis_task: None,
             preview_task: None,
             pending_anchor: None,
+            pending_line: None,
             recovery_id: session::new_recovery_id(),
             recovery_written: false,
             recovery_task: None,
@@ -846,6 +853,11 @@ impl DocumentView {
 
     /// Recompute statistics, the outline and the block index off the UI
     /// thread once typing pauses. Stale results are discarded.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        reason = "Line number fits f32 block interpolation"
+    )]
     fn schedule_analysis(&mut self, policy: DebouncePolicy, cx: &mut Context<'_, Self>) {
         let revision = self.revision;
         let source = self.source.clone();
@@ -868,6 +880,33 @@ impl DocumentView {
                     this.schedule_recovery(cx);
                 } else {
                     this.discard_recovery();
+                }
+                if let Some(line) = this.pending_line.take() {
+                    let zero_based = line.saturating_sub(1);
+                    if let Some((block, _)) = this.analysis.blocks.block_at_line(zero_based as f32)
+                    {
+                        this.preview.update(cx, |preview, cx| {
+                            preview.list_state().scroll_to(ListOffset {
+                                item_ix: block,
+                                offset_in_item: px(0.),
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+                if let Some(anchor) = this.pending_anchor.take()
+                    && let Some(ix) = crate::links::find_heading(&this.analysis.outline, &anchor)
+                    && let Some(heading) = this.analysis.outline.get(ix)
+                    && let Some((block, _)) =
+                        this.analysis.blocks.block_at_line(heading.line as f32)
+                {
+                    this.preview.update(cx, |preview, cx| {
+                        preview.list_state().scroll_to(ListOffset {
+                            item_ix: block,
+                            offset_in_item: px(0.),
+                        });
+                        cx.notify();
+                    });
                 }
                 this.sync_preview(SyncMode::Force, cx);
                 cx.notify();
@@ -985,6 +1024,11 @@ impl DocumentView {
     fn shows_editor(cx: &App) -> bool {
         let settings = AppSettings::get(cx);
         settings.layout.shows_editor()
+    }
+
+    fn shows_preview(cx: &App) -> bool {
+        let settings = AppSettings::get(cx);
+        settings.layout.shows_preview()
     }
 
     fn apply(&mut self, edit: Edit, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1266,6 +1310,60 @@ impl DocumentView {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        reason = "Line number fits u32 editor position and f32 block interpolation"
+    )]
+    pub(crate) fn reveal_line(
+        &mut self,
+        line: usize,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let zero_based = line.saturating_sub(1);
+        if Self::shows_editor(cx) {
+            self.set_scroll_driver(ScrollDriver::Editor);
+            self.editor.update(cx, |editor, cx| {
+                editor.set_cursor_position(
+                    gpui_kit::component::input::Position::new(zero_based as u32, 0),
+                    window,
+                    cx,
+                );
+            });
+            self.scroll_sync.editor_scroll_target = Some(crate::scroll_sync::EditorScrollTarget {
+                line: zero_based as f32,
+                attempts: 0,
+            });
+            self.scroll_sync.scroll_editor_to_target(&self.editor, cx);
+            let editor = self.editor.clone();
+            window.on_next_frame(move |_, cx| {
+                editor.update(cx, |editor, cx| {
+                    let Some((caret, _)) = editor.cursor_layout() else {
+                        return;
+                    };
+                    let offset = editor.scroll_offset();
+                    let target = (editor.input_bounds().top() - caret.top()).min(px(0.));
+                    editor.set_scroll_offset(point(offset.x, target), cx);
+                });
+            });
+        }
+        if Self::shows_preview(cx) {
+            if self.analysis_task.is_some() {
+                self.pending_line = Some(line);
+            } else if let Some((block, _)) = self.analysis.blocks.block_at_line(zero_based as f32) {
+                self.preview.update(cx, |preview, cx| {
+                    preview.list_state().scroll_to(ListOffset {
+                        item_ix: block,
+                        offset_in_item: px(0.),
+                    });
+                    cx.notify();
+                });
+            }
+        }
+    }
+
     fn set_scroll_driver(&mut self, driver: ScrollDriver) {
         self.scroll_sync.set_driver(driver);
     }
@@ -1543,13 +1641,19 @@ impl Render for DocumentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.last_window_width = window.viewport_size().width;
 
-        if self.analysis_task.is_none()
-            && let Some(anchor) = self.pending_anchor.take()
-        {
-            let document = cx.entity();
-            window.defer(cx, move |window, cx| {
-                document.update(cx, |this, cx| this.reveal_anchor(&anchor, window, cx));
-            });
+        if self.analysis_task.is_none() {
+            if let Some(anchor) = self.pending_anchor.take() {
+                let document = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    document.update(cx, |this, cx| this.reveal_anchor(&anchor, window, cx));
+                });
+            }
+            if let Some(line) = self.pending_line.take() {
+                let document = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    document.update(cx, |this, cx| this.reveal_line(line, window, cx));
+                });
+            }
         }
         let settings = AppSettings::get(cx);
         let layout = settings.layout;
@@ -1677,6 +1781,52 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    #[gpui_kit::test]
+    fn test_reveal_line_moves_cursor_and_scrolls(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut doc_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                layout: Layout::Split,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let mut md = String::new();
+                for i in 1..=50 {
+                    _ = writeln!(md, "## Heading {i}\n\nLine {i} content\n");
+                }
+                let doc = cx.new(|cx| DocumentView::new(md, None, LineEnding::Lf, window, cx));
+                doc_entity = Some(doc.clone());
+                doc
+            })
+            .unwrap()
+        });
+        let _ = cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            window.draw(cx).clear(cx);
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.reveal_line(20, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let _ = cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            window.draw(cx).clear(cx);
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                let position = doc.editor.read(cx).cursor_position();
+                assert_eq!(position.line, 19);
+                assert_eq!(position.character, 0);
+                assert!(doc.editor.read(cx).scroll_offset().y < px(0.));
+                assert_eq!(
+                    doc.preview
+                        .read(cx)
+                        .list_state()
+                        .logical_scroll_top()
+                        .item_ix,
+                    9
+                );
+            });
+        });
+    }
 
     #[gpui_kit::test]
     fn expands_and_closes_table_overlay(cx: &mut gpui_kit::TestAppContext) {

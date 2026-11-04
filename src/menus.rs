@@ -16,11 +16,11 @@ use gpui_kit::{
 use crate::{
     actions::{
         About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, FindInPreview, GoToHeading,
-        Heading, InlineCode, InsertLink, Italic, NewFile, NewTab, NumberedList, Open,
-        OpenMarkdownGuide, OpenRecent, OpenSettings, Quit, Quote, RevealInFolder, Save, SaveAs,
-        SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList, TidyTable, ToggleGlanceMode,
-        ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap, ToggleTabs, ZoomIn, ZoomOut,
-        ZoomReset,
+        Heading, InlineCode, InsertLink, InstallShellCommand, Italic, NewFile, NewTab,
+        NumberedList, Open, OpenMarkdownGuide, OpenRecent, OpenSettings, Quit, Quote,
+        RevealInFolder, Save, SaveAs, SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList,
+        TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap,
+        ToggleTabs, ZoomIn, ZoomOut, ZoomReset,
     },
     document::display_name,
     settings::{Appearance, Layout},
@@ -220,7 +220,10 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
         ),
     ];
 
-    let mut help = vec![MenuItem::action("Markdown guide", OpenMarkdownGuide)];
+    let mut help = vec![
+        MenuItem::action("Markdown guide", OpenMarkdownGuide),
+        MenuItem::action("Install shell command…", InstallShellCommand),
+    ];
     if !macos {
         help.push(MenuItem::separator());
         help.push(MenuItem::action("About Downmark", About));
@@ -234,6 +237,7 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
                 MenuItem::action("About Downmark", About),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Install shell command…", InstallShellCommand),
                 MenuItem::separator(),
                 MenuItem::action("Quit Downmark", Quit),
             ],

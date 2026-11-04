@@ -38,14 +38,15 @@ use gpui_kit::{
 use crate::{
     actions::{
         About, ActivateTab, CloseDocument, CloseWindow, FindInPreview, FollowLink, GoToHeading,
-        NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab, Quit,
-        RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
+        InstallShellCommand, NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab,
+        Quit, RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
         ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
         ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
     },
     analysis::{Analysis, content_hash},
     catalog::FolderCatalog,
-    diagram_viewer, dialogs,
+    cli::{FileTarget, Target},
+    default_app, diagram_viewer, dialogs,
     document::{self, LineEnding, display_name, is_markdown_path},
     document_view::{DocumentEvent, DocumentView},
     links::{self, LinkTarget},
@@ -196,10 +197,13 @@ pub(crate) struct Workspace {
     _subscriptions: Vec<Subscription>,
     saved_layout_before_glance: Option<Layout>,
     glance_drag_active: bool,
+    explicit_layout: Option<Layout>,
 }
 
+use serde::{Deserialize, Serialize};
+
 /// Whether a window or workspace should start directly in distraction-free Glance Mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GlanceStart {
     Glance,
     Normal,
@@ -220,9 +224,10 @@ enum TabActivation {
 
 impl Workspace {
     /// A workspace restoring the last session (when enabled) and opening
-    /// `paths`.
+    /// `files`.
     pub(crate) fn new(
-        paths: Vec<PathBuf>,
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
         glance: GlanceStart,
         app_menu_bar: Entity<AppMenuBar>,
         window: &mut Window,
@@ -282,16 +287,22 @@ impl Workspace {
             _subscriptions: subscriptions,
             saved_layout_before_glance: None,
             glance_drag_active: false,
+            explicit_layout: layout,
         };
-        this.restore(paths, glance, &settings, window, cx);
+        this.restore(files, layout, glance, &settings, window, cx);
         this
     }
 
     /// Reopen the last session's documents and anything recovered after a
     /// crash, then the files asked for.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Session restoration, recovered documents, tabs initialization and layout setup"
+    )]
     fn restore(
         &mut self,
-        paths: Vec<PathBuf>,
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
         glance: GlanceStart,
         settings: &crate::settings::Settings,
         window: &mut Window,
@@ -315,7 +326,7 @@ impl Workspace {
             // Unsaved changes always come back; saved documents only when
             // the session is restored (just the active one without tabs).
             let wanted = settings.restore_session
-                && paths.is_empty()
+                && files.is_empty()
                 && (settings.tabs || ix == previous.active);
             let doc = match recovery {
                 Some((id, recovery)) => Some(Self::restored_document(id, recovery, window, cx)),
@@ -380,7 +391,7 @@ impl Workspace {
             #[cfg(test)]
             let is_first = false;
 
-            let tab = if is_first && paths.is_empty() {
+            let tab = if is_first && files.is_empty() {
                 let doc = cx.new(|cx| {
                     DocumentView::new(WELCOME.to_string(), None, LineEnding::Lf, window, cx)
                 });
@@ -392,7 +403,7 @@ impl Workspace {
             self.add_tab(tab, TabActivation::Background, window, cx);
         }
         self.active = active.unwrap_or(0).min(self.tabs.len().saturating_sub(1));
-        let single_file = paths.len() == 1;
+        let single_file = files.len() == 1;
         let should_glance = glance.is_glance() || (single_file && settings.glance_on_external);
         if should_glance {
             self.saved_layout_before_glance = Some(settings.layout);
@@ -400,9 +411,13 @@ impl Workspace {
                 s.glance_mode = true;
                 s.layout = Layout::Preview;
             });
+        } else if let Some(explicit) = layout {
+            AppSettings::update(cx, |s| {
+                s.layout = explicit;
+            });
         }
-        if !paths.is_empty() {
-            self.open_paths(paths, window, cx);
+        if !files.is_empty() {
+            self.open_files(files, window, cx);
         }
         self.focus_active(window, cx);
     }
@@ -590,12 +605,38 @@ impl Workspace {
 
     /// Open `paths`: as tabs when tabs are on, otherwise in place of the
     /// current document (asking about unsaved changes first).
-    fn open_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub(crate) fn open_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let files = paths
+            .into_iter()
+            .map(|path| FileTarget { path, target: None })
+            .collect();
+        self.open_files(files, window, cx);
+    }
+
+    /// Open `files` with optional targets: as tabs when tabs are on, otherwise in place of the
+    /// current document (asking about unsaved changes first).
+    fn open_files(
+        &mut self,
+        files: Vec<FileTarget>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let tabs = AppSettings::get(cx).tabs;
-        for path in paths {
-            let path = path.canonicalize().unwrap_or(path);
+        for file in files {
+            let path = file.path.canonicalize().unwrap_or(file.path);
+            let target = file.target;
             if let Some(ix) = self.tabs.iter().position(|tab| tab.path(cx) == Some(&path)) {
                 self.activate(ix, window, cx);
+                if let Some(target) = target
+                    && let Some(doc) = self.active_document()
+                {
+                    self.reveal_target(&doc, target, window, cx);
+                }
                 continue;
             }
             let active = self.active_tab();
@@ -606,18 +647,18 @@ impl Workspace {
                 self.confirm_unsaved(doc.clone(), AfterConfirm::OpenPath(path), window, cx);
                 return;
             }
-            self.load_path(path, Placement::Default, None, window, cx);
+            self.load_path(path, Placement::Default, target, window, cx);
         }
     }
 
     /// Read `path` in the background and show it where `placement` says,
-    /// scrolled to the heading `anchor` names, if any.
+    /// scrolled to the heading or line `target` names, if any.
     #[expect(clippy::unused_self, reason = "GPUI view method consistency")]
     fn load_path(
         &mut self,
         path: PathBuf,
         placement: Placement,
-        anchor: Option<String>,
+        target: Option<Target>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -631,7 +672,11 @@ impl Workspace {
                 Ok(loaded) => {
                     AppSettings::update(cx, |settings| {
                         settings.push_recent(&path);
-                        settings.layout = Layout::Preview;
+                        if let Some(layout) = this.explicit_layout {
+                            settings.layout = layout;
+                        } else {
+                            settings.layout = Layout::Preview;
+                        }
                     });
                     let doc = cx.new(|cx| {
                         DocumentView::new(
@@ -655,8 +700,8 @@ impl Workspace {
                     } else {
                         this.add_tab(tab, TabActivation::Activate, window, cx);
                     }
-                    if let Some(anchor) = anchor {
-                        this.reveal_anchor(&doc, &anchor, window, cx);
+                    if let Some(target) = target {
+                        this.reveal_target(&doc, target, window, cx);
                     }
                 }
                 Err(err) => {
@@ -672,6 +717,27 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Reveal a line or heading target in `doc`.
+    fn reveal_target(
+        &mut self,
+        doc: &Entity<DocumentView>,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match target {
+            Target::Line(line) => {
+                let doc = doc.clone();
+                window.defer(cx, move |window, cx| {
+                    doc.update(cx, |doc, cx| doc.reveal_line(line, window, cx));
+                });
+            }
+            Target::Heading(anchor) => {
+                self.reveal_anchor(doc, &anchor, window, cx);
+            }
+        }
     }
 
     fn new_document(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1204,7 +1270,13 @@ impl Workspace {
                 self.load_path(path, Placement::Default, None, window, cx);
             }
             AfterConfirm::OpenLink(path, anchor) => {
-                self.load_path(path, Placement::ReplaceActive, anchor, window, cx);
+                self.load_path(
+                    path,
+                    Placement::ReplaceActive,
+                    anchor.map(Target::Heading),
+                    window,
+                    cx,
+                );
             }
             AfterConfirm::CloseDocument(id) => {
                 self.discarded.remove(&id);
@@ -1333,11 +1405,23 @@ impl Workspace {
             return;
         }
         if new_tab {
-            self.load_path(path, Placement::NewTab, anchor, window, cx);
+            self.load_path(
+                path,
+                Placement::NewTab,
+                anchor.map(Target::Heading),
+                window,
+                cx,
+            );
         } else if let Some(doc) = self.active_document() {
             self.confirm_unsaved(doc, AfterConfirm::OpenLink(path, anchor), window, cx);
         } else {
-            self.load_path(path, Placement::Default, anchor, window, cx);
+            self.load_path(
+                path,
+                Placement::Default,
+                anchor.map(Target::Heading),
+                window,
+                cx,
+            );
         }
     }
 
@@ -2372,6 +2456,16 @@ impl Render for Workspace {
                 );
             }))
             .on_action(|_: &About, window, cx| dialogs::open_about(window, cx))
+            .on_action(|_: &InstallShellCommand, window, cx| {
+                match default_app::install_shell_command() {
+                    Ok(msg) => {
+                        window.push_notification(Notification::info(msg), cx);
+                    }
+                    Err(err) => {
+                        window.push_notification(Notification::error(err), cx);
+                    }
+                }
+            })
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., cx)))
@@ -2480,6 +2574,33 @@ impl Workspace {
                 });
             }
             self.open_paths(documents, window, cx);
+        }
+    }
+
+    /// Open documents and apply settings received from a secondary CLI process via IPC.
+    pub(crate) fn open_launch_config(
+        &mut self,
+        config: crate::cli::LaunchConfig,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if config.glance.is_glance() {
+            if !AppSettings::get(cx).glance_mode {
+                self.saved_layout_before_glance = Some(AppSettings::get(cx).layout);
+                AppSettings::update(cx, |settings| {
+                    settings.glance_mode = true;
+                    settings.layout = Layout::Preview;
+                });
+            }
+        } else if let Some(layout) = config.layout {
+            self.explicit_layout = Some(layout);
+            AppSettings::update(cx, |settings| {
+                settings.glance_mode = false;
+                settings.layout = layout;
+            });
+        }
+        if !config.files.is_empty() {
+            self.open_files(config.files, window, cx);
         }
     }
 }
@@ -2648,7 +2769,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
             let initial_tab_count = ws.tabs.len();
             for _ in 0..15 {
                 ws.new_tab(TabActivation::Background, window, cx);
@@ -2670,7 +2798,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
             for _ in 0..10 {
                 ws.new_tab(TabActivation::Background, window, cx);
             }
@@ -2698,7 +2833,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
             assert_eq!(ws.tabs.len(), 1);
             assert_eq!(ws.active, 0);
 
@@ -2723,7 +2865,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
             ws.new_document(window, cx);
@@ -2745,7 +2894,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
@@ -2775,7 +2931,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Glance,
+                app_menu_bar,
+                window,
+                cx,
+            );
             assert!(AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
             ws
@@ -2795,7 +2958,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Glance,
+                app_menu_bar,
+                window,
+                cx,
+            );
             assert!(AppSettings::get(cx).glance_mode);
 
             // Explicitly setting layout exits glance mode
@@ -2828,7 +2998,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Glance,
+                app_menu_bar,
+                window,
+                cx,
+            );
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -2870,7 +3047,14 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(Vec::new(), GlanceStart::Glance, app_menu_bar, window, cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Glance,
+                app_menu_bar,
+                window,
+                cx,
+            );
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -2927,8 +3111,14 @@ mod tests {
                     DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx)
                 });
                 let entity = cx.new(|cx| {
-                    let mut ws =
-                        Workspace::new(Vec::new(), GlanceStart::Normal, app_menu_bar, window, cx);
+                    let mut ws = Workspace::new(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    );
                     ws.tabs[0] = WorkspaceTab::Document(doc);
                     ws
                 });
