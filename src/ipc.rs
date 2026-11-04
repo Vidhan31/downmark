@@ -1,13 +1,12 @@
 //! Inter-process communication for single-instance window reuse.
 
-use std::{
-    io::{BufRead as _, BufReader, Write as _},
-    path::PathBuf,
-};
+use std::io::Write as _;
 
 #[cfg(unix)]
 use std::{
+    io::{BufRead as _, BufReader},
     os::unix::net::{UnixListener, UnixStream},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -197,37 +196,46 @@ pub(crate) fn start_server(
             .chain(std::iter::once(0))
             .collect();
 
-        // SAFETY: Calling Win32 API CreateNamedPipeW to initialize pipe server with default security.
-        let handle: HANDLE = unsafe {
-            CreateNamedPipeW(
-                wide_name.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                4096,
-                4096,
-                0,
-                ptr::null(),
-            )
-        };
-
-        if handle == INVALID_HANDLE_VALUE {
-            return;
-        }
-
         #[derive(Clone, Copy)]
         struct SendHandle(HANDLE);
 
         // SAFETY: Win32 HANDLE represents an OS resource that can be safely transferred across threads.
         unsafe impl Send for SendHandle {}
 
-        let send_handle = SendHandle(handle);
+        impl SendHandle {
+            const fn into_raw(self) -> HANDLE {
+                self.0
+            }
+        }
+
+        let send_handle = {
+            // SAFETY: Calling Win32 API CreateNamedPipeW to initialize pipe server with default security.
+            let handle: HANDLE = unsafe {
+                CreateNamedPipeW(
+                    wide_name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    4096,
+                    4096,
+                    0,
+                    ptr::null(),
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE {
+                return;
+            }
+
+            SendHandle(handle)
+        };
+
         let (ipc_tx, mut ipc_rx) = futures::channel::mpsc::unbounded::<LaunchConfig>();
 
         std::thread::Builder::new()
             .name("downmark-ipc".into())
             .spawn(move || {
-                let handle = send_handle.0;
+                let handle = send_handle.into_raw();
                 loop {
                     // SAFETY: ConnectNamedPipe blocks waiting for a client to connect to the pipe.
                     let connected = unsafe { ConnectNamedPipe(handle, ptr::null_mut()) };
@@ -331,6 +339,8 @@ pub(crate) fn cleanup_socket() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[cfg(unix)]
