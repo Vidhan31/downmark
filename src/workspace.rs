@@ -13,10 +13,12 @@ use std::{
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
     Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, Menu, MouseButton,
-    MouseDownEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions, Render,
-    ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, WindowBounds, WindowControlArea,
+    MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
+    PathPromptOptions, Render, ScrollEvent, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowBounds,
+    WindowControlArea,
     assets::IconName,
+    base::{GlobalState, TextSelection},
     component::{
         ActiveTheme as _, Icon, IndexPath, Sizable as _, TitleBar, WindowExt as _,
         button::{Button, ButtonVariants as _},
@@ -1828,6 +1830,19 @@ impl Workspace {
                     .overflow_hidden()
                     .items_center()
                     .gap_1()
+                    .capture_any_mouse_down(|_, window, cx| {
+                        GlobalState::suppress_text_selection(cx);
+                        TextSelection::end(window, cx);
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                        GlobalState::suppress_text_selection(cx);
+                        TextSelection::end(window, cx);
+                    })
+                    .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+                        if !event.dragging() {
+                            TextSelection::end(window, cx);
+                        }
+                    })
                     .child(self.render_app_menu_button(cx))
                     .child(self.render_tabs(
                         visible_tabs_width + px(NEW_TAB_BUTTON_WIDTH_PX),
@@ -2206,6 +2221,14 @@ impl Workspace {
             .w_full()
             .role(gpui_kit::Role::Status)
             .aria_label("Status bar")
+            .capture_any_mouse_down(|_, window, cx| {
+                GlobalState::suppress_text_selection(cx);
+                TextSelection::end(window, cx);
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                GlobalState::suppress_text_selection(cx);
+                TextSelection::end(window, cx);
+            })
             .child(
                 StatusBar::new().left(left_section).right(
                     h_flex()
@@ -2485,9 +2508,15 @@ impl Render for Workspace {
                         .w_full()
                         .h(px(24.))
                         .window_control_area(WindowControlArea::Drag)
+                        .capture_any_mouse_down(|_, window, cx| {
+                            GlobalState::suppress_text_selection(cx);
+                            TextSelection::end(window, cx);
+                        })
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                GlobalState::suppress_text_selection(cx);
+                                TextSelection::end(window, cx);
                                 if ev.click_count == 2 {
                                     window.zoom_window();
                                 } else {
@@ -2501,10 +2530,13 @@ impl Render for Workspace {
                                 this.glance_drag_active = false;
                             }),
                         )
-                        .on_mouse_move(cx.listener(|this, _, window, _| {
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                             if this.glance_drag_active {
                                 this.glance_drag_active = false;
+                                TextSelection::end(window, cx);
                                 window.start_window_move();
+                            } else if !event.dragging() {
+                                TextSelection::end(window, cx);
                             }
                         }))
                         .on_mouse_down(MouseButton::Right, move |ev, window, _| {
@@ -2541,6 +2573,19 @@ impl Render for Workspace {
                     div()
                         .w_full()
                         .overflow_hidden()
+                        .capture_any_mouse_down(|_, window, cx| {
+                            GlobalState::suppress_text_selection(cx);
+                            TextSelection::end(window, cx);
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            GlobalState::suppress_text_selection(cx);
+                            TextSelection::end(window, cx);
+                        })
+                        .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+                            if !event.dragging() {
+                                TextSelection::end(window, cx);
+                            }
+                        })
                         .child(self.render_title_bar(window, cx)),
                 )
                 .child(div().flex_1().min_h_0().overflow_hidden().child(main))
@@ -2687,6 +2732,8 @@ pub(crate) fn restored_bounds(cx: &App) -> Option<WindowBounds> {
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::Modifiers;
+
     use super::*;
 
     #[test]
@@ -3135,5 +3182,63 @@ mod tests {
             assert!(!window.has_active_dialog(cx));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn title_bar_mouse_down_suppresses_text_selection(cx: &mut gpui_kit::TestAppContext) {
+        let (_ws, cx) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let doc = cx.new(|cx| {
+                DocumentView::new(
+                    "# Heading\n\nSome text content to select".to_string(),
+                    None,
+                    LineEnding::Lf,
+                    window,
+                    cx,
+                )
+            });
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+            ws.tabs[0] = WorkspaceTab::Document(doc);
+            ws
+        });
+
+        // Click in the title bar region (y = 15 px).
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(300.), px(15.)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+
+        cx.update(|window, cx| {
+            assert!(GlobalState::is_text_selection_suppressed(cx));
+            assert!(!TextSelection::has_selection(window, cx));
+        });
+
+        // Move into document area without dragging.
+        cx.simulate_event(MouseMoveEvent {
+            position: point(px(300.), px(200.)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        });
+
+        cx.update(|window, cx| {
+            assert!(!TextSelection::has_selection(window, cx));
+        });
     }
 }

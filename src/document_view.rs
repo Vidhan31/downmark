@@ -14,7 +14,7 @@ use gpui_kit::{
     Focusable as _, InteractiveElement as _, IntoElement, KeyDownEvent, ListOffset, MouseButton,
     MouseMoveEvent, ParentElement as _, Pixels, Render, RetainAllImageCache, ScrollEvent,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    base::{TextView, TextViewState},
+    base::{TextSelection, TextView, TextViewState},
     component::{
         ActiveTheme as _, ElementExt as _, RopeExt as _, Theme, WindowExt as _,
         clipboard::Clipboard,
@@ -1378,6 +1378,10 @@ impl DocumentView {
             .sync_editor(&self.preview, &self.editor, &self.analysis, cx);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Declarative GPUI layout for editor pane"
+    )]
     fn render_editor(&self, window: &Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let document = cx.weak_entity();
         let inset = column_inset(self.pane_width(self.editor_width, window, cx), cx);
@@ -1390,8 +1394,11 @@ impl DocumentView {
             // The margins beside the text column belong to the editor too:
             // the editor handles the wheel over its text, this handles the
             // rest so the whole pane scrolls.
-            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.set_scroll_driver(ScrollDriver::Editor);
+                if !event.dragging() {
+                    TextSelection::end(window, cx);
+                }
             }))
             .capture_key_down(cx.listener(|this, _: &KeyDownEvent, _, _| {
                 this.set_scroll_driver(ScrollDriver::Editor);
@@ -1510,8 +1517,11 @@ impl DocumentView {
             )
             // Let the margins beside the text column scroll the preview; the
             // list scrolls itself when the pointer is over its viewport.
-            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.set_scroll_driver(ScrollDriver::Preview);
+                if !event.dragging() {
+                    TextSelection::end(window, cx);
+                }
             }))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.set_scroll_driver(ScrollDriver::Preview);
