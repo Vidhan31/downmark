@@ -212,7 +212,6 @@ pub(crate) fn inline_code_color(cx: &App) -> Hsla {
 
     let fg = Rgba::from(theme.foreground);
 
-    // 1. Check syntax highlight theme for code span
     if let Some(color) = theme
         .highlight_theme
         .style("text.code.span")
@@ -221,7 +220,6 @@ pub(crate) fn inline_code_color(cx: &App) -> Hsla {
         return color;
     }
 
-    // 2. Check syntax highlight theme for literal text if distinct from foreground
     if let Some(color) = theme
         .highlight_theme
         .style("text.literal")
@@ -234,7 +232,6 @@ pub(crate) fn inline_code_color(cx: &App) -> Hsla {
         }
     }
 
-    // 3. Fallback to string syntax highlight if distinct from foreground
     if let Some(color) = theme.highlight_theme.style("string").and_then(|s| s.color) {
         let rgba = Rgba::from(color);
         let dist = (rgba.r - fg.r).abs() + (rgba.g - fg.g).abs() + (rgba.b - fg.b).abs();
@@ -243,7 +240,6 @@ pub(crate) fn inline_code_color(cx: &App) -> Hsla {
         }
     }
 
-    // 4. Fallback to primary theme color
     theme.primary
 }
 

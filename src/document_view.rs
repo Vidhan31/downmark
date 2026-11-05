@@ -1855,7 +1855,6 @@ mod tests {
             window.close_dialog(cx);
             assert!(!window.has_active_dialog(cx));
 
-            // Test that pressing Escape closes the table dialog
             crate::actions::bind_keys(cx);
             doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
                 doc.open_expanded_table(table_md, Some(0..table_md.len()), window, cx);
@@ -1867,7 +1866,6 @@ mod tests {
             assert!(handled);
             assert!(!window.has_active_dialog(cx));
 
-            // Test that right/left arrow keys are handled in the table overlay
             doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
                 doc.open_expanded_table(table_md, Some(0..table_md.len()), window, cx);
             });
@@ -2032,7 +2030,6 @@ mod tests {
             view.preview_scroll_top(&crate::actions::PreviewScrollTop, window, cx);
             assert_eq!(view.scroll_sync.driver(), ScrollDriver::Preview);
 
-            // Test horizontal table scroll actions with active scroll handle
             let handle = gpui_kit::ScrollHandle::new();
             cx.set_global(preview_ext::ActiveTableScrollHandle(handle));
             view.preview_scroll_right(&crate::actions::PreviewScrollRight, window, cx);
@@ -2075,12 +2072,10 @@ mod tests {
             });
             window.draw(cx).clear(cx);
 
-            // Verify table is recognized in analysis
             doc_entity.as_ref().unwrap().read_with(cx, |doc, _| {
                 assert!(doc.analysis.blocks.is_table(1));
             });
 
-            // Test opening expanded table with active search
             assert!(!window.has_active_dialog(cx));
             let table_md = "| Column 1 | Column 2 |\n| --- | --- |\n| Item Alpha | TargetMatch |\n| Item Gamma | Item Delta |";
             doc_entity.as_ref().unwrap().update(cx, |doc, cx| {

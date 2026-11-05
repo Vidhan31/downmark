@@ -297,7 +297,7 @@ mod tests {
             line: 10.0,
             attempts: 0,
         });
-        sync.set_driver(ScrollDriver::Preview); // No change
+        sync.set_driver(ScrollDriver::Preview);
         assert!(sync.editor_scroll_target.is_some());
 
         sync.set_driver(ScrollDriver::Editor);

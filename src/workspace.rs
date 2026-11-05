@@ -2905,12 +2905,10 @@ mod tests {
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
-            // Toggle on: glance_mode is true, layout forced to Preview
             ws.toggle_glance_mode(window, cx);
             assert!(AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
 
-            // Toggle off: glance_mode is false, previous layout (Split) is restored
             ws.toggle_glance_mode(window, cx);
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
@@ -2968,12 +2966,10 @@ mod tests {
             );
             assert!(AppSettings::get(cx).glance_mode);
 
-            // Explicitly setting layout exits glance mode
             ws.set_layout(&SetLayout(Layout::Editor), window, cx);
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Editor);
 
-            // Re-enter glance mode, then creating a new tab exits glance mode
             ws.toggle_glance_mode(window, cx);
             assert!(AppSettings::get(cx).glance_mode);
             ws.new_tab_action(&NewTab, window, cx);
@@ -3069,21 +3065,18 @@ mod tests {
             assert!(AppSettings::get(cx).glance_mode);
             ws
         });
-        // Open search first
         cx_window.update(|window, cx| {
             doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
                 doc.open_search(window, cx);
                 assert!(doc.is_search_open());
             });
             window.draw(cx).clear(cx);
-            // First Escape closes search, stays in glance mode
             let handled =
                 window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
             assert!(handled);
             assert!(!doc_entity.as_ref().unwrap().read(cx).is_search_open());
             assert!(AppSettings::get(cx).glance_mode);
 
-            // Second Escape exits glance mode
             window.draw(cx).clear(cx);
             let handled =
                 window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);

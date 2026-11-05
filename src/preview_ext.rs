@@ -1260,7 +1260,6 @@ mod tests {
         assert!(cache.contains_key(&key_b));
         assert!(cache.contains_key(&key_c));
 
-        // Tab 1 contains key_b. No tabs contain key_a or key_c.
         let open_tab_contents =
             vec!["# Document with diagram\n\n```mermaid\ngraph LR\nC-->D\n```\n"];
         let _ = cache.prune_unreferenced(&open_tab_contents);
@@ -1278,7 +1277,6 @@ mod tests {
             "Unreferenced diagram C must be pruned"
         );
 
-        // When all tabs are closed (empty list), everything is pruned
         let _ = cache.prune_unreferenced(&[]);
         assert!(
             !cache.contains_key(&key_b),

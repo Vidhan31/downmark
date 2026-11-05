@@ -69,7 +69,6 @@ if (-not $PublisherDisplayName) {
     $PublisherDisplayName = if ($env:MSIX_PUBLISHER_DISPLAY_NAME) { $env:MSIX_PUBLISHER_DISPLAY_NAME } else { "Downmark Contributors" }
 }
 
-# Locate Windows SDK tools (MakeAppx.exe and SignTool.exe)
 function Get-SdkTool([string]$ToolName) {
     $kitsRoot = @(
         "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
@@ -99,7 +98,6 @@ function Get-SdkTool([string]$ToolName) {
 $makeAppx = Get-SdkTool "makeappx.exe"
 $signTool = if ($SignSelfSigned) { Get-SdkTool "signtool.exe" } else { $null }
 
-# Prepare staging workspace
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $resolvedOutputDir = (Resolve-Path $OutputDir).Path
@@ -108,10 +106,8 @@ $stagingAssets = Join-Path $stagingDir "Assets"
 New-Item -ItemType Directory -Force -Path $stagingAssets | Out-Null
 
 try {
-    # 1. Copy payload binary
     Copy-Item -LiteralPath $SourceExe -Destination (Join-Path $stagingDir "Downmark.exe")
 
-    # 2. Copy in-app visual assets
     $assetsSource = Join-Path $scriptDir "assets"
     foreach ($asset in @("Square44x44Logo.png", "Square150x150Logo.png", "StoreLogo.png")) {
         $sourceAsset = Join-Path $assetsSource $asset
@@ -122,7 +118,6 @@ try {
         }
     }
 
-    # 3. Generate AppxManifest.xml with substituted identity
     $templatePath = Join-Path $scriptDir "AppxManifest.xml.template"
     $manifestXml = Get-Content -LiteralPath $templatePath -Raw -Encoding UTF8
     $manifestXml = $manifestXml.Replace('__PACKAGE_NAME__', $PackageName)
@@ -133,7 +128,6 @@ try {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText((Join-Path $stagingDir "AppxManifest.xml"), $manifestXml, $utf8NoBom)
 
-    # 4. Pack MSIX package
     $outputPackage = Join-Path $resolvedOutputDir "Downmark-$Version-windows-x64.msix"
     Write-Host "Packing MSIX: $outputPackage"
     Write-Host "  Package Name: $PackageName"
@@ -144,7 +138,6 @@ try {
         throw "MakeAppx.exe failed with exit code $LASTEXITCODE"
     }
 
-    # 5. Sign with temporary self-signed certificate if requested
     if ($SignSelfSigned) {
         Write-Host "Creating self-signed test certificate for '$Publisher'..."
         $cert = New-SelfSignedCertificate `

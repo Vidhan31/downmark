@@ -101,8 +101,6 @@ impl DocumentSearch {
             .as_ref()
             .expect("cached_rendered_lower was initialized or populated above");
 
-        // Incremental search optimization: if typing extends previous query without doc change,
-        // filter the existing matches directly.
         let is_query_extension = !doc_changed
             && !previous_query_lower.is_empty()
             && query_lower.starts_with(&previous_query_lower)
@@ -274,7 +272,6 @@ impl DocumentSearch {
             let mid = low + (high - low) / 2;
             let mut found_range = None;
 
-            // Probe mid; if mid does not render, probe forward
             let mut probe_ix = mid;
             while probe_ix < high {
                 if let Some(r) = rendered_range_for_source(block_ranges[probe_ix].clone()) {
@@ -295,7 +292,6 @@ impl DocumentSearch {
                     low = actual_ix + 1;
                 }
             } else {
-                // No rendering blocks from mid to high
                 high = mid;
             }
         }
@@ -485,10 +481,9 @@ mod tests {
         let target_range = 50..55;
         let mapper = |r: Range<usize>| Some(r);
 
-        // When block spans are empty, falls back to proportional estimate
         let (ix, range) =
             search.find_block_for_target(&block_spans, &target_range, 100, 10, mapper);
-        assert_eq!(ix, 5); // 50 / 100 * 10 = 5
+        assert_eq!(ix, 5);
         assert!(range.is_none());
     }
 }
