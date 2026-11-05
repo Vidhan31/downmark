@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-05
+
+### Fixed
+- Window drag text selection. Fixed an issue where dragging the window by holding the title bar and then moving the mouse into the document view inadvertently started or resumed text selection.
+
 ## [1.2.0] - 2026-11-04
 
 ### Added
@@ -44,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of Downmark, a fast, native Markdown editor and viewer built with GPUI.
 
-[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/Vidhan31/downmark/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Vidhan31/downmark/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Vidhan31/downmark/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Vidhan31/downmark/releases/tag/v1.0.0

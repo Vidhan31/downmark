@@ -1,6 +1,6 @@
 [package]
 name = "downmark"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 description = "Downmark — a fast, native Markdown viewer built with GPUI Kit."
 license = "Apache-2.0"
