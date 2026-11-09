@@ -154,10 +154,13 @@ gpui-kit = { version = "0.9.0", features = ["test-support"] }
 
 # Dependencies are large (GPUI, tree-sitter grammars, Typst); full debug info
 # for them makes every test binary hundreds of megabytes.
+# Optimizing dependencies (opt-level = 3) prevents UI/parser lag in development
+# while keeping compilation fast for local code changes.
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
+opt-level = 3
 debug = false
 
 [profile.release]
@@ -165,3 +168,12 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = true
+
+# Profiling / Release-with-Debug:
+# Inherits release optimizations, but preserves full debug symbols and prevents
+# stripping. Essential for profilers (perf, samply, flamegraph) and diagnosing
+# crashes in optimized builds.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
