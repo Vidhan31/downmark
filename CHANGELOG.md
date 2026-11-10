@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Interactive task list checkboxes. Clicking task list checkboxes (`- [ ]`, `- [x]`) in preview updates the source text in all modes, including Preview and Glance modes, and records undo history.
+- Search match markers on scrollbars. When search is active, colored tick marks appear on the scrollbar track in Preview, Editor, and Split modes to indicate match locations, with a distinct highlight for the active match.
+- Native link tooltips. Hovering over a link displays its destination type and address (headings, documents, external URLs, emails) using native tooltips.
+- Reference link resolution. Reference-style links (`[text][ref]`) and image references resolve destination URLs and titles in preview and table overlay views.
+
+### Changed
+- Upgraded `gpui-kit` to 0.9.1 and aligned HTTP client dependencies.
+- Migrated GitHub alert callouts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`) to native block surfaces.
+
+### Removed
+- Status bar link preview text on hover. Native tooltips replace the bottom status bar target display.
+
+### Fixed
+- Empty tooltips when hovering reference-style links without inline URLs.
+
 ## [1.2.1] - 2026-11-05
 
 ### Fixed

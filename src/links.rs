@@ -6,7 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::{App, ClickEvent, MouseButton, SharedString, Window};
+use gpui_kit::{
+    AnyView, App, AppContext, ClickEvent, MouseButton, SharedString, Window,
+    component::tooltip::Tooltip,
+};
 
 use crate::{actions::FollowLink, analysis::Heading};
 
@@ -233,9 +236,40 @@ pub(crate) fn format_target_tooltip(
     out.into()
 }
 
+struct EmptyTooltip;
+
+impl gpui_kit::Render for EmptyTooltip {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        _: &mut gpui_kit::Context<'_, Self>,
+    ) -> impl gpui_kit::IntoElement {
+        gpui_kit::div()
+    }
+}
+
+/// Builds an interactive tooltip view for a link destination and optional document base directory.
+pub(crate) fn build_tooltip(
+    url: &SharedString,
+    base_dir: Option<&Path>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyView {
+    if url.trim().is_empty() {
+        return cx.new(|_| EmptyTooltip).into();
+    }
+    let target = classify(url, base_dir);
+    let text = format_target_tooltip(target.as_ref(), url, None);
+    if text.trim().is_empty() {
+        return cx.new(|_| EmptyTooltip).into();
+    }
+    Tooltip::new(text).build(window, cx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::ParentElement as _;
 
     fn heading(text: &str) -> Heading {
         Heading {
@@ -372,5 +406,29 @@ mod tests {
             format_target_tooltip(file_target.as_ref(), "guide.md#setup", None).as_ref(),
             "Document: guide.md (#setup)"
         );
+    }
+
+    #[gpui_kit::test]
+    fn empty_url_builds_empty_view(cx: &mut gpui_kit::TestAppContext) {
+        let _ = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_window, cx| {
+                cx.new(|_| {
+                    struct EmptyTestRoot;
+                    impl gpui_kit::Render for EmptyTestRoot {
+                        fn render(
+                            &mut self,
+                            window: &mut Window,
+                            cx: &mut gpui_kit::Context<'_, Self>,
+                        ) -> impl gpui_kit::IntoElement {
+                            let empty = SharedString::from("");
+                            let view = build_tooltip(&empty, None, window, cx);
+                            gpui_kit::div().child(view)
+                        }
+                    }
+                    EmptyTestRoot
+                })
+            })
+            .unwrap()
+        });
     }
 }

@@ -5,7 +5,7 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -130,6 +130,9 @@ pub(crate) struct DocumentView {
     /// Parser configuration for the preview; built once so the preview can
     /// tell that it is unchanged between frames.
     markdown_extensions: gpui_kit::component::text::MarkdownExtensions,
+    base_dir_cell: Arc<Mutex<Option<PathBuf>>>,
+    search_ruler_decorations: gpui_kit::base::input::OverviewRulerDecorationCollection,
+    last_search_ruler_query: String,
     search: DocumentSearch,
     search_input: Entity<InputState>,
     search_open: bool,
@@ -169,12 +172,39 @@ pub(crate) struct DocumentView {
     /// Measured widths used to center the text column.
     editor_width: Pixels,
     preview_width: Pixels,
+    preview_height: Pixels,
     last_window_width: Pixels,
     preview_style: gpui_kit::base::TextViewStyle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<DocumentEvent> for DocumentView {}
+
+/// Target state for a task checkbox toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskState {
+    Checked,
+    Unchecked,
+}
+
+impl From<bool> for TaskState {
+    fn from(checked: bool) -> Self {
+        if checked {
+            Self::Checked
+        } else {
+            Self::Unchecked
+        }
+    }
+}
+
+impl TaskState {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Checked => "[x]",
+            Self::Unchecked => "[ ]",
+        }
+    }
+}
 
 impl DocumentView {
     /// A document showing `text`, saved at `path` when it has one.
@@ -232,6 +262,16 @@ impl DocumentView {
             cx.observe(&editor, |this, editor, cx| {
                 this.last_cursor = editor.read(cx).cursor();
                 this.sync_preview(SyncMode::Normal, cx);
+                let session = editor.read(cx).search_session();
+                let query = if session.is_active() {
+                    session.query.clone()
+                } else {
+                    String::new()
+                };
+                if query != this.last_search_ruler_query {
+                    this.last_search_ruler_query = query;
+                    this.sync_editor_search_ruler(cx);
+                }
             }),
             // A re-parse can rebuild the preview's rows, which resets its
             // scroll position; realign once the new rows exist.
@@ -252,15 +292,25 @@ impl DocumentView {
             }),
             cx.observe_global_in::<Theme>(window, |this, _, cx| {
                 this.preview_style = make_preview_style(cx);
+                this.sync_editor_search_ruler(cx);
                 cx.notify();
             }),
         ];
 
         let preview_style = make_preview_style(cx);
+        let base_dir_cell = Arc::new(Mutex::new(None));
+        let markdown_extensions =
+            preview_ext::markdown_extensions(&preview, Arc::clone(&base_dir_cell));
+        let search_ruler_decorations = editor.update(cx, |editor, cx| {
+            editor.create_overview_ruler_decorations_collection(Vec::new(), cx)
+        });
 
         let mut this = Self {
             editor,
-            markdown_extensions: preview_ext::markdown_extensions(&preview),
+            markdown_extensions,
+            base_dir_cell,
+            search_ruler_decorations,
+            last_search_ruler_query: String::new(),
             preview,
             image_cache: RetainAllImageCache::new(cx),
             search: DocumentSearch::new(),
@@ -289,6 +339,7 @@ impl DocumentView {
             scroll_sync: ScrollSynchronizer::new(),
             editor_width: px(0.),
             preview_width: px(0.),
+            preview_height: px(0.),
             last_window_width: px(0.),
             preview_style,
             _subscriptions: subscriptions,
@@ -569,6 +620,8 @@ impl DocumentView {
 
     pub(crate) fn clear_search(&mut self, cx: &mut Context<'_, Self>) {
         self.search.clear_query();
+        self.last_search_ruler_query.clear();
+        self.search_ruler_decorations.set(Vec::new(), cx);
         self.preview.update(cx, |state, cx| {
             state.clear_range_highlights(cx);
         });
@@ -580,6 +633,8 @@ impl DocumentView {
         self.search.update_query(&query, rendered_text.as_str());
 
         self.update_search_highlights(cx);
+        self.last_search_ruler_query = query;
+        self.sync_editor_search_ruler(cx);
         if let Some(target_range) = self.search.current_match().cloned() {
             self.scroll_to_match(&target_range, cx);
         }
@@ -664,7 +719,8 @@ impl DocumentView {
         let text = span
             .and_then(|range| self.source.get(range))
             .unwrap_or(fallback_markdown);
-        let markdown = SharedString::from(text.to_string());
+        let resolved = preview_ext::resolve_reference_links(text);
+        let markdown = SharedString::from(resolved.into_owned());
         let base_dir = self.dir().map(Arc::<Path>::from);
         let extensions = preview_ext::table_overlay_extensions(&self.preview);
         table_overlay::open(
@@ -690,6 +746,111 @@ impl DocumentView {
             .as_ref()
             .and_then(|path| path.parent())
             .map(Path::to_path_buf)
+    }
+
+    fn sync_base_dir(&self) {
+        if let Ok(mut lock) = self.base_dir_cell.lock() {
+            *lock = self.dir();
+        }
+    }
+
+    fn sync_editor_search_ruler(&mut self, cx: &mut App) {
+        let editor = self.editor.read(cx);
+        let session = editor.search_session();
+        let color = cx.theme().warning;
+        let mut decorations = Vec::new();
+        if session.is_active() {
+            for range in session.matcher.matched_ranges().iter() {
+                decorations.push(
+                    gpui_kit::base::input::OverviewRulerDecoration::new(range.clone())
+                        .with_lane(gpui_kit::base::input::OverviewRulerLane::Full)
+                        .with_color(color),
+                );
+            }
+        } else if self.search_open && !self.last_search_ruler_query.trim().is_empty() {
+            let query = self.last_search_ruler_query.trim();
+            let editor_text = editor.value();
+            let query_lower = query.to_lowercase();
+            let text_lower = editor_text.to_lowercase();
+            let mut search_start = 0;
+            while let Some(pos) = text_lower[search_start..].find(&query_lower) {
+                let match_start = search_start + pos;
+                let match_end = match_start + query.len();
+                decorations.push(
+                    gpui_kit::base::input::OverviewRulerDecoration::new(match_start..match_end)
+                        .with_lane(gpui_kit::base::input::OverviewRulerLane::Full)
+                        .with_color(color),
+                );
+                search_start = match_start + query_lower.len().max(1);
+            }
+        }
+        self.search_ruler_decorations.set(decorations, cx);
+    }
+
+    /// Toggles a task checkbox in the document when clicked in the preview.
+    pub(crate) fn toggle_task_checkbox(
+        &mut self,
+        event: &gpui_kit::base::TaskToggleEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.toggle_task_marker(
+            TaskState::from(event.checked()),
+            event.marker_range(),
+            window,
+            cx,
+        );
+    }
+
+    /// Replaces the task marker at `marker` with `[x]` or `[ ]`.
+    pub(crate) fn toggle_task_marker(
+        &mut self,
+        target_state: TaskState,
+        marker: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.preview_task.is_some() {
+            return;
+        }
+        let text = self.editor.read(cx).value();
+        let actual_marker = if marker.end <= text.len()
+            && text.is_char_boundary(marker.start)
+            && text.is_char_boundary(marker.end)
+            && matches!(&text[marker.clone()], "[ ]" | "[x]" | "[X]")
+        {
+            Some(marker)
+        } else {
+            // Locate nearest valid task marker if offsets slightly shifted
+            let mut best = None;
+            let mut best_dist = usize::MAX;
+            for (idx, _) in text
+                .match_indices("[ ]")
+                .chain(text.match_indices("[x]"))
+                .chain(text.match_indices("[X]"))
+            {
+                let dist = idx.abs_diff(marker.start);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some(idx..idx + 3);
+                }
+            }
+            best
+        };
+
+        let Some(marker) = actual_marker else {
+            return;
+        };
+        let current_selection = self.editor.read(cx).selected_range();
+        let replacement = target_state.marker();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_selected_range(marker, cx);
+            editor.replace(replacement, window, cx);
+            editor.set_selected_range(current_selection, cx);
+        });
+        self.dirty = true;
+        self.set_scroll_driver(ScrollDriver::Preview);
+        self.schedule_preview(DebouncePolicy::Immediate, cx);
     }
 
     /// An untitled document nobody has typed into, which opening a file may
@@ -728,6 +889,7 @@ impl DocumentView {
         self.saved_hash = content_hash(&text);
         self.disk = path.as_deref().and_then(DiskStamp::of);
         self.path = path;
+        self.sync_base_dir();
         self.line_ending = line_ending;
         self.dirty = false;
         self.clear_search(cx);
@@ -753,6 +915,7 @@ impl DocumentView {
             .as_deref()
             .and_then(|path| crate::document::load(path).ok());
         self.path = recovery.path;
+        self.sync_base_dir();
         self.disk = self.path.as_deref().and_then(DiskStamp::of);
         self.line_ending = if recovery.crlf {
             LineEnding::CrLf
@@ -830,8 +993,9 @@ impl DocumentView {
                     if this.revision != revision {
                         return;
                     }
+                    let resolved = preview_ext::resolve_reference_links(&source);
                     this.preview
-                        .update(cx, |preview, cx| preview.set_text(&source, cx));
+                        .update(cx, |preview, cx| preview.set_text(&resolved, cx));
                     if this.search_open && !this.search.query().is_empty() {
                         this.on_search_query_changed(cx);
                     }
@@ -842,8 +1006,9 @@ impl DocumentView {
             }));
         } else {
             self.preview_task = None;
+            let resolved = preview_ext::resolve_reference_links(&source);
             self.preview
-                .update(cx, |preview, cx| preview.set_text(&source, cx));
+                .update(cx, |preview, cx| preview.set_text(&resolved, cx));
             if self.search_open && !self.search.query().is_empty() {
                 self.on_search_query_changed(cx);
             }
@@ -926,6 +1091,7 @@ impl DocumentView {
         self.saved_hash = content_hash(&text);
         self.dirty = self.source.as_ref() != text.as_ref();
         self.path = Some(path.to_path_buf());
+        self.sync_base_dir();
         self.disk = DiskStamp::of(path);
         if !self.dirty {
             self.discard_recovery();
@@ -1490,6 +1656,59 @@ impl DocumentView {
             })
     }
 
+    fn render_preview_search_ruler(&self, cx: &App) -> impl IntoElement {
+        let total_matches = self.search.total_matches();
+        if total_matches == 0 || self.preview_height <= px(20.) {
+            return div().id("preview-overview-ruler-empty").into_any_element();
+        }
+
+        let rendered_text = self.preview.read(cx).rendered_text();
+        let total_len = rendered_text.len().max(1);
+        let current_ix = self.search.current_match_index();
+        let color = cx.theme().warning;
+        let current_color = cx.theme().primary;
+
+        let track_height = self.preview_height;
+        let track_width = gpui_kit::base::Scrollbar::width();
+        let available = (track_height - px(6.)).max(px(0.));
+
+        let mut marks = Vec::new();
+        for (i, range) in self.search.matches().iter().enumerate() {
+            let is_current = i == current_ix;
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::as_conversions,
+                reason = "Character offset into preview height fraction"
+            )]
+            let fraction = (range.start as f32 / total_len as f32).clamp(0.0, 1.0);
+            let top = available * fraction;
+            let mark_color = if is_current { current_color } else { color };
+            let mark_height = if is_current { px(6.) } else { px(4.) };
+
+            marks.push(
+                div()
+                    .absolute()
+                    .top(top)
+                    .right_0()
+                    .w(track_width)
+                    .h(mark_height)
+                    .bg(mark_color)
+                    .opacity(if is_current { 1.0 } else { 0.85 })
+                    .rounded(px(1.)),
+            );
+        }
+
+        div()
+            .id("preview-overview-ruler")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(track_width)
+            .children(marks)
+            .into_any_element()
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Declarative GPUI layout for preview pane"
@@ -1546,7 +1765,9 @@ impl DocumentView {
                 list.scroll_by(-delta.y);
                 this.preview.update(cx, |_, cx| cx.notify());
             }))
-            .child(
+            .child({
+                let base_dir_for_links = base_dir.clone();
+                let document_toggle = document.clone();
                 gpui_kit::image_cache(self.image_cache.clone())
                     .size_full()
                     .child(
@@ -1563,9 +1784,22 @@ impl DocumentView {
                             .code_block_actions(|code_block, _, _| {
                                 Clipboard::new("copy-code").value(code_block.code())
                             })
-                            .on_link_click(crate::links::on_click),
-                    ),
-            )
+                            .on_link_click(crate::links::on_click)
+                            .link_tooltip(move |url, window, cx| {
+                                crate::links::build_tooltip(
+                                    url,
+                                    base_dir_for_links.as_deref(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .on_task_toggle(move |event, window, cx| {
+                                _ = document_toggle.update(cx, |this, cx| {
+                                    this.toggle_task_checkbox(event, window, cx);
+                                });
+                            }),
+                    )
+            })
             .when(is_empty, |this| {
                 this.child(
                     v_flex()
@@ -1607,13 +1841,21 @@ impl DocumentView {
                     },
                 ))
             })
+            .when(
+                self.search_open && self.search.total_matches() > 0,
+                |this| this.child(self.render_preview_search_ruler(cx)),
+            )
             .on_prepaint(move |bounds, _, cx| {
                 let layout = AppSettings::get(cx).layout;
                 cx.defer(move |cx| {
                     _ = document.update(cx, |this, cx| {
-                        let changed = (this.preview_width - bounds.size.width).abs() >= px(1.);
+                        let width_changed =
+                            (this.preview_width - bounds.size.width).abs() >= px(1.);
+                        let height_changed =
+                            (this.preview_height - bounds.size.height).abs() >= px(1.);
                         this.preview_width = bounds.size.width;
-                        if changed && layout == Layout::Split {
+                        this.preview_height = bounds.size.height;
+                        if (width_changed && layout == Layout::Split) || height_changed {
                             cx.notify();
                         }
                         this.sync_editor(cx);
@@ -2116,6 +2358,76 @@ mod tests {
                 None,
                 "Table style must not clamp height"
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn task_checkbox_toggle_updates_editor_and_marks_dirty(cx: &mut gpui_kit::TestAppContext) {
+        let (doc, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            cx.set_global(AppSettings(crate::settings::Settings::default()));
+            let initial = "- [ ] First task\n- [x] Second task\n";
+            let mut view = DocumentView::new(initial.to_string(), None, LineEnding::Lf, window, cx);
+            view.dirty = false;
+
+            // Toggle first task to checked: marker range is 2..5 ("- [ ]")
+            view.toggle_task_marker(TaskState::Checked, 2..5, window, cx);
+            assert!(view.is_dirty());
+            assert_eq!(
+                view.editor.read(cx).value().as_str(),
+                "- [x] First task\n- [x] Second task\n"
+            );
+
+            // Toggle second task to unchecked: marker range is 19..22 ("- [x]")
+            view.toggle_task_marker(TaskState::Unchecked, 19..22, window, cx);
+            assert_eq!(
+                view.editor.read(cx).value().as_str(),
+                "- [x] First task\n- [ ] Second task\n"
+            );
+
+            view
+        });
+        cx.run_until_parked();
+        doc.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.editor.read(cx).value().as_str(),
+                "- [x] First task\n- [ ] Second task\n"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn preview_search_ruler_and_link_expansion_task_toggle(cx: &mut gpui_kit::TestAppContext) {
+        let (doc, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            cx.set_global(AppSettings(crate::settings::Settings::default()));
+            let initial =
+                "[ref]: https://example.com \"Example\"\n\n- [ ] Task with [reference][ref]\n";
+            let mut view = DocumentView::new(initial.to_string(), None, LineEnding::Lf, window, cx);
+            view.preview_height = px(500.);
+
+            // Verify preview text got resolved
+            let rendered = view.preview.read(cx).rendered_text();
+            assert!(rendered.as_str().contains("reference"));
+
+            // Open search and test search ruler elements
+            view.search_open = true;
+            view.search.update_query("task", rendered.as_str());
+            assert_eq!(view.search.total_matches(), 1);
+
+            let ruler = view.render_preview_search_ruler(cx);
+            let _ = ruler.into_any_element();
+
+            // Toggle task checkbox when reference links were expanded
+            // The marker range 39..42 is passed (near the checkbox)
+            view.toggle_task_marker(TaskState::Checked, 39..42, window, cx);
+            assert!(view.editor.read(cx).value().contains("- [x] Task"));
+
+            view
+        });
+        cx.run_until_parked();
+        doc.read_with(cx, |view, cx| {
+            assert!(view.editor.read(cx).value().contains("- [x] Task"));
         });
     }
 }

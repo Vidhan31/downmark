@@ -12,11 +12,10 @@ use std::{
 
 use gpui_kit::{
     Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, Global, InteractiveElement as _, IntoElement, Menu, MouseButton,
-    MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
-    PathPromptOptions, Render, ScrollEvent, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowBounds,
-    WindowControlArea,
+    Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu, MouseButton, MouseDownEvent,
+    MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions, Render,
+    ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, WindowBounds, WindowControlArea,
     assets::IconName,
     base::{GlobalState, TextSelection},
     component::{
@@ -59,12 +58,6 @@ use crate::{
     settings_dialog,
     themes::{self, AppSettings},
 };
-
-/// URL of the link currently hovered or focused in the preview, for status bar display.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct HoveredLink(pub(crate) Option<SharedString>);
-
-impl Global for HoveredLink {}
 
 /// Shown when Downmark starts for the first time.
 const WELCOME: &str = include_str!("welcome.md");
@@ -2130,10 +2123,6 @@ impl Workspace {
             )
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "status bar with catalog/document stats, hover target, line/column info"
-    )]
     fn render_status_bar(&self, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let (stats, editor_position, editor_selection, line_ending) = match self.active_tab() {
             WorkspaceTab::NewTab(_) => {
@@ -2176,45 +2165,26 @@ impl Workspace {
         let settings = AppSettings::get(cx);
         let muted = cx.theme().muted_foreground;
         let item = |text: String| div().text_color(muted).child(text);
-        let hovered_link = cx.try_global::<HoveredLink>().and_then(|h| h.0.clone());
 
-        let left_section = if let Some(target) = hovered_link {
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Icon::new(IconName::Link)
-                        .xsmall()
-                        .text_color(cx.theme().primary),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .truncate()
-                        .child(target),
-                )
-        } else {
-            h_flex()
-                .gap_4()
-                .child(item(format!(
-                    "{} {}",
-                    group_thousands(stats.words),
-                    if stats.words == 1 { "word" } else { "words" }
-                )))
-                .child(item(format!(
-                    "{} {}",
-                    group_thousands(stats.characters),
-                    if stats.characters == 1 {
-                        "character"
-                    } else {
-                        "characters"
-                    }
-                )))
-                .when(stats.words > 0, |this| {
-                    this.child(item(format!("{} min read", stats.reading_minutes())))
-                })
-        };
+        let left_section = h_flex()
+            .gap_4()
+            .child(item(format!(
+                "{} {}",
+                group_thousands(stats.words),
+                if stats.words == 1 { "word" } else { "words" }
+            )))
+            .child(item(format!(
+                "{} {}",
+                group_thousands(stats.characters),
+                if stats.characters == 1 {
+                    "character"
+                } else {
+                    "characters"
+                }
+            )))
+            .when(stats.words > 0, |this| {
+                this.child(item(format!("{} min read", stats.reading_minutes())))
+            });
 
         div()
             .id("workspace-status-bar")

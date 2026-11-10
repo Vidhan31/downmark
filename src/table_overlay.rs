@@ -65,6 +65,7 @@ pub(crate) fn open(
             .content(move |content, _window, cx| {
                 let markdown_for_view = markdown_view.clone();
                 let base_dir_for_img = base_dir.clone();
+                let base_dir_for_link = base_dir.clone();
                 let on_link_for_click = Arc::clone(&on_link);
                 let scroll_handle_for_keys = scroll_handle.clone();
                 let scroll_handle_for_wheel = scroll_handle.clone();
@@ -74,6 +75,8 @@ pub(crate) fn open(
                 content.h(height).size_full().p_0().child(
                     v_flex()
                         .id("expanded-table-container")
+                        .role(gpui_kit::Role::Dialog)
+                        .aria_label("Expanded table view")
                         .track_focus(&container_focus)
                         .size_full()
                         .overflow_hidden()
@@ -216,6 +219,14 @@ pub(crate) fn open(
                                                         images::resolve(
                                                             url,
                                                             base_dir_for_img.as_deref(),
+                                                        )
+                                                    })
+                                                    .link_tooltip(move |url, window, cx| {
+                                                        crate::links::build_tooltip(
+                                                            url,
+                                                            base_dir_for_link.as_deref(),
+                                                            window,
+                                                            cx,
                                                         )
                                                     })
                                                     .on_link_click(move |url, event, window, cx| {

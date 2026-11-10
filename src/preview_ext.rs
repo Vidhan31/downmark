@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -22,7 +23,6 @@ use gpui_kit::{
             InlineElement, InlineRenderContext, MarkdownExtensions, MarkdownNode,
             MarkdownParseContext, MarkdownPlugin, markdown_ast::Node,
         },
-        tooltip::Tooltip,
         v_flex,
     },
     div, img,
@@ -38,7 +38,10 @@ use crate::{
 };
 
 /// The parser configuration and plugins the preview renders with.
-pub(crate) fn markdown_extensions(preview: &gpui_kit::Entity<TextViewState>) -> MarkdownExtensions {
+pub(crate) fn markdown_extensions(
+    preview: &gpui_kit::Entity<TextViewState>,
+    base_dir: Arc<Mutex<Option<PathBuf>>>,
+) -> MarkdownExtensions {
     let cache = MathCache::new(preview);
     let diagrams = DiagramCache::new(preview);
     let with_math = |extensions: MarkdownExtensions| {
@@ -52,13 +55,9 @@ pub(crate) fn markdown_extensions(preview: &gpui_kit::Entity<TextViewState>) -> 
             .plugin(MermaidPlugin {
                 cache: diagrams.clone(),
             })
-            .plugin(LinkTooltipPlugin)
-    };
-    // Alert bodies are rendered by their own nested view, which needs math too.
-    let alert = AlertPlugin {
-        body_extensions: with_math(MarkdownExtensions::default()),
     };
     let table = TableBlockPlugin {
+        base_dir,
         body_extensions: with_math(
             MarkdownExtensions::default()
                 .frontmatter()
@@ -69,7 +68,11 @@ pub(crate) fn markdown_extensions(preview: &gpui_kit::Entity<TextViewState>) -> 
         MarkdownExtensions::default()
             .frontmatter()
             .plugin(gpui_kit::component::text::FrontmatterPlugin::new())
-            .plugin(alert)
+            .block_surface("note", alert_surface(AlertKind::Note))
+            .block_surface("tip", alert_surface(AlertKind::Tip))
+            .block_surface("important", alert_surface(AlertKind::Important))
+            .block_surface("warning", alert_surface(AlertKind::Warning))
+            .block_surface("caution", alert_surface(AlertKind::Caution))
             .plugin(table),
     )
 }
@@ -91,12 +94,16 @@ pub(crate) fn table_overlay_extensions(
             .plugin(MermaidPlugin {
                 cache: diagrams.clone(),
             })
-            .plugin(LinkTooltipPlugin)
     };
     with_math(
         MarkdownExtensions::default()
             .frontmatter()
-            .plugin(gpui_kit::component::text::FrontmatterPlugin::new()),
+            .plugin(gpui_kit::component::text::FrontmatterPlugin::new())
+            .block_surface("note", alert_surface(AlertKind::Note))
+            .block_surface("tip", alert_surface(AlertKind::Tip))
+            .block_surface("important", alert_surface(AlertKind::Important))
+            .block_surface("warning", alert_surface(AlertKind::Warning))
+            .block_surface("caution", alert_surface(AlertKind::Caution)),
     )
 }
 
@@ -111,18 +118,6 @@ pub(crate) enum AlertKind {
 }
 
 impl AlertKind {
-    fn from_marker(marker: &str) -> Option<Self> {
-        let name = marker.strip_prefix("[!")?.strip_suffix(']')?;
-        Some(match name.to_ascii_uppercase().as_str() {
-            "NOTE" => Self::Note,
-            "TIP" => Self::Tip,
-            "IMPORTANT" => Self::Important,
-            "WARNING" => Self::Warning,
-            "CAUTION" => Self::Caution,
-            _ => return None,
-        })
-    }
-
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Note => "Note",
@@ -155,70 +150,13 @@ impl AlertKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Alert {
+fn alert_surface(
     kind: AlertKind,
-    /// The alert's Markdown content, without the quote markers.
-    body: SharedString,
-}
-
-/// Split a blockquote's source into an alert, if its first line is an alert
-/// marker and nothing else, as GitHub requires.
-pub(crate) fn parse_alert(blockquote_source: &str) -> Option<(AlertKind, String)> {
-    let mut lines = blockquote_source.lines().map(|line| {
-        let line = line.trim_start();
-        match line.strip_prefix('>') {
-            Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
-            // A lazy continuation line.
-            None => line,
-        }
-    });
-    let kind = AlertKind::from_marker(lines.next()?.trim())?;
-    let body = lines.collect::<Vec<_>>().join("\n");
-    Some((kind, body.trim().to_string()))
-}
-
-struct AlertPlugin {
-    body_extensions: MarkdownExtensions,
-}
-
-impl MarkdownPlugin for AlertPlugin {
-    fn is_block(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "github-alert"
-    }
-
-    fn parse(&self, node: &Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
-        let Node::Blockquote(_) = node else {
-            return None;
-        };
-        let source = cx.node_source(node)?;
-        let (kind, body) = parse_alert(source)?;
-        Some(
-            MarkdownNode::new(
-                "github-alert",
-                Alert {
-                    kind,
-                    body: body.clone().into(),
-                },
-            )
-            .text(format!("{}\n{body}", kind.title()))
-            .markdown(source),
-        )
-    }
-
-    fn render(&self, node: &MarkdownNode, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let alert = node.data::<Alert>().expect("alert node data");
-        let color = alert.kind.color(cx);
-        let id = SharedString::from(format!("alert-{}", content_hash(&alert.body)));
+) -> impl Fn(&mut Window, &mut App) -> gpui_kit::Div + Send + Sync + 'static {
+    move |_, cx| {
+        let color = kind.color(cx);
 
         v_flex()
-            .id(id.clone())
-            .role(gpui_kit::Role::Note)
-            .aria_label(alert.kind.title())
             .w_full()
             .gap_1()
             .px_4()
@@ -229,21 +167,15 @@ impl MarkdownPlugin for AlertPlugin {
             .bg(color.opacity(0.06))
             .child(
                 h_flex()
+                    .id(SharedString::from(format!("alert-title-{}", kind.title())))
+                    .role(gpui_kit::Role::Note)
+                    .aria_label(kind.title())
                     .gap_2()
                     .text_color(color)
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(Icon::new(alert.kind.icon()).small())
-                    .child(alert.kind.title()),
+                    .child(Icon::new(kind.icon()).small())
+                    .child(kind.title()),
             )
-            .when(!alert.body.is_empty(), |this| {
-                this.child(
-                    TextView::markdown(id, alert.body.clone())
-                        .style(crate::themes::preview_style(cx))
-                        .markdown_extensions(self.body_extensions.clone())
-                        .on_link_click(crate::links::on_click)
-                        .w_full(),
-                )
-            })
     }
 }
 
@@ -306,6 +238,7 @@ struct TableBlockData {
 }
 
 struct TableBlockPlugin {
+    base_dir: Arc<Mutex<Option<PathBuf>>>,
     body_extensions: MarkdownExtensions,
 }
 
@@ -377,6 +310,10 @@ impl MarkdownPlugin for TableBlockPlugin {
 
         let table_view_style =
             crate::themes::preview_style(cx).with_table(gpui_kit::StyleRefinement::default());
+
+        let base_dir = self.base_dir.lock().ok().and_then(|g| g.clone());
+        let base_dir_for_img = base_dir.clone();
+        let base_dir_for_links = base_dir;
 
         v_flex()
             .id(id.clone())
@@ -497,6 +434,17 @@ impl MarkdownPlugin for TableBlockPlugin {
                                         .markdown_extensions(self.body_extensions.clone())
                                         .selectable(true)
                                         .on_link_click(crate::links::on_click)
+                                        .image_source(move |url| {
+                                            crate::images::resolve(url, base_dir_for_img.as_deref())
+                                        })
+                                        .link_tooltip(move |url, window, cx| {
+                                            crate::links::build_tooltip(
+                                                url,
+                                                base_dir_for_links.as_deref(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
                                         .w_full(),
                                     ),
                             ),
@@ -1108,110 +1056,113 @@ impl MarkdownPlugin for MermaidPlugin {
     }
 }
 
-/// Extracts plain text from inline markdown AST nodes.
-fn plain_link_text(children: &[Node]) -> String {
-    let mut out = String::new();
-    for child in children {
-        match child {
-            Node::Text(t) => out.push_str(&t.value),
-            Node::InlineCode(c) => out.push_str(&c.value),
-            Node::InlineMath(m) => out.push_str(&m.value),
-            other => {
-                if let Some(sub) = other.children() {
-                    out.push_str(&plain_link_text(sub));
+fn collect_reference_nodes(
+    node: &markdown::mdast::Node,
+    source: &str,
+    defs: &mut std::collections::HashMap<String, (String, Option<String>)>,
+    refs: &mut Vec<(std::ops::Range<usize>, String, String)>,
+) {
+    use markdown::mdast::Node;
+
+    match node {
+        Node::Definition(def) => {
+            defs.entry(def.identifier.clone())
+                .or_insert_with(|| (def.url.clone(), def.title.clone()));
+        }
+        Node::LinkReference(link) => {
+            if let Some(pos) = link.position.as_ref() {
+                let range = pos.start.offset..pos.end.offset;
+                let label = if let Some(last) = link.children.last().and_then(|c| c.position()) {
+                    let end = (last.end.offset + 1).min(range.end);
+                    source.get(range.start..end).unwrap_or("")
+                } else if let Some(first_close) = source[range.clone()].find(']') {
+                    &source[range.start..=range.start + first_close]
+                } else {
+                    ""
+                };
+                if !label.is_empty() {
+                    refs.push((range, label.to_string(), link.identifier.clone()));
                 }
             }
         }
-    }
-    out
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LinkData {
-    url: String,
-    title: Option<String>,
-    text: String,
-}
-
-/// Renders markdown hyperlinks with interactive hover tooltips, status bar target
-/// notifications, and accessible screen reader information.
-struct LinkTooltipPlugin;
-
-impl MarkdownPlugin for LinkTooltipPlugin {
-    fn name(&self) -> &'static str {
-        "link-tooltip"
-    }
-
-    fn parse(&self, node: &Node, cx: &MarkdownParseContext<'_>) -> Option<MarkdownNode> {
-        let Node::Link(link) = node else {
-            return None;
-        };
-        let text = plain_link_text(&link.children);
-        // Only claim links that fit cleanly inline without wrapping across multiple paragraphs
-        if text.is_empty() || text.len() > 80 || text.contains('\n') {
-            return None;
-        }
-        let source = cx.node_source(node).unwrap_or(&link.url);
-        Some(
-            MarkdownNode::new(
-                "link-tooltip",
-                LinkData {
-                    url: link.url.clone(),
-                    title: link.title.clone(),
-                    text: text.clone(),
-                },
-            )
-            .text(text.clone())
-            .accessibility_label(format!("Link: {text}, destination: {}", link.url))
-            .markdown(source),
-        )
-    }
-
-    fn render_inline(
-        &self,
-        node: &MarkdownNode,
-        _: &InlineRenderContext,
-        _: &mut Window,
-        cx: &mut App,
-    ) -> Option<InlineElement> {
-        let data = node.data::<LinkData>()?;
-        let url = SharedString::from(data.url.clone());
-        let url_click = url.clone();
-        let url_aux = url.clone();
-        let url_hover = url.clone();
-        let text = data.text.clone();
-        let target = crate::links::classify(&data.url, None);
-        let tooltip_text =
-            crate::links::format_target_tooltip(target.as_ref(), &data.url, data.title.as_deref());
-        let hash = content_hash(&format!("{}:{}", data.url, text));
-        let id = SharedString::from(format!("a11y-link-{hash}"));
-
-        let el = div()
-            .id(id)
-            .cursor_pointer()
-            .text_color(cx.theme().primary)
-            .hover(gpui_kit::Styled::underline)
-            .role(gpui_kit::Role::Link)
-            .aria_label(format!("Link: {text}, leads to {url}"))
-            .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
-            .on_hover(move |hovered, _, cx| {
-                if *hovered {
-                    cx.set_global(crate::workspace::HoveredLink(Some(url_hover.clone())));
+        Node::ImageReference(img) => {
+            if let Some(pos) = img.position.as_ref() {
+                let range = pos.start.offset..pos.end.offset;
+                let label = if let Some(first_close) = source[range.clone()].find(']') {
+                    &source[range.start..=range.start + first_close]
                 } else {
-                    cx.set_global(crate::workspace::HoveredLink(None));
+                    ""
+                };
+                if !label.is_empty() {
+                    refs.push((range, label.to_string(), img.identifier.clone()));
                 }
-                cx.refresh_windows();
-            })
-            .on_click(move |event, window, cx| {
-                crate::links::on_click(&url_click, event, window, cx);
-            })
-            .on_aux_click(move |event, window, cx| {
-                crate::links::on_click(&url_aux, event, window, cx);
-            })
-            .child(text);
-
-        Some(InlineElement::new(el))
+            }
+        }
+        _ => {}
     }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_reference_nodes(child, source, defs, refs);
+        }
+    }
+}
+
+/// Resolves Markdown reference-style links (`[text][ref]`, `[ref][]`, `[ref]`)
+/// and image references (`![alt][ref]`) into standard inline links (`[text](url "title")`).
+///
+/// This avoids upstream parser limitations where reference definition metadata is
+/// detached from link targets in preview mode.
+pub(crate) fn resolve_reference_links(source: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    use markdown::mdast::Node;
+
+    if !source.contains("]:") {
+        return Cow::Borrowed(source);
+    }
+
+    let Ok(Node::Root(root)) =
+        markdown::to_mdast(source, &crate::analysis::preview_parse_options())
+    else {
+        return Cow::Borrowed(source);
+    };
+
+    let mut defs: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut refs: Vec<(std::ops::Range<usize>, String, String)> = Vec::new();
+
+    collect_reference_nodes(&Node::Root(root), source, &mut defs, &mut refs);
+
+    if defs.is_empty() || refs.is_empty() {
+        return Cow::Borrowed(source);
+    }
+
+    refs.sort_by_key(|(range, _, _)| std::cmp::Reverse(range.start));
+
+    let mut out = source.to_string();
+    for (range, label, identifier) in refs {
+        let normalized = identifier.trim().to_lowercase();
+        if let Some((url, title)) = defs
+            .iter()
+            .find(|(k, _)| k.trim().to_lowercase() == normalized)
+            .map(|(_, v)| v)
+        {
+            let replacement = if let Some(title) = title {
+                format!("{label}({url} \"{title}\")")
+            } else {
+                format!("{label}({url})")
+            };
+            if range.end <= out.len()
+                && out.is_char_boundary(range.start)
+                && out.is_char_boundary(range.end)
+            {
+                out.replace_range(range, &replacement);
+            }
+        }
+    }
+
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -1219,19 +1170,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_github_alerts() {
-        let (kind, body) = parse_alert("> [!WARNING]\n> Back up first.\n>\n> - Really.").unwrap();
-        assert_eq!(kind, AlertKind::Warning);
-        assert_eq!(body, "Back up first.\n\n- Really.");
-
-        assert_eq!(
-            parse_alert("> [!tip]").unwrap(),
-            (AlertKind::Tip, String::new())
+    fn test_reference_link_parse() {
+        let md = "- **Reference-style links:**\n  You can read more about [CommonMark][commonmark-ref] and [GFM Specification][gfm-ref].\n  Collapsed: [commonmark-ref][].\n  Shortcut: [commonmark-ref].\n  Image: ![Sample][commonmark-ref].\n\n[commonmark-ref]: https://spec.commonmark.org \"CommonMark Specification\"\n[gfm-ref]: https://github.github.com/gfm/ \"GitHub Flavored Markdown Spec\"";
+        let resolved = resolve_reference_links(md);
+        assert!(
+            resolved
+                .contains("[CommonMark](https://spec.commonmark.org \"CommonMark Specification\")")
         );
-        // The marker must stand alone on the first line.
-        assert!(parse_alert("> [!NOTE] inline text").is_none());
-        assert!(parse_alert("> Just a quote").is_none());
-        assert!(parse_alert("> [!UNKNOWN]\n> text").is_none());
+        assert!(resolved.contains(
+            "[GFM Specification](https://github.github.com/gfm/ \"GitHub Flavored Markdown Spec\")"
+        ));
+        assert!(resolved.contains(
+            "[commonmark-ref](https://spec.commonmark.org \"CommonMark Specification\")"
+        ));
+        assert!(
+            resolved
+                .contains("![Sample](https://spec.commonmark.org \"CommonMark Specification\")")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn parses_and_renders_github_alerts(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let md = "> [!WARNING]\n> Back up first.\n>\n> - Really.";
+        let (window_handle, _) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_, cx| {
+                let entity = cx.new(|cx| TextViewState::markdown(md, cx));
+                let extensions = markdown_extensions(&entity, Arc::new(Mutex::new(None)));
+                cx.new(|_| {
+                    struct AlertTestRoot {
+                        text: SharedString,
+                        extensions: MarkdownExtensions,
+                    }
+                    impl gpui_kit::Render for AlertTestRoot {
+                        fn render(
+                            &mut self,
+                            _: &mut Window,
+                            _: &mut gpui_kit::Context<'_, Self>,
+                        ) -> impl IntoElement {
+                            TextView::markdown("alert-test", self.text.clone())
+                                .markdown_extensions(self.extensions.clone())
+                        }
+                    }
+                    AlertTestRoot {
+                        text: md.into(),
+                        extensions,
+                    }
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(window_handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1304,7 +1297,7 @@ mod tests {
         let (window_handle, _) = cx.update(|cx| {
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |_, cx| {
                 let entity = cx.new(|cx| TextViewState::markdown(md, cx));
-                let extensions = markdown_extensions(&entity);
+                let extensions = markdown_extensions(&entity, Arc::new(Mutex::new(None)));
                 cx.new(|_| {
                     struct TableTestRoot {
                         text: SharedString,

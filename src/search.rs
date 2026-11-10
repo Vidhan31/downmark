@@ -31,7 +31,6 @@ impl DocumentSearch {
         &self.query
     }
 
-    #[expect(dead_code, reason = "getter for document search matches")]
     pub(crate) fn matches(&self) -> &[Range<usize>] {
         &self.matches
     }
@@ -40,7 +39,6 @@ impl DocumentSearch {
         self.matches.len()
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "used in tests"))]
     pub(crate) fn current_match_index(&self) -> usize {
         self.current_match_index
     }
