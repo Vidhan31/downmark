@@ -3031,6 +3031,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/fontdb/fontdb-0.24.0.crate",
+        "sha256": "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f",
+        "dest": "cargo/vendor/fontdb-0.24.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f\", \"files\": {}}",
+        "dest": "cargo/vendor/fontdb-0.24.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/foreign-types/foreign-types-0.5.0.crate",
         "sha256": "d737d9aa519fb7b749cbc3b962edcf310a8dd1f4b67c91c4f83975dbdd17d965",
         "dest": "cargo/vendor/foreign-types-0.5.0"
