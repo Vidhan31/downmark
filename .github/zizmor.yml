@@ -2,9 +2,9 @@
 # See: https://docs.zizmor.sh/configuration/
 
 rules:
-  # Release workflows legitimately use build caches
+  # Release and packaging workflows reuse cargo build caches across runs.
   cache-poisoning:
     disable: true
-  # Existing packaging workflows use ${{ vars.* }} in PowerShell blocks
+  # MSIX packaging scripts interpolate GitHub context values into PowerShell blocks.
   template-injection:
     disable: true

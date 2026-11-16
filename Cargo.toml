@@ -8,6 +8,8 @@ repository = "https://github.com/Vidhan31/downmark"
 publish = false
 
 [package.metadata.cargo-machete]
+# resvg::usvg exposes fontdb methods on options, but downmark does not import
+# fontdb directly. Ignored so cargo-machete does not treat it as unused.
 ignored = ["fontdb"]
 
 [lints.rust]

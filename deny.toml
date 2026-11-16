@@ -2,6 +2,8 @@
 # See: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
+# Transitive GUI crates (rkyv, bincode, quick-xml) carry unmaintained or advisory
+# notices from upstream GPUI/Typst dependencies. CI runs bans, licenses, and sources.
 ignore = []
 
 [licenses]

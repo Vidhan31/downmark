@@ -111,6 +111,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      # Advisories check omitted: upstream GPUI and Typst pull in crates with
+      # open advisories (such as rkyv 0.7) that downmark cannot patch directly.
       - name: Check dependency licenses, bans, and sources (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@55a198ad5e9a07759beeae4e572e50e5af91813f # v2.0.8
         with:
