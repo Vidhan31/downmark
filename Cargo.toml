@@ -124,7 +124,7 @@ url = "2"
 # The SVG renderer GPUI draws with: the diagram viewer draws the part of a
 # zoomed diagram in view with it, so it stays sharp.
 resvg = { version = "0.46", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
-fontdb = "0.23"
+fontdb = "0.24"
 # Math rendering, all pure Rust: LaTeX is translated to Typst math, laid out
 # by the Typst compiler with its bundled math fonts, and drawn as SVG.
 # LaTeX math → Typst math (Apache-2.0), without its command-line tool.
