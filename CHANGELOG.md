@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-16
+
 ### Added
 - Interactive task list checkboxes. Clicking task list checkboxes (`- [ ]`, `- [x]`) in preview updates the source text in all modes, including Preview and Glance modes, and records undo history.
 - Search match markers on scrollbars. When search is active, colored tick marks appear on the scrollbar track in Preview, Editor, and Split modes to indicate match locations, with a distinct highlight for the active match.
@@ -71,7 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of Downmark, a fast, native Markdown editor and viewer built with GPUI.
 
-[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/Vidhan31/downmark/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/Vidhan31/downmark/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Vidhan31/downmark/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/Vidhan31/downmark/compare/v1.0.0...v1.1.0
