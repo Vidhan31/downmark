@@ -5,6 +5,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=packaging/windows/downmark.ico");
 
+    // Add local .cargo/lib to link search path if present (portable across development checkouts).
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let local_lib = std::path::Path::new(&manifest_dir).join(".cargo/lib");
+    if local_lib.exists() {
+        println!("cargo:rustc-link-search=native={}", local_lib.display());
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

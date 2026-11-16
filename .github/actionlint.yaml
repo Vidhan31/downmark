@@ -1,0 +1,9 @@
+# actionlint configuration file
+# See: https://github.com/rhysd/actionlint/blob/main/docs/config.md
+
+self-hosted-runner:
+  labels: []
+
+paths:
+  .github/workflows/**/*.yml:
+    ignore: []

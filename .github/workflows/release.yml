@@ -430,6 +430,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -458,12 +460,28 @@ jobs:
           merge-multiple: true
       - name: Fetch the macOS disk image
         run: gh release download "$TAG" --pattern '*.dmg' --dir dist
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          npx --yes @cyclonedx/cdxgen@12.8.4 -r -o dist/bom.json --spec-version 1.6 .
+          test -f dist/bom.json
       - name: Checksums
         working-directory: dist
         run: |
           sha256sum -- * > ../SHA256SUMS.txt
           mv ../SHA256SUMS.txt ./SHA256SUMS.txt
           cat SHA256SUMS.txt
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*
+            dist/SHA256SUMS.txt
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            dist/*
+          sbom-path: 'dist/bom.json'
       - name: Attach the packages
         run: gh release upload "$TAG" dist/* --clobber
       - name: Publish the release
