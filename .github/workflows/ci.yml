@@ -112,11 +112,11 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Check dependency advisories, licenses, and bans (cargo-deny)
-        uses: EmbarkStudios/cargo-deny-action@e0f440037eb933400e80722e3424097713ead317 # v2.0.8
+        uses: EmbarkStudios/cargo-deny-action@55a198ad5e9a07759beeae4e572e50e5af91813f # v2.0.8
         with:
           command: check
       - name: Install cargo-machete
-        uses: taiki-e/install-action@b7f03fbdb71e626e2794eb84bfb8d5272a249c63 # v2
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-machete
       - name: Check for unused dependencies (cargo-machete)
