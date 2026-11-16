@@ -156,7 +156,7 @@ pub(crate) fn find_heading(outline: &[Heading], anchor: &str) -> Option<usize> {
         let base = slug(&heading.text);
         let count = seen.entry(base.clone()).or_default();
         let anchor = if *count == 0 {
-            base.clone()
+            base
         } else {
             format!("{base}-{count}")
         };

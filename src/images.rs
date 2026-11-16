@@ -48,8 +48,7 @@ pub(crate) fn store_image(
     {
         let alt = path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().to_string())
-            .unwrap_or_default();
+            .map_or_default(|stem| stem.to_string_lossy().to_string());
         return Ok((link_path(relative), alt));
     }
     let target_dir = dir.join(folder);

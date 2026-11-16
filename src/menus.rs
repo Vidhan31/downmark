@@ -93,8 +93,7 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
                 let folder = path
                     .parent()
                     .and_then(|dir| dir.file_name())
-                    .map(|dir| format!("  —  {}", dir.to_string_lossy()))
-                    .unwrap_or_default();
+                    .map_or_default(|dir| format!("  —  {}", dir.to_string_lossy()));
                 MenuItem::action(format!("{name}{folder}"), OpenRecent(ix))
             })
             .collect()
