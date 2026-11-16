@@ -7,6 +7,9 @@ license = "Apache-2.0"
 repository = "https://github.com/Vidhan31/downmark"
 publish = false
 
+[package.metadata.cargo-machete]
+ignored = ["fontdb"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"          # each unsafe op needs its own unsafe block
 missing_debug_implementations = "warn"   # every public type implements Debug
