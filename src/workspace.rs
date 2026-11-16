@@ -1669,6 +1669,7 @@ impl Workspace {
             dialog.close_button(false).p_0().child(
                 Command::new(&headings)
                     .bordered(false)
+                    .highlight_matches(true)
                     .placeholder("Go to heading")
                     .max_h(rems(24.))
                     .items(items)

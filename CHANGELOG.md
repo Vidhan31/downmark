@@ -12,9 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Search match markers on scrollbars. When search is active, colored tick marks appear on the scrollbar track in Preview, Editor, and Split modes to indicate match locations, with a distinct highlight for the active match.
 - Native link tooltips. Hovering over a link displays its destination type and address (headings, documents, external URLs, emails) using native tooltips.
 - Reference link resolution. Reference-style links (`[text][ref]`) and image references resolve destination URLs and titles in preview and table overlay views.
+- Heading search match highlights. The heading picker palette highlights matching query text in results.
 
 ### Changed
-- Upgraded `gpui-kit` to 0.9.1 and aligned HTTP client dependencies.
+- Upgraded `gpui-kit` to 0.10.0 and aligned HTTP client dependencies.
 - Migrated GitHub alert callouts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`) to native block surfaces.
 
 ### Removed
@@ -22,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Empty tooltips when hovering reference-style links without inline URLs.
+- Adjacent image layout in preview. Markdown badge rows and adjacent images now render side by side on one line instead of stacking vertically.
+- HTML code blocks. The preview now renders raw `<pre>` blocks as monospace code blocks.
+- Editor caret movement and deletion for multi-codepoint characters. Arrow keys, Backspace, and Delete now operate on Unicode grapheme clusters instead of single code points, preventing broken emoji and accents.
+- Editor hit-testing with line numbers enabled. Clicking or querying text positions on lines after the first now resolves to the correct character offset.
+- Copy shortcut with an empty selection. Pressing Ctrl+C or Cmd+C in a focused editor with no text selected now copies the active text selection from the preview pane.
 
 ## [1.2.1] - 2026-11-05
 
