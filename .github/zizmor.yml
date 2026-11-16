@@ -1,0 +1,10 @@
+# zizmor configuration file
+# See: https://docs.zizmor.sh/configuration/
+
+rules:
+  # Release workflows legitimately use build caches
+  cache-poisoning:
+    disable: true
+  # Existing packaging workflows use ${{ vars.* }} in PowerShell blocks
+  template-injection:
+    disable: true

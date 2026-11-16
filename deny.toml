@@ -2,15 +2,9 @@
 # See: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-version = 2
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
-ignore = []
+unmaintained = "workspace"
 
 [licenses]
-version = 2
 confidence-threshold = 0.8
 allow = [
   "0BSD",
@@ -33,15 +27,7 @@ allow = [
   "Zlib",
 ]
 
-[[licenses.clarify]]
-name = "tree-sitter-graphql"
-expression = "MIT"
-license-files = [
-  { path = "LICENSE" },
-]
-
 [bans]
-version = 2
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
@@ -50,7 +36,6 @@ skip = []
 skip-tree = []
 
 [sources]
-version = 2
 unknown-registry = "deny"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
