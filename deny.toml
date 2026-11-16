@@ -2,7 +2,7 @@
 # See: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-unmaintained = "workspace"
+ignore = []
 
 [licenses]
 confidence-threshold = 0.8
