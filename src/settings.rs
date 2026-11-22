@@ -83,6 +83,18 @@ pub(crate) struct Settings {
     pub(crate) recent_files: Vec<PathBuf>,
     /// Folders tracked for discovering Markdown documents on the new tab page.
     pub(crate) tracked_folders: Vec<PathBuf>,
+    /// Project folders chosen by the user for the AI workflow hub.
+    #[serde(default)]
+    pub(crate) project_folders: Vec<PathBuf>,
+    /// Currently selected project filter in the UI (None means All Projects).
+    #[serde(default)]
+    pub(crate) selected_project_filter: Option<PathBuf>,
+    /// Active project folder currently selected for the AI workflow hub (kept for backwards compatibility).
+    #[serde(default)]
+    pub(crate) active_project: Option<PathBuf>,
+    /// Recently opened project folders for quick switching with minimal clicks.
+    #[serde(default)]
+    pub(crate) recent_projects: Vec<PathBuf>,
 
     /// Open documents in tabs instead of replacing the current one.
     pub(crate) tabs: bool,
@@ -115,6 +127,10 @@ impl Default for Settings {
             scroll_sync: false,
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
+            project_folders: Vec::new(),
+            selected_project_filter: None,
+            active_project: None,
+            recent_projects: Vec::new(),
             tabs: true,
             glance_on_external: false,
             restore_session: true,
@@ -139,6 +155,10 @@ impl Settings {
             && self.scroll_sync == other.scroll_sync
             && self.recent_files == other.recent_files
             && self.tracked_folders == other.tracked_folders
+            && self.project_folders == other.project_folders
+            && self.selected_project_filter == other.selected_project_filter
+            && self.active_project == other.active_project
+            && self.recent_projects == other.recent_projects
             && self.tabs == other.tabs
             && self.glance_on_external == other.glance_on_external
             && self.restore_session == other.restore_session
@@ -202,6 +222,18 @@ impl Settings {
         settings.glance_mode = false;
         settings.recent_files.truncate(RECENT_LIMIT);
         settings.tracked_folders.retain(|dir| dir.is_dir());
+        settings.project_folders.retain(|dir| dir.is_dir());
+        settings.recent_projects.retain(|dir| dir.is_dir());
+        if let Some(ref filter) = settings.selected_project_filter
+            && (!filter.is_dir() || !settings.project_folders.contains(filter))
+        {
+            settings.selected_project_filter = None;
+        }
+        if let Some(ref active) = settings.active_project
+            && !active.is_dir()
+        {
+            settings.active_project = None;
+        }
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
         settings.image_folder = if folder.is_empty() || folder.contains("..") {
             "assets".to_string()

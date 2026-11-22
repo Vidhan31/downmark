@@ -307,7 +307,12 @@ impl Workspace {
             let _ = this.update_in(cx, Self::check_disk);
         });
 
-        let catalog = cx.new(|_| FolderCatalog::new(settings.tracked_folders.clone()));
+        let catalog = cx.new(|_| {
+            FolderCatalog::new(
+                settings.project_folders.clone(),
+                settings.selected_project_filter.clone(),
+            )
+        });
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -560,11 +565,14 @@ impl Workspace {
                         NewTabEvent::PromptChooseFolder => {
                             this.prompt_choose_folder(window, cx);
                         }
+                        NewTabEvent::SelectProjectFilter(path) => {
+                            this.select_project_filter(path.clone(), cx);
+                        }
+                        NewTabEvent::RemoveProjectFolder(path) => {
+                            this.remove_project_folder(path, cx);
+                        }
                         NewTabEvent::PromptOpenFile => {
                             this.prompt_open(window, cx);
-                        }
-                        NewTabEvent::RemoveFolder(path) => {
-                            this.remove_tracked_folder(path, window, cx);
                         }
                         NewTabEvent::Rescan => {
                             this.rescan_catalog(window, cx);
@@ -767,12 +775,11 @@ impl Workspace {
                         )
                     });
                     let active = this.active_tab();
-                    let replace = active.is_blank(cx)
-                        || match placement {
-                            Placement::Default => !AppSettings::get(cx).tabs,
-                            Placement::NewTab => false,
-                            Placement::ReplaceActive => true,
-                        };
+                    let replace = match placement {
+                        Placement::NewTab => false,
+                        Placement::ReplaceActive => true,
+                        Placement::Default => active.is_blank(cx) || !AppSettings::get(cx).tabs,
+                    };
                     let tab = WorkspaceTab::Document(doc.clone());
                     if replace {
                         this.replace_active(tab, window, cx);
@@ -860,8 +867,8 @@ impl Workspace {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
-            multiple: false,
-            prompt: Some("Choose Folder to Scan for Markdown Files".into()),
+            multiple: true,
+            prompt: Some("Choose Project Folder".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -872,12 +879,19 @@ impl Workspace {
                     let path = path.canonicalize().unwrap_or(path);
                     if path.is_dir() {
                         AppSettings::update(cx, |settings| {
+                            if !settings.project_folders.contains(&path) {
+                                settings.project_folders.push(path.clone());
+                            }
+                            settings.selected_project_filter = Some(path.clone());
+                            if !settings.recent_projects.contains(&path) {
+                                settings.recent_projects.insert(0, path.clone());
+                            }
                             if !settings.tracked_folders.contains(&path) {
                                 settings.tracked_folders.push(path.clone());
                             }
                         });
                         this.catalog.update(cx, |catalog, cx| {
-                            catalog.add_folder(path);
+                            catalog.add_project_folder(path);
                             cx.notify();
                         });
                     }
@@ -887,6 +901,33 @@ impl Workspace {
         .detach();
     }
 
+    fn select_project_filter(&mut self, path: Option<PathBuf>, cx: &mut Context<'_, Self>) {
+        let path = path.map(|p| p.canonicalize().unwrap_or(p));
+        AppSettings::update(cx, |settings| {
+            settings.selected_project_filter.clone_from(&path);
+        });
+        self.catalog.update(cx, |catalog, cx| {
+            catalog.set_selected_project_filter(path);
+            cx.notify();
+        });
+    }
+
+    fn remove_project_folder(&mut self, path: &Path, cx: &mut Context<'_, Self>) {
+        let path = path.to_path_buf();
+        AppSettings::update(cx, |settings| {
+            settings.project_folders.retain(|p| p != &path);
+            settings.recent_projects.retain(|p| p != &path);
+            if settings.selected_project_filter.as_ref() == Some(&path) {
+                settings.selected_project_filter = None;
+            }
+        });
+        self.catalog.update(cx, |catalog, cx| {
+            catalog.remove_project_folder(&path);
+            cx.notify();
+        });
+    }
+
+    #[expect(dead_code, reason = "Maintained for programmatic folder removal")]
     fn remove_tracked_folder(
         &mut self,
         path: &Path,
@@ -896,6 +937,10 @@ impl Workspace {
         let path = path.to_path_buf();
         AppSettings::update(cx, |settings| {
             settings.tracked_folders.retain(|f| f != &path);
+            settings.recent_projects.retain(|p| p != &path);
+            if settings.active_project.as_ref() == Some(&path) {
+                settings.active_project = settings.recent_projects.first().cloned();
+            }
         });
         self.catalog.update(cx, |catalog, cx| {
             catalog.remove_folder(&path);
@@ -2880,7 +2925,7 @@ mod tests {
         });
 
         let (new_tab_view, _) = cx.add_window_view(|window, cx| {
-            let catalog = cx.new(|_| FolderCatalog::new(Vec::new()));
+            let catalog = cx.new(|_| FolderCatalog::new(Vec::new(), None));
             NewTabView::new(catalog, window, cx)
         });
 
@@ -2947,6 +2992,44 @@ mod tests {
             ws
         });
         let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn placement_new_tab_retains_home_tab(cx: &mut gpui_kit::TestAppContext) {
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+            assert_eq!(ws.tabs.len(), 1);
+            assert!(matches!(ws.tabs[0], WorkspaceTab::NewTab(_)));
+            ws
+        });
+
+        workspace.update(cx, |ws, cx| {
+            let active = ws.active_tab();
+            let replace = match Placement::NewTab {
+                Placement::NewTab => false,
+                Placement::ReplaceActive => true,
+                Placement::Default => active.is_blank(cx) || !AppSettings::get(cx).tabs,
+            };
+            assert!(
+                !replace,
+                "Placement::NewTab must never replace active blank/Home tab"
+            );
+        });
     }
 
     #[gpui_kit::test]
