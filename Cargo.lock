@@ -5184,9 +5184,9 @@ dependencies = [
 
 [[package]]
 name = "merman"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95a601a95395f286f1f7775ba00c352a11c85ab4debe3bdbef5fa0426a21809"
+checksum = "6cdaadb8ae102baadbf04be16508f0c487ccfca6d2a3c992f09e01d8d2e00663"
 dependencies = [
  "merman-analysis",
  "merman-ascii",
