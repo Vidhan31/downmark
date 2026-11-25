@@ -203,7 +203,7 @@ mod platform {
         }
     }
 
-    pub fn is_default() -> Option<bool> {
+    pub(super) fn is_default() -> Option<bool> {
         let id = bundle_id()?;
         let content_type = CFString::new(MARKDOWN_TYPE);
         // SAFETY: the content type outlives the call; a non-null result is
@@ -218,7 +218,7 @@ mod platform {
         Some(handler.is_some_and(|handler| handler.eq_ignore_ascii_case(&id)))
     }
 
-    pub fn make_default(_: &mut gpui_kit::App) -> Result<Outcome, String> {
+    pub(super) fn make_default(_: &mut gpui_kit::App) -> Result<Outcome, String> {
         let id = bundle_id().ok_or("Only Downmark.app can become the default app.")?;
         let content_type = CFString::new(MARKDOWN_TYPE);
         let handler = CFString::new(&id);
@@ -266,7 +266,7 @@ mod platform {
             .or_else(|| CLASSES_ROOT.open(".md").ok()?.get_string("").ok())
     }
 
-    pub fn is_default() -> Option<bool> {
+    pub(super) fn is_default() -> Option<bool> {
         let chosen = chosen_prog_id();
         Some(chosen.is_some_and(|prog_id| {
             prog_id.eq_ignore_ascii_case(PROG_ID)
@@ -329,7 +329,7 @@ mod platform {
         Ok(())
     }
 
-    pub fn make_default(cx: &mut gpui_kit::App) -> Result<Outcome, String> {
+    pub(super) fn make_default(cx: &mut gpui_kit::App) -> Result<Outcome, String> {
         let page = if registered_for_machine() {
             "registeredAppMachine"
         } else {
@@ -498,11 +498,11 @@ mod platform {
 mod platform {
     use super::Outcome;
 
-    pub fn is_default() -> Option<bool> {
+    pub(super) fn is_default() -> Option<bool> {
         None
     }
 
-    pub fn make_default(_: &mut gpui_kit::App) -> Result<Outcome, String> {
+    pub(super) fn make_default(_: &mut gpui_kit::App) -> Result<Outcome, String> {
         Err("This system has no default apps Downmark knows how to set.".into())
     }
 }
