@@ -15,7 +15,9 @@ python3 -m venv "$work/venv"
 "$work/venv/bin/pip" install --quiet tomlkit aiohttp
 
 echo "Downloading flatpak-cargo-generator.py..."
-curl -fsSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py \
+# Pin to an immutable commit of flatpak/flatpak-builder-tools rather than floating master.
+flatpak_tools_rev="9d86d336a39b9af38b86f114b6ce5820fe260f91"
+curl -fsSL "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${flatpak_tools_rev}/cargo/flatpak-cargo-generator.py" \
   -o "$work/flatpak-cargo-generator.py"
 
 echo "Generating cargo-sources.json from Cargo.lock..."

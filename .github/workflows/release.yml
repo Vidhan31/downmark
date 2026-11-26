@@ -39,6 +39,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -55,9 +59,8 @@ jobs:
 
   macos:
     # The repository variable MACOS_RUNNER picks another macOS runner, such
-    # as GetMac's; GitHub's macOS 26 runner otherwise. The job checks the
-    # version itself rather than waiting on a GitHub-hosted job, so it runs
-    # wherever its runner is available.
+    # as GetMac's; GitHub's macOS 26 runner otherwise.
+    needs: [version, ci]
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 180
     permissions:
@@ -89,6 +92,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-auditable
       # Compiled dependencies, restored so a release rebuilds little but
       # Downmark itself. Saved even when a later step (signing, packaging)
       # fails, so a retry doesn't start from scratch.
@@ -176,8 +183,8 @@ jobs:
           # One after the other: building both in a single cargo run was
           # slower (26 minutes against 17), as the two link-time-optimized
           # builds compete for the runner's memory.
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+          cargo auditable build --release --locked --target aarch64-apple-darwin
+          cargo auditable build --release --locked --target x86_64-apple-darwin
           mkdir -p dist
           lipo -create -output dist/downmark \
             target/aarch64-apple-darwin/release/downmark \
@@ -273,7 +280,7 @@ jobs:
           echo "::notice::$DMG is attached to the draft release $tag"
 
   windows:
-    needs: version
+    needs: [version, ci]
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -298,6 +305,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-auditable
       # Compiled dependencies; see the macOS job.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -305,7 +316,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo auditable build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Stage Downmark.exe
         run: |
@@ -395,7 +406,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    needs: version
+    needs: [version, ci]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
@@ -448,15 +459,19 @@ jobs:
       TAG: ${{ github.ref_name }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      # Read release notes from CHANGELOG.md or fallback notes, plus Cargo manifests for SBOM.
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      # Full checkout so cargo metadata / cargo-cyclonedx can inspect the workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: |
-            .github/release-notes
-            CHANGELOG.md
-            Cargo.toml
-            Cargo.lock
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-cyclonedx
       - name: Extract release notes from CHANGELOG
         id: changelog_reader
         uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
@@ -474,7 +489,8 @@ jobs:
         run: gh release download "$TAG" --pattern '*.dmg' --dir dist
       - name: Generate SBOM (CycloneDX)
         run: |
-          npx --yes @cyclonedx/cdxgen@12.8.4 -r -o dist/bom.json --spec-version 1.6 .
+          cargo cyclonedx --format json --spec-version 1.6 --target all --override-filename bom
+          mv bom.json dist/bom.json
           test -f dist/bom.json
       - name: Checksums
         working-directory: dist

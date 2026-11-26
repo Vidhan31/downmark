@@ -1,0 +1,26 @@
+# Normalize text files to LF (matching .editorconfig and pre-commit)
+* text=auto eol=lf
+
+*.rs text diff=rust
+*.toml text
+*.lock text
+*.md text diff=markdown
+*.yml text
+*.yaml text
+*.json text
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.xml text
+*.desktop text
+Justfile text
+
+# Binary assets and packages
+*.png binary
+*.ico binary
+*.icns binary
+*.so binary
+*.dll binary
+*.exe binary
+*.dmg binary
+*.msix binary
+*.flatpak binary

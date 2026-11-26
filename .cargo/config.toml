@@ -6,3 +6,10 @@ rustflags = [
     "-C", "link-arg=-Wl,-z,relro,-z,now",
     "-C", "link-arg=-Wl,-z,noexecstack",
 ]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "control-flow-guard=yes",
+    "-C", "link-arg=/GUARD:CF",
+    "-C", "link-arg=/CETCOMPAT",
+]

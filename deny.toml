@@ -5,6 +5,7 @@
 # Only fail on unmaintained crates that downmark depends on directly; upstream
 # GUI/Typst crates pull in several unmaintained transitive crates.
 unmaintained = "workspace"
+yanked = "deny"
 # Transitive crates pinned by upstream dependencies (mitex-spec/tylax -> rkyv 0.7,
 # citationberg/hayagriva/typst & wayland/xcb -> quick-xml 0.38) that downmark
 # cannot upgrade directly without upstream releases.
@@ -39,7 +40,7 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
 deny = []
 skip = []
@@ -47,6 +48,6 @@ skip-tree = []
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "warn"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
