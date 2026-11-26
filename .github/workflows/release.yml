@@ -92,7 +92,6 @@ jobs:
       # Compiled dependencies, restored so a release rebuilds little but
       # Downmark itself. Saved even when a later step (signing, packaging)
       # fails, so a retry doesn't start from scratch.
-      # zizmor: ignore[cache-poisoning]
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # CI has jobs with the same names that cache debug builds; without
@@ -300,7 +299,6 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       # Compiled dependencies; see the macOS job.
-      # zizmor: ignore[cache-poisoning]
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release

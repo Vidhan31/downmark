@@ -1,6 +1,8 @@
 # zizmor configuration file
 # See: https://docs.zizmor.sh/configuration/
-#
-# Both template-injection and cache-poisoning are enabled globally; legitimate
-# release cache uses are suppressed inline with `# zizmor: ignore[cache-poisoning]`.
-rules: {}
+
+rules:
+  # Release builds reuse cargo caches across tag runs.
+  cache-poisoning:
+    ignore:
+      - release.yml
