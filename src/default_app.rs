@@ -250,7 +250,7 @@ mod platform {
     const PROG_ID: &str = "Downmark.Markdown";
     const EXTENSIONS: [&str; 4] = [".md", ".markdown", ".mdown", ".mkd"];
 
-    /// The ProgId of the app the user chose for `.md` files.
+    /// The `ProgId` of the app the user chose for `.md` files.
     fn chosen_prog_id() -> Option<String> {
         let base = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.md";
         // Windows 11 keeps newer choices under UserChoiceLatest.
@@ -266,6 +266,10 @@ mod platform {
             .or_else(|| CLASSES_ROOT.open(".md").ok()?.get_string("").ok())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the cross-platform platform::is_default signature"
+    )]
     pub(super) fn is_default() -> Option<bool> {
         let chosen = chosen_prog_id();
         Some(chosen.is_some_and(|prog_id| {
@@ -320,7 +324,7 @@ mod platform {
         // SAFETY: SHCNE_ASSOCCHANGED takes no items.
         unsafe {
             windows_sys::Win32::UI::Shell::SHChangeNotify(
-                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED as i32,
+                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED.cast_signed(),
                 windows_sys::Win32::UI::Shell::SHCNF_IDLIST,
                 std::ptr::null(),
                 std::ptr::null(),

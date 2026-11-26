@@ -16,15 +16,39 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  validate:
+    name: "Validate Linux Metadata"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils appstream jq
+      - name: Validate desktop entry and AppStream metainfo
+        run: |
+          desktop-file-validate packaging/linux/io.github.Vidhan31.Downmark.desktop
+          appstreamcli validate --no-net --pedantic packaging/linux/io.github.Vidhan31.Downmark.metainfo.xml
+      - name: Validate cargo-sources.json syntax
+        run: jq empty packaging/linux/cargo-sources.json
+
   flatpak:
     name: "Build Flatpak Bundle"
+    needs: [validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -34,6 +58,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Prepare writable Flatpak system repo
+        run: |
+          cp -a /var/lib/flatpak /var/lib/flatpak.tmp
+          rm -rf /var/lib/flatpak
+          mv /var/lib/flatpak.tmp /var/lib/flatpak
 
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8

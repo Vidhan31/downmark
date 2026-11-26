@@ -83,11 +83,19 @@ downmark --help
 
 ### Prerequisites
 
-A stable Rust toolchain (Rust 1.85 or newer, supporting the 2024 edition):
+A stable Rust toolchain (Rust 1.98 or newer, supporting the 2024 edition; configured via [rust-toolchain.toml](rust-toolchain.toml)):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
+
+- **Linux:** Install system development libraries required by GPUI, Wayland/X11, TLS, and Vulkan:
+  - Debian / Ubuntu: `sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1`
+  - Fedora: `sudo dnf install -y fontconfig-devel wayland-devel libxkbcommon-x11-devel libX11-devel openssl-devel libzstd-devel vulkan-loader`
+- **Windows:** Visual Studio Build Tools with the Windows 10/11 SDK (required for MSVC linking, resource embedding, and MSIX packaging).
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`).
+
+Optional local dev tools (installable via [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall)): `just` (task runner via [Justfile](Justfile)), `prek` or `pre-commit` (Git hooks), `cargo-nextest`, `cargo-deny`, `cargo-machete`, `typos-cli`, and `taplo-cli`.
 
 ### Build and run
 

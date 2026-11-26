@@ -647,7 +647,8 @@ impl FolderCatalog {
     }
 
     pub(crate) fn set_selected_project_filter(&mut self, filter: Option<PathBuf>) {
-        self.selected_project_filter = filter;
+        // Project folders are stored canonicalized; normalize the filter to match (e.g. Windows \\?\ / 8.3 paths).
+        self.selected_project_filter = filter.map(|f| f.canonicalize().unwrap_or(f));
     }
 
     #[expect(dead_code, reason = "Legacy adapter for setting active project")]
