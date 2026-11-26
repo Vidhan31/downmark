@@ -190,12 +190,6 @@ pub(crate) fn start_server(
             },
         };
 
-        let pipe_name = windows_pipe_name();
-        let wide_name: Vec<u16> = OsStr::new(&pipe_name)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
         #[derive(Clone, Copy)]
         struct SendHandle(HANDLE);
 
@@ -207,6 +201,12 @@ pub(crate) fn start_server(
                 self.0
             }
         }
+
+        let pipe_name = windows_pipe_name();
+        let wide_name: Vec<u16> = OsStr::new(&pipe_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
 
         let send_handle = {
             // SAFETY: Calling Win32 API CreateNamedPipeW to initialize pipe server with default security.
@@ -261,7 +261,7 @@ pub(crate) fn start_server(
                                 handle,
                                 byte.as_mut_ptr().cast(),
                                 1,
-                                &mut bytes_read,
+                                &raw mut bytes_read,
                                 ptr::null_mut(),
                             )
                         };
@@ -282,7 +282,7 @@ pub(crate) fn start_server(
                                 handle,
                                 b"ok".as_ptr().cast(),
                                 2,
-                                &mut bytes_written,
+                                &raw mut bytes_written,
                                 ptr::null_mut(),
                             );
                         }
