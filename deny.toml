@@ -2,9 +2,18 @@
 # See: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Transitive GUI crates (rkyv, bincode, quick-xml) carry unmaintained or advisory
-# notices from upstream GPUI/Typst dependencies. CI runs bans, licenses, and sources.
-ignore = []
+# Only fail on unmaintained crates that downmark depends on directly; upstream
+# GUI/Typst crates pull in several unmaintained transitive crates.
+unmaintained = "workspace"
+yanked = "warn"
+# Transitive crates pinned by upstream dependencies (mitex-spec/tylax -> rkyv 0.7,
+# citationberg/hayagriva/typst & wayland/xcb -> quick-xml 0.38) that downmark
+# cannot upgrade directly without upstream releases.
+ignore = [
+  { id = "RUSTSEC-2026-0235", reason = "Transitive rkyv 0.7 via mitex-spec/tylax; no untrusted rkyv archives are parsed" },
+  { id = "RUSTSEC-2026-0194", reason = "Transitive quick-xml 0.38 via upstream typst/wayland/xcb; no untrusted XML from citationberg" },
+  { id = "RUSTSEC-2026-0195", reason = "Transitive quick-xml 0.38 NsReader via upstream deps; not exposed to untrusted XML streams" },
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -31,7 +40,7 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
 deny = []
 skip = []
@@ -39,6 +48,6 @@ skip-tree = []
 
 [sources]
 unknown-registry = "deny"
-unknown-git = "warn"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
