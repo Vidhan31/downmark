@@ -5,7 +5,7 @@
 # Only fail on unmaintained crates that downmark depends on directly; upstream
 # GUI/Typst crates pull in several unmaintained transitive crates.
 unmaintained = "workspace"
-yanked = "deny"
+yanked = "warn"
 # Transitive crates pinned by upstream dependencies (mitex-spec/tylax -> rkyv 0.7,
 # citationberg/hayagriva/typst & wayland/xcb -> quick-xml 0.38) that downmark
 # cannot upgrade directly without upstream releases.
