@@ -1,10 +1,6 @@
 # zizmor configuration file
 # See: https://docs.zizmor.sh/configuration/
-
-rules:
-  # Release and packaging workflows reuse cargo build caches across runs.
-  cache-poisoning:
-    disable: true
-  # MSIX packaging scripts interpolate GitHub context values into PowerShell blocks.
-  template-injection:
-    disable: true
+#
+# Both template-injection and cache-poisoning are enabled globally; legitimate
+# release cache uses are suppressed inline with `# zizmor: ignore[cache-poisoning]`.
+rules: {}

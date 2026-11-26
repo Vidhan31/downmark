@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -81,20 +81,19 @@ jobs:
           exclude-azure-cli-credential: false
 
       - name: Build MSIX package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MSIX_PACKAGE_NAME: ${{ vars.MSIX_PACKAGE_NAME }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
         run: |
           $dist = (Resolve-Path dist).Path
-          $packageName = if ('${{ vars.MSIX_PACKAGE_NAME }}') { '${{ vars.MSIX_PACKAGE_NAME }}' } else { 'Downmark' }
-          $publisher = if ('${{ vars.MSIX_PUBLISHER }}') { '${{ vars.MSIX_PUBLISHER }}' } else { 'CN=Downmark' }
-          $displayName = if ('${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}') { '${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}' } else { 'Downmark Contributors' }
           $signSelfSigned = ($env:HAS_SIGNING -ne 'true')
 
           & packaging/windows/build-msix.ps1 `
-            -Version "${{ steps.version.outputs.version }}" `
+            -Version $env:VERSION `
             -SourceExe "$dist\Downmark.exe" `
             -OutputDir $dist `
-            -PackageName $packageName `
-            -Publisher $publisher `
-            -PublisherDisplayName $displayName `
             -SignSelfSigned:$signSelfSigned
 
       - name: Sign MSIX package
