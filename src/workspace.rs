@@ -38,11 +38,12 @@ use gpui_kit::{
 
 use crate::{
     actions::{
-        About, ActivateTab, CloseDocument, CloseWindow, FindInPreview, FollowLink, GoToHeading,
-        InstallShellCommand, NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab,
-        Quit, RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
-        ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
-        ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+        About, ActivateTab, CloseDocument, CloseWindow, CopyFilePath, FindInPreview, FollowLink,
+        GoToHeading, InstallShellCommand, NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings,
+        PreviousTab, Quit, RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance,
+        ToggleGlanceMode, ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession,
+        ToggleScrollSync, ToggleSoftWrap, ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT,
+        ZoomIn, ZoomOut, ZoomReset,
     },
     analysis::{Analysis, content_hash},
     catalog::FolderCatalog,
@@ -193,6 +194,8 @@ pub(crate) struct Workspace {
     saved_layout_before_glance: Option<Layout>,
     glance_drag_active: bool,
     explicit_layout: Option<Layout>,
+    #[cfg(test)]
+    config_dir: Option<PathBuf>,
 }
 
 use serde::{Deserialize, Serialize};
@@ -225,6 +228,48 @@ impl Workspace {
         layout: Option<Layout>,
         glance: GlanceStart,
         app_menu_bar: Entity<AppMenuBar>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self::new_inner(
+            files,
+            layout,
+            glance,
+            app_menu_bar,
+            #[cfg(test)]
+            None,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_config_dir(
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
+        glance: GlanceStart,
+        app_menu_bar: Entity<AppMenuBar>,
+        config_dir: impl Into<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self::new_inner(
+            files,
+            layout,
+            glance,
+            app_menu_bar,
+            Some(config_dir.into()),
+            window,
+            cx,
+        )
+    }
+
+    fn new_inner(
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
+        glance: GlanceStart,
+        app_menu_bar: Entity<AppMenuBar>,
+        #[cfg(test)] config_dir: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -283,9 +328,47 @@ impl Workspace {
             saved_layout_before_glance: None,
             glance_drag_active: false,
             explicit_layout: layout,
+            #[cfg(test)]
+            config_dir,
         };
         this.restore(files, layout, glance, &settings, window, cx);
         this
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn load_session(&self) -> Option<Session> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return Session::load_from(&dir.join("session.json"));
+        }
+        Session::load()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn read_recovery(&self, id: &str) -> Option<session::Recovery> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return session::read_recovery_in(&dir.join("recovery"), id);
+        }
+        session::read_recovery(id)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn orphaned_recoveries(&self, known: &HashSet<String>) -> Vec<(String, session::Recovery)> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return session::orphaned_recoveries_in(&dir.join("recovery"), known);
+        }
+        session::orphaned_recoveries(known)
     }
 
     /// Reopen the last session's documents and anything recovered after a
@@ -303,7 +386,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let previous = Session::load();
+        let previous = self.load_session();
         #[cfg_attr(
             test,
             expect(unused_variables, reason = "tests do not use welcome document")
@@ -316,7 +399,8 @@ impl Workspace {
         for (ix, entry) in previous.documents.iter().enumerate() {
             let recovery = entry.recovery.as_deref().and_then(|id| {
                 referenced.insert(id.to_string());
-                session::read_recovery(id).map(|recovery| (id.to_string(), recovery))
+                self.read_recovery(id)
+                    .map(|recovery| (id.to_string(), recovery))
             });
             // Unsaved changes always come back; saved documents only when
             // the session is restored (just the active one without tabs).
@@ -354,7 +438,7 @@ impl Workspace {
             }
         }
 
-        let orphans = session::orphaned_recoveries(&referenced);
+        let orphans = self.orphaned_recoveries(&referenced);
         let recovered = orphans.len() + self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count();
         for (id, recovery) in orphans {
             let doc = Self::restored_document(id, recovery, window, cx);
@@ -920,6 +1004,13 @@ impl Workspace {
             }),
         };
         if self.last_session.as_ref() != Some(&session) {
+            #[cfg(test)]
+            if let Some(dir) = &self.config_dir {
+                session.save_to(&dir.join("session.json"));
+            } else {
+                session.save();
+            }
+            #[cfg(not(test))]
             session.save();
             self.last_session = Some(session);
         }
@@ -1576,6 +1667,32 @@ impl Workspace {
                 Notification::info("Save the document to give it a location."),
                 cx,
             ),
+        }
+    }
+
+    fn copy_file_path(
+        &mut self,
+        _: &CopyFilePath,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        struct CopyFilePathNotice;
+
+        let Some(path) = self.active_tab().path(cx) else {
+            return;
+        };
+        let full_path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            full_path.to_string_lossy().into_owned(),
+        ));
+        if window
+            .root::<gpui_kit::base::Root>()
+            .is_some_and(|root| root.is_some())
+        {
+            window.push_notification(
+                Notification::success("Copied file path to clipboard.").id::<CopyFilePathNotice>(),
+                cx,
+            );
         }
     }
 
@@ -2361,6 +2478,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::reveal_in_folder))
+            .on_action(cx.listener(Self::copy_file_path))
             .on_action(cx.listener(Self::close_document))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::quit))
@@ -2775,8 +2893,34 @@ mod tests {
         });
     }
 
+    struct TestConfigDir(PathBuf);
+
+    impl TestConfigDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "downmark-workspace-test-{name}-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create test config dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestConfigDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[gpui_kit::test]
     fn creating_tabs_adds_each_tab(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("creating_tabs");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2786,11 +2930,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -2806,6 +2951,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn tabs_scroll_methods_behave_correctly(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("tabs_scroll");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2815,11 +2961,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -2841,6 +2988,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn new_tab_activates_newly_created_tab(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("new_tab_activates");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2850,11 +2998,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -2872,6 +3021,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn new_document_defaults_to_preview_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("new_document_preview");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2882,11 +3032,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -2901,6 +3052,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn toggles_glance_mode_and_restores_layout(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("toggles_glance");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2911,11 +3063,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -2936,6 +3089,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn glance_start_initializes_in_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("glance_start");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2946,11 +3100,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let ws = Workspace::new(
+            let ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3080,6 +3235,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn switching_layout_or_new_tab_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("switching_layout");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -3090,11 +3246,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3115,6 +3272,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn escape_key_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("escape_exits_glance");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3128,11 +3286,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3163,6 +3322,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn escape_closes_search_before_exiting_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("escape_closes_search");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3177,11 +3337,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3222,6 +3383,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn view_table_opens_overlay_dialog(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("view_table");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -3238,11 +3400,12 @@ mod tests {
                     DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx)
                 });
                 let entity = cx.new(|cx| {
-                    let mut ws = Workspace::new(
+                    let mut ws = Workspace::new_with_config_dir(
                         Vec::new(),
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     );
@@ -3273,6 +3436,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn title_bar_mouse_down_suppresses_text_selection(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("title_bar_mouse_down");
         let (_ws, cx) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -3291,11 +3455,12 @@ mod tests {
                     cx,
                 )
             });
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3326,6 +3491,344 @@ mod tests {
 
         cx.update(|window, cx| {
             assert!(!TextSelection::has_selection(window, cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn copy_file_path_shortcut_copies_saved_tab_path(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("copy_file_path_saved");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let saved_path = std::env::temp_dir().join("downmark-copy-path-test.md");
+        let expected_path = std::path::absolute(&saved_path)
+            .unwrap_or_else(|_| saved_path.clone())
+            .to_string_lossy()
+            .into_owned();
+
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let saved_doc = cx.new(|cx| {
+                    DocumentView::new(
+                        "# Saved\n".to_string(),
+                        Some(saved_path.clone()),
+                        LineEnding::Lf,
+                        window,
+                        cx,
+                    )
+                });
+                let entity = cx.new(|cx| {
+                    let mut ws = Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        config_dir.path(),
+                        window,
+                        cx,
+                    );
+                    ws.tabs[0] = WorkspaceTab::Document(saved_doc);
+                    ws.focus_active(window, cx);
+                    ws
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke.clone(), cx);
+            assert!(
+                handled,
+                "shortcut must be handled on saved tab in Editor mode"
+            );
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected_path.clone())
+            );
+            assert_eq!(window.notifications(cx).len(), 1);
+
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| {
+                ws.set_layout(&SetLayout(Layout::Preview), window, cx);
+            });
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke, cx);
+            assert!(
+                handled,
+                "shortcut must be handled on saved tab in Preview mode"
+            );
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected_path)
+            );
+            assert_eq!(
+                window.notifications(cx).len(),
+                1,
+                "repeated copies must update the existing toast instead of stacking duplicates"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn copy_file_path_shortcut_ignores_unsaved_and_home_tabs(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("copy_file_path_ignores");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    let mut ws = Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        config_dir.path(),
+                        window,
+                        cx,
+                    );
+                    let unsaved_doc = cx.new(|cx| {
+                        DocumentView::new(
+                            "# Unsaved\n".to_string(),
+                            None,
+                            LineEnding::Lf,
+                            window,
+                            cx,
+                        )
+                    });
+                    ws.add_tab(
+                        WorkspaceTab::Document(unsaved_doc),
+                        TabActivation::Background,
+                        window,
+                        cx,
+                    );
+                    ws
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| ws.activate(0, window, cx));
+            window.draw(cx).clear(cx);
+            window.dispatch_keystroke(keystroke.clone(), cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "Home tab must not overwrite clipboard"
+            );
+            assert!(window.notifications(cx).is_empty());
+
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| ws.activate(1, window, cx));
+            window.draw(cx).clear(cx);
+            window.dispatch_keystroke(keystroke, cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "Unsaved tab must not overwrite clipboard"
+            );
+            assert!(window.notifications(cx).is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn code_block_shortcut_inserts_fence_after_rebind(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("code_block_shortcut");
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let mut doc_entity = None;
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new_with_config_dir(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                config_dir.path(),
+                window,
+                cx,
+            );
+            let doc =
+                cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
+            doc_entity = Some(doc.clone());
+            ws.tabs[0] = WorkspaceTab::Document(doc);
+            ws.focus_active(window, cx);
+            ws
+        });
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-alt-c"
+        } else {
+            "ctrl-alt-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx_window.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke, cx);
+            assert!(handled, "secondary-alt-c must trigger CodeBlock");
+        });
+        doc_entity.unwrap().read_with(cx, |doc, cx| {
+            assert!(
+                doc.editor().read(cx).value().contains("```"),
+                "CodeBlock shortcut must insert a fenced code block"
+            );
+        });
+        let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn restore_reads_session_and_recoveries_from_injected_config_dir(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let populated_dir = TestConfigDir::new("restore_populated");
+        let recovery_dir = populated_dir.path().join("recovery");
+        let session = Session {
+            documents: vec![SessionDocument {
+                path: Some(PathBuf::from("/tmp/session-doc.md")),
+                cursor: 0,
+                recovery: Some("rec-1".to_string()),
+            }],
+            active: 0,
+            window: None,
+        };
+        session.save_to(&populated_dir.path().join("session.json"));
+        session::write_recovery_to(
+            &recovery_dir.join("rec-1.json"),
+            &session::Recovery {
+                path: Some(PathBuf::from("/tmp/session-doc.md")),
+                text: "# Session Recovery\n".to_string(),
+                crlf: false,
+            },
+        )
+        .unwrap();
+        session::write_recovery_to(
+            &recovery_dir.join("orphan-1.json"),
+            &session::Recovery {
+                path: Some(PathBuf::from("/tmp/orphan-doc.md")),
+                text: "# Orphan Recovery\n".to_string(),
+                crlf: false,
+            },
+        )
+        .unwrap();
+
+        cx.update(gpui_kit::init);
+
+        let mut ws_populated = None;
+        cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        populated_dir.path(),
+                        window,
+                        cx,
+                    )
+                });
+                ws_populated = Some(entity.clone());
+                entity
+            })
+            .unwrap();
+        });
+        ws_populated.unwrap().read_with(cx, |ws, cx| {
+            assert_eq!(ws.tabs.len(), 2);
+            assert_eq!(
+                ws.tabs[0].path(cx).cloned(),
+                Some(PathBuf::from("/tmp/session-doc.md"))
+            );
+            assert_eq!(
+                ws.tabs[1].path(cx).cloned(),
+                Some(PathBuf::from("/tmp/orphan-doc.md"))
+            );
+        });
+
+        let empty_dir = TestConfigDir::new("restore_empty");
+        let mut ws_empty = None;
+        cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        empty_dir.path(),
+                        window,
+                        cx,
+                    )
+                });
+                ws_empty = Some(entity.clone());
+                entity
+            })
+            .unwrap();
+        });
+        ws_empty.unwrap().read_with(cx, |ws, _cx| {
+            assert_eq!(ws.tabs.len(), 1);
+            assert!(matches!(ws.tabs[0], WorkspaceTab::NewTab(_)));
         });
     }
 }
