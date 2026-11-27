@@ -1786,6 +1786,8 @@ mod tests {
         let proj_b = base_dir.join("proj_b");
         fs::create_dir_all(&proj_a).unwrap();
         fs::create_dir_all(&proj_b).unwrap();
+        let proj_a = proj_a.canonicalize().unwrap();
+        let proj_b = proj_b.canonicalize().unwrap();
 
         let keep_md = proj_a.join("README.md");
         let remove_md = proj_a.join("old.md");
@@ -1847,6 +1849,8 @@ mod tests {
         let proj_b = base_dir.join("proj_b");
         fs::create_dir_all(&proj_a).unwrap();
         fs::create_dir_all(&proj_b).unwrap();
+        let proj_a = proj_a.canonicalize().unwrap();
+        let proj_b = proj_b.canonicalize().unwrap();
 
         let mut catalog =
             FolderCatalog::new(vec![proj_a.clone(), proj_b.clone()], Some(proj_a.clone()));
