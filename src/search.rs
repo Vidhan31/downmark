@@ -443,6 +443,27 @@ fn next_char_offset(text: &str, offset: usize) -> usize {
         .map_or(text.len() + 1, |ch| offset + ch.len_utf8())
 }
 
+fn starts_inside_word_run(text: &str, start: usize) -> bool {
+    let prev_is_word = text[..start].chars().next_back().is_some_and(is_word_char);
+    let first_is_word = text[start..].chars().next().is_some_and(is_word_char);
+    prev_is_word && first_is_word
+}
+
+fn next_rejected_offset(text: &str, start: usize) -> usize {
+    if starts_inside_word_run(text, start) {
+        let mut end = start;
+        for ch in text[start..].chars() {
+            if !is_word_char(ch) {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        end
+    } else {
+        next_char_offset(text, start)
+    }
+}
+
 fn collect_matches(
     matcher: &CompiledMatcher,
     options: SearchOptions,
@@ -487,7 +508,7 @@ fn collect_matches(
                         next_char_offset(text, start)
                     };
                 } else {
-                    pos = next_char_offset(text, start);
+                    pos = next_rejected_offset(text, start);
                 }
             }
         }
@@ -500,14 +521,21 @@ fn collect_matches(
         }
         CompiledMatcher::Regex { re, word_end } => {
             let mut pos = 0;
+            let mut last_nonempty_end: Option<usize> = None;
             while pos <= text.len() {
                 let Some(found) = re.find_at(text, pos) else {
                     break;
                 };
                 let start = found.start();
                 let end = found.end();
+                if start == end && last_nonempty_end == Some(start) {
+                    pos = next_char_offset(text, start);
+                    continue;
+                }
                 let candidate = if is_whole_word(text, &(start..end)) {
                     Some(start..end)
+                } else if starts_inside_word_run(text, start) {
+                    None
                 } else {
                     word_end
                         .as_ref()
@@ -521,6 +549,9 @@ fn collect_matches(
 
                 if let Some(range) = candidate {
                     let range_end = range.end;
+                    if range_end > start {
+                        last_nonempty_end = Some(range_end);
+                    }
                     if !push_range(range) {
                         break;
                     }
@@ -530,7 +561,7 @@ fn collect_matches(
                         next_char_offset(text, start)
                     };
                 } else {
-                    pos = next_char_offset(text, start);
+                    pos = next_rejected_offset(text, start);
                 }
             }
         }
@@ -749,6 +780,21 @@ mod tests {
         search.update_query(r"foo|foobar", "foobar");
         assert_eq!(search.total_matches(), 1);
         assert_eq!(search.current_match(), Some(&(0..6)));
+
+        // Empty matches overlapping the end of a previous nonempty match must be suppressed,
+        // while standalone zero-width searches (like \b) remain intact.
+        search.update_query(r"\w*", "foo bar");
+        assert_eq!(search.matches(), &[0..3, 4..7]);
+
+        search.update_query(r"\b", "foo bar");
+        assert_eq!(search.matches(), &[0..0, 3..3, 4..4, 7..7]);
+
+        // Rejected candidates inside a long word run must skip to the end of the run
+        // instead of rescanning every interior position quadratically.
+        let mut long_run = String::from("x");
+        long_run.extend(std::iter::repeat_n('a', 100_000));
+        search.update_query("a+", &long_run);
+        assert_eq!(search.total_matches(), 0);
     }
 
     #[test]
