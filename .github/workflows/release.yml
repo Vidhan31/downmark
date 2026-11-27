@@ -2,8 +2,11 @@
 #
 # Pushing a tag vX.Y.Z (matching the version in Cargo.toml) publishes a
 # GitHub Release with every package.
-# The macOS job attaches its disk image to the draft itself rather than
-# handing it over as an artifact, so it doesn't depend on GitHub-hosted
+# Pull requests with "release" in their title, branch name, or labels also
+# build all 3 platform packages and upload them as workflow artifacts without
+# publishing a release.
+# The macOS job attaches its disk image to the draft itself on tag pushes rather
+# than handing it over as an artifact, so it doesn't depend on GitHub-hosted
 # runners or Actions artifact storage. Code signing and notarization happen when the
 # repository secrets (macOS) and Azure Artifact Signing variables (Windows)
 # are configured; without them the macOS app is signed ad hoc and the Windows
@@ -13,10 +16,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, edited]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -26,6 +31,11 @@ env:
 
 jobs:
   ci:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.title, 'release') ||
+      contains(github.head_ref, 'release') ||
+      contains(github.event.pull_request.labels.*.name, 'release')
     permissions:
       contents: read
       pull-requests: read
@@ -34,6 +44,11 @@ jobs:
       run_windows: false
 
   version:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.title, 'release') ||
+      contains(github.head_ref, 'release') ||
+      contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -48,9 +63,11 @@ jobs:
           persist-credentials: false
       - name: Read the version from Cargo.toml
         id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
             exit 1
           fi
@@ -69,20 +86,22 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       # A certificate exported with a blank password is fine, so the
       # password may be empty.
-      HAS_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
-      HAS_NOTARY: ${{ (secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER != '') || (secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '') }}
+      HAS_SIGNING: ${{ github.event_name == 'push' && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      HAS_NOTARY: ${{ github.event_name == 'push' && ((secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER != '') || (secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '')) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Read the version from Cargo.toml
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           if [[ -z "$version" ]]; then
             echo "::error::No version found in Cargo.toml"
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
             exit 1
           fi
@@ -107,6 +126,7 @@ jobs:
           cache-on-failure: true
 
       - name: Check the signing secrets
+        if: github.event_name == 'push'
         env:
           CERTIFICATE_SET: ${{ secrets.APPLE_CERTIFICATE != '' }}
           PASSWORD_SET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
@@ -259,6 +279,7 @@ jobs:
         run: security delete-keychain "$KEYCHAIN" || true
 
       - name: Attach the disk image to a draft release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -279,6 +300,14 @@ jobs:
           gh release upload "$tag" "dist/$DMG" --clobber
           echo "::notice::$DMG is attached to the draft release $tag"
 
+      - name: Upload macOS disk image
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: downmark-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
   windows:
     needs: [version, ci]
     runs-on: windows-latest
@@ -290,8 +319,8 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       # Signing with Azure Artifact Signing (formerly Trusted Signing) when
-      # the repository variables are configured.
-      HAS_SIGNING: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' && vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
+      # the repository variables are configured on a tag push.
+      HAS_SIGNING: ${{ github.event_name == 'push' && vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' && vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
       # aws-lc-sys (TLS for remote images) needs NASM on x86_64 Windows
       # unless it may use its prebuilt objects.
       AWS_LC_SYS_PREBUILT_NASM: "1"
@@ -446,6 +475,7 @@ jobs:
   # Collects every package on the draft release the macOS job started and
   # publishes the final release.
   release:
+    if: github.event_name == 'push'
     needs: [version, ci, macos, windows, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
