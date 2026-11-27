@@ -518,16 +518,13 @@ impl DocumentView {
         self.sync_editor(cx);
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "Action listener matches GPUI listener signature"
-    )]
     fn preview_scroll_left(
         &mut self,
         _: &PreviewScrollLeft,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.set_scroll_driver(ScrollDriver::Preview);
         if let Some(active) = cx.try_global::<preview_ext::ActiveTableScrollHandle>() {
             let handle = active.0.clone();
             let mut offset = handle.offset();
@@ -537,16 +534,13 @@ impl DocumentView {
         }
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "Action listener matches GPUI listener signature"
-    )]
     fn preview_scroll_right(
         &mut self,
         _: &PreviewScrollRight,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.set_scroll_driver(ScrollDriver::Preview);
         if let Some(active) = cx.try_global::<preview_ext::ActiveTableScrollHandle>() {
             let handle = active.0.clone();
             let max = handle.max_offset();
@@ -1823,105 +1817,124 @@ impl DocumentView {
         let is_empty = self.source.trim().is_empty();
 
         div()
-            .id("preview-pane")
-            .key_context(PREVIEW_CONTEXT)
-            .role(gpui_kit::Role::Document)
-            .aria_label("Markdown preview")
+            .id("preview-container")
             .size_full()
             .relative()
             .bg(cx.theme().background)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    let preview_focus = this.preview.read(cx).focus_handle().clone();
-                    window.focus(&preview_focus, cx);
-                }),
-            )
-            // Let the margins beside the text column scroll the preview; the
-            // list scrolls itself when the pointer is over its viewport.
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                this.set_scroll_driver(ScrollDriver::Preview);
-                if !event.dragging() {
-                    TextSelection::end(window, cx);
-                }
-            }))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.set_scroll_driver(ScrollDriver::Preview);
-                let key = event.keystroke.key.to_lowercase();
-                match key.as_str() {
-                    "left" | "arrowleft" | "h" => {
-                        this.preview_scroll_left(&PreviewScrollLeft, window, cx);
-                    }
-                    "right" | "arrowright" | "l" => {
-                        this.preview_scroll_right(&PreviewScrollRight, window, cx);
-                    }
-                    _ => {}
-                }
-            }))
-            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
-                this.set_scroll_driver(ScrollDriver::Preview);
-                let list = this.preview.read(cx).list_state().clone();
-                if list.viewport_bounds().contains(&event.position) {
-                    return;
-                }
-                let delta = event.delta.pixel_delta(window.line_height());
-                list.scroll_by(-delta.y);
-                this.preview.update(cx, |_, cx| cx.notify());
-            }))
-            .child({
-                let base_dir_for_links = base_dir.clone();
-                let document_toggle = document.clone();
-                gpui_kit::image_cache(self.image_cache.clone())
+            .child(
+                div()
+                    .id("preview-pane")
+                    .key_context(PREVIEW_CONTEXT)
+                    .role(gpui_kit::Role::Document)
+                    .aria_label("Markdown preview")
                     .size_full()
-                    .child(
-                        TextView::new(&self.preview)
-                            .size_full()
-                            .scrollable(true)
-                            .selectable(true)
-                            .style(self.preview_style.clone())
-                            .markdown_extensions(self.markdown_extensions.clone())
-                            .pl(inset)
-                            .pr(inset)
-                            .py_8()
-                            .image_source(move |url| images::resolve(url, base_dir.as_deref()))
-                            .code_block_actions(|code_block, _, _| {
-                                Clipboard::new("copy-code").value(code_block.code())
-                            })
-                            .on_link_click(crate::links::on_click)
-                            .link_tooltip(move |url, window, cx| {
-                                crate::links::build_tooltip(
-                                    url,
-                                    base_dir_for_links.as_deref(),
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .on_task_toggle(move |event, window, cx| {
-                                _ = document_toggle.update(cx, |this, cx| {
-                                    this.toggle_task_checkbox(event, window, cx);
-                                });
-                            }),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            let preview_focus = this.preview.read(cx).focus_handle().clone();
+                            window.focus(&preview_focus, cx);
+                        }),
                     )
-            })
-            .when(is_empty, |this| {
-                this.child(
-                    v_flex()
-                        .absolute()
-                        .inset_0()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            div()
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(cx.theme().foreground)
-                                .child("Nothing to preview"),
+                    // Let the margins beside the text column scroll the preview; the
+                    // list scrolls itself when the pointer is over its viewport.
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        this.set_scroll_driver(ScrollDriver::Preview);
+                        if !event.dragging() {
+                            TextSelection::end(window, cx);
+                        }
+                    }))
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if this
+                            .search_input
+                            .read(cx)
+                            .focus_handle(cx)
+                            .is_focused(window)
+                        {
+                            return;
+                        }
+                        let mods = &event.keystroke.modifiers;
+                        if mods.control || mods.alt || mods.platform {
+                            return;
+                        }
+                        this.set_scroll_driver(ScrollDriver::Preview);
+                        let key = event.keystroke.key.to_lowercase();
+                        match (key.as_str(), mods.shift) {
+                            ("left" | "arrowleft", _) | ("h", false) => {
+                                this.preview_scroll_left(&PreviewScrollLeft, window, cx);
+                            }
+                            ("right" | "arrowright", _) | ("l", false) => {
+                                this.preview_scroll_right(&PreviewScrollRight, window, cx);
+                            }
+                            _ => {}
+                        }
+                    }))
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                        this.set_scroll_driver(ScrollDriver::Preview);
+                        let list = this.preview.read(cx).list_state().clone();
+                        if list.viewport_bounds().contains(&event.position) {
+                            return;
+                        }
+                        let delta = event.delta.pixel_delta(window.line_height());
+                        list.scroll_by(-delta.y);
+                        this.preview.update(cx, |_, cx| cx.notify());
+                    }))
+                    .child({
+                        let base_dir_for_links = base_dir.clone();
+                        let document_toggle = document.clone();
+                        gpui_kit::image_cache(self.image_cache.clone())
+                            .size_full()
+                            .child(
+                                TextView::new(&self.preview)
+                                    .size_full()
+                                    .scrollable(true)
+                                    .selectable(true)
+                                    .style(self.preview_style.clone())
+                                    .markdown_extensions(self.markdown_extensions.clone())
+                                    .pl(inset)
+                                    .pr(inset)
+                                    .py_8()
+                                    .image_source(move |url| {
+                                        images::resolve(url, base_dir.as_deref())
+                                    })
+                                    .code_block_actions(|code_block, _, _| {
+                                        Clipboard::new("copy-code").value(code_block.code())
+                                    })
+                                    .on_link_click(crate::links::on_click)
+                                    .link_tooltip(move |url, window, cx| {
+                                        crate::links::build_tooltip(
+                                            url,
+                                            base_dir_for_links.as_deref(),
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .on_task_toggle(move |event, window, cx| {
+                                        _ = document_toggle.update(cx, |this, cx| {
+                                            this.toggle_task_checkbox(event, window, cx);
+                                        });
+                                    }),
+                            )
+                    })
+                    .when(is_empty, |this| {
+                        this.child(
+                            v_flex()
+                                .absolute()
+                                .inset_0()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    div()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(cx.theme().foreground)
+                                        .child("Nothing to preview"),
+                                )
+                                .child("Markdown you write appears here."),
                         )
-                        .child("Markdown you write appears here."),
-                )
-            })
+                    }),
+            )
             .when(self.search_open, |this| {
                 let match_display = self.search.match_display();
                 let total_matches = self.search.total_matches();
@@ -2551,6 +2564,92 @@ mod tests {
         doc.read_with(cx, |view, cx| {
             assert!(view.editor.read(cx).value().contains("- [x] Task"));
         });
+    }
+    #[gpui_kit::test]
+    fn find_input_accepts_h_l_and_space_without_scrolling_preview(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+            cx.set_global(AppSettings(crate::settings::Settings {
+                layout: Layout::Preview,
+                ..Default::default()
+            }));
+        });
+        let mut doc_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let md = (0..50).fold(String::new(), |mut acc, i| {
+                    let _ = writeln!(acc, "Line {i} hello world");
+                    acc
+                });
+                let doc = cx.new(|cx| DocumentView::new(md, None, LineEnding::Lf, window, cx));
+                doc_entity = Some(doc.clone());
+                doc
+            })
+            .unwrap()
+        });
+
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            let doc = doc_entity.as_ref().unwrap();
+            doc.update(cx, |doc, cx| {
+                doc.open_search(window, cx);
+                doc.set_scroll_driver(ScrollDriver::Editor);
+            });
+            window.draw(cx).clear(cx);
+
+            for key in [
+                "h",
+                "e",
+                "l",
+                "l",
+                "o",
+                "space",
+                "w",
+                "o",
+                "r",
+                "l",
+                "d",
+                "shift-space",
+                "shift-h",
+                "shift-l",
+                "left",
+                "right",
+                "home",
+                "end",
+            ] {
+                let keystroke = gpui_kit::Keystroke::parse(key).unwrap();
+                window.dispatch_keystroke(keystroke, cx);
+            }
+            window.draw(cx).clear(cx);
+
+            doc.read_with(cx, |doc, cx| {
+                assert_eq!(doc.search_input.read(cx).value().as_str(), "hello world HL");
+                assert_eq!(doc.smooth_scroll.pending_delta, 0.0);
+                assert_eq!(doc.scroll_sync.driver(), ScrollDriver::Editor);
+            });
+
+            doc.update(cx, |doc, cx| {
+                doc.close_search(window, cx);
+            });
+            window.draw(cx).clear(cx);
+
+            let space = gpui_kit::Keystroke::parse("space").unwrap();
+            assert!(window.dispatch_keystroke(space, cx));
+            doc.read_with(cx, |doc, _| {
+                assert!(doc.smooth_scroll.pending_delta > 0.0);
+                assert_eq!(doc.scroll_sync.driver(), ScrollDriver::Preview);
+            });
+
+            doc.update(cx, |doc, _| doc.set_scroll_driver(ScrollDriver::Editor));
+            let h = gpui_kit::Keystroke::parse("h").unwrap();
+            assert!(window.dispatch_keystroke(h, cx));
+            doc.read_with(cx, |doc, _| {
+                assert_eq!(doc.scroll_sync.driver(), ScrollDriver::Preview);
+            });
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

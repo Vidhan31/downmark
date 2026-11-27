@@ -368,29 +368,33 @@ impl MarkdownPlugin for TableBlockPlugin {
                         cx.set_global(ActiveTableScrollHandle(scroll_handle_for_active.clone()));
                     })
                     .capture_key_down(move |event, window, cx| {
+                        let mods = &event.keystroke.modifiers;
+                        if mods.control || mods.alt || mods.platform {
+                            return;
+                        }
                         let key = event.keystroke.key.to_lowercase();
                         let mut offset = scroll_handle_for_keys.offset();
                         let max = scroll_handle_for_keys.max_offset();
-                        match key.as_str() {
-                            "left" | "arrowleft" | "h" => {
+                        match (key.as_str(), mods.shift) {
+                            ("left" | "arrowleft", _) | ("h", false) => {
                                 offset.x = (offset.x + px(120.)).min(px(0.));
                                 scroll_handle_for_keys.set_offset(offset);
                                 window.refresh();
                                 cx.stop_propagation();
                             }
-                            "right" | "arrowright" | "l" => {
+                            ("right" | "arrowright", _) | ("l", false) => {
                                 offset.x = (offset.x - px(120.)).max(-max.x);
                                 scroll_handle_for_keys.set_offset(offset);
                                 window.refresh();
                                 cx.stop_propagation();
                             }
-                            "home" => {
+                            ("home", _) => {
                                 offset.x = px(0.);
                                 scroll_handle_for_keys.set_offset(offset);
                                 window.refresh();
                                 cx.stop_propagation();
                             }
-                            "end" => {
+                            ("end", _) => {
                                 offset.x = -max.x;
                                 scroll_handle_for_keys.set_offset(offset);
                                 window.refresh();
