@@ -11,11 +11,12 @@ use std::{
 };
 
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu, MouseButton, MouseDownEvent,
-    MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions, Render,
-    ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, WindowBounds, WindowControlArea,
+    Anchor, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EntityId, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu, MouseButton,
+    MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
+    PathPromptOptions, Render, ScrollEvent, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowBounds,
+    WindowControlArea,
     assets::IconName,
     base::{GlobalState, TextSelection},
     component::{
@@ -1921,6 +1922,22 @@ impl Workspace {
             })
     }
 
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(tab) = self.tabs.get(ix).cloned() else {
+            return;
+        };
+        match tab {
+            WorkspaceTab::Document(doc) => {
+                let id = doc.entity_id();
+                self.confirm_unsaved(doc, AfterConfirm::CloseDocument(id), window, cx);
+            }
+            WorkspaceTab::NewTab(new_tab) => {
+                let id = new_tab.entity_id();
+                self.remove_tab(id, window, cx);
+            }
+        }
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Declarative tab bar layout and styling"
@@ -1992,6 +2009,7 @@ impl Workspace {
 
                         h_flex()
                             .id(("tab", tab_id))
+                            .debug_selector(move || format!("workspace-tab-{ix}"))
                             .group("tab")
                             .role(gpui_kit::Role::Tab)
                             .aria_selected(active)
@@ -2048,6 +2066,7 @@ impl Workspace {
                             .child(
                                 div()
                                     .id(("workspace-tab-close", tab_id))
+                                    .debug_selector(move || format!("workspace-tab-close-{ix}"))
                                     .role(gpui_kit::Role::Button)
                                     .aria_label(format!("Close tab {tab_name}"))
                                     .tooltip(|window, cx| {
@@ -2082,59 +2101,33 @@ impl Workspace {
                                             .group_hover("tab", |style| style.visible())
                                             .child(Icon::new(IconName::Close).xsmall()),
                                     )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            match this.tabs[ix].clone() {
-                                                WorkspaceTab::Document(doc) => {
-                                                    let id = doc.entity_id();
-                                                    this.confirm_unsaved(
-                                                        doc,
-                                                        AfterConfirm::CloseDocument(id),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                                WorkspaceTab::NewTab(new_tab) => {
-                                                    let id = new_tab.entity_id();
-                                                    this.remove_tab(id, window, cx);
-                                                }
-                                            }
-                                        }),
-                                    ),
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_tab_at(ix, window, cx);
+                                    })),
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.activate(ix, window, cx);
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Middle,
-                                cx.listener(move |this, _, window, cx| {
-                                    match this.tabs[ix].clone() {
-                                        WorkspaceTab::Document(doc) => {
-                                            let id = doc.entity_id();
-                                            this.confirm_unsaved(
-                                                doc,
-                                                AfterConfirm::CloseDocument(id),
-                                                window,
-                                                cx,
-                                            );
-                                        }
-                                        WorkspaceTab::NewTab(new_tab) => {
-                                            let id = new_tab.entity_id();
-                                            this.remove_tab(id, window, cx);
-                                        }
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate(ix, window, cx);
+                            }))
+                            .on_aux_click(cx.listener(
+                                move |this, event: &ClickEvent, window, cx| {
+                                    if event.is_middle_click() {
+                                        this.close_tab_at(ix, window, cx);
                                     }
-                                }),
-                            )
+                                },
+                            ))
                     })),
             )
             .child(
                 div()
                     .id("new-tab")
+                    .debug_selector(|| "new-tab-button".to_string())
                     .role(gpui_kit::Role::Button)
                     .aria_label(if cfg!(target_os = "macos") {
                         "New Tab (Cmd+T)"
@@ -2159,13 +2152,13 @@ impl Workspace {
                     .hover(|style| style.bg(theme.list_hover).text_color(theme.foreground))
                     .active(|style| style.bg(theme.list_active))
                     .child(Icon::new(IconName::Plus).xsmall())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.new_tab(TabActivation::Activate, window, cx);
-                        }),
-                    ),
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.new_tab(TabActivation::Activate, window, cx);
+                    })),
             )
     }
 
@@ -3293,6 +3286,256 @@ mod tests {
 
         cx.update(|window, cx| {
             assert!(!TextSelection::has_selection(window, cx));
+        });
+    }
+
+    fn open_two_tab_workspace(
+        cx: &mut gpui_kit::TestAppContext,
+    ) -> (Entity<Workspace>, &mut gpui_kit::VisualTestContext) {
+        let (ws, cx) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+            ws.new_tab(TabActivation::Background, window, cx);
+            assert_eq!(ws.tabs.len(), 2);
+            assert_eq!(ws.active, 0);
+            ws
+        });
+        cx.run_until_parked();
+        (ws, cx)
+    }
+
+    #[gpui_kit::test]
+    fn clicking_tab_switches_on_mouseup_after_mousedown(cx: &mut gpui_kit::TestAppContext) {
+        let (ws, cx) = open_two_tab_workspace(cx);
+        let tab1_bounds = cx
+            .debug_bounds("workspace-tab-1")
+            .expect("tab 1 bounds must exist");
+        let tab0_bounds = cx
+            .debug_bounds("workspace-tab-0")
+            .expect("tab 0 bounds must exist");
+
+        cx.simulate_mouse_move(tab1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            tab1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(
+                ws.active, 0,
+                "pressing mouse down on tab 1 must not switch tabs before mouse up"
+            );
+        });
+        cx.simulate_mouse_move(
+            tab0_bounds.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab0_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(
+                ws.active, 0,
+                "releasing on tab 0 after pressing on tab 1 must not activate either tab"
+            );
+        });
+
+        cx.simulate_mouse_move(tab1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            tab1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.active, 1, "full click on tab 1 must activate it");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn new_tab_button_creates_tab_on_mouseup_after_mousedown(cx: &mut gpui_kit::TestAppContext) {
+        let (ws, cx) = open_two_tab_workspace(cx);
+        let tab0_bounds = cx
+            .debug_bounds("workspace-tab-0")
+            .expect("tab 0 bounds must exist");
+        let new_tab_bounds = cx
+            .debug_bounds("new-tab-button")
+            .expect("new-tab button bounds must exist");
+
+        cx.simulate_mouse_move(new_tab_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            new_tab_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(
+                ws.tabs.len(),
+                2,
+                "pressing mouse down on + must not create a tab before mouse up"
+            );
+        });
+        cx.simulate_mouse_move(
+            tab0_bounds.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab0_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 2, "dragging off + must cancel new tab");
+        });
+
+        cx.simulate_mouse_move(new_tab_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            new_tab_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            new_tab_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 3, "full click on + must create a third tab");
+            assert_eq!(ws.active, 2);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn tab_close_button_and_middle_click_close_on_mouseup(cx: &mut gpui_kit::TestAppContext) {
+        let (ws, cx) = open_two_tab_workspace(cx);
+        let tab0_bounds = cx
+            .debug_bounds("workspace-tab-0")
+            .expect("tab 0 bounds must exist");
+        let tab1_bounds = cx
+            .debug_bounds("workspace-tab-1")
+            .expect("tab 1 bounds must exist");
+        let close1_bounds = cx
+            .debug_bounds("workspace-tab-close-1")
+            .expect("tab 1 close button bounds must exist");
+
+        cx.simulate_mouse_move(close1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            close1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(
+                ws.tabs.len(),
+                2,
+                "pressing close button must not close before mouse up"
+            );
+            assert_eq!(ws.active, 0);
+        });
+        cx.simulate_mouse_move(
+            tab0_bounds.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab0_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 2);
+            assert_eq!(ws.active, 0);
+        });
+
+        cx.simulate_mouse_move(tab1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            tab1_bounds.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(
+                ws.tabs.len(),
+                2,
+                "middle mouse down on tab must not close it before mouse up"
+            );
+        });
+        cx.simulate_mouse_move(
+            tab0_bounds.center(),
+            Some(MouseButton::Middle),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab0_bounds.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 2);
+        });
+
+        cx.simulate_mouse_move(close1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            close1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            close1_bounds.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 1);
+            assert_eq!(ws.active, 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn middle_clicking_tab_closes_on_mouseup_after_mousedown(cx: &mut gpui_kit::TestAppContext) {
+        let (ws, cx) = open_two_tab_workspace(cx);
+        let tab1_bounds = cx
+            .debug_bounds("workspace-tab-1")
+            .expect("tab 1 bounds must exist");
+
+        cx.simulate_mouse_move(tab1_bounds.center(), None, Modifiers::default());
+        cx.simulate_mouse_down(
+            tab1_bounds.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 2);
+        });
+        cx.simulate_mouse_up(
+            tab1_bounds.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        ws.read_with(cx, |ws, _| {
+            assert_eq!(ws.tabs.len(), 1, "full middle click on tab must close it");
         });
     }
 }
