@@ -350,7 +350,8 @@ impl DocumentView {
             preview_style,
             _subscriptions: subscriptions,
         };
-        this.load_text(text, path, line_ending, window, cx);
+        let stamp = path.as_deref().and_then(DiskStamp::of);
+        this.load_text(text, path, line_ending, stamp, window, cx);
         this
     }
 
@@ -950,17 +951,18 @@ impl DocumentView {
         });
     }
 
-    /// Replace the document with `text` read from `path`.
+    /// Replace the document with `text` read from `path` with its validated `stamp`.
     fn load_text(
         &mut self,
         text: String,
         path: Option<PathBuf>,
         line_ending: LineEnding,
+        stamp: Option<DiskStamp>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         self.saved_hash = content_hash(&text);
-        self.disk = path.as_deref().and_then(DiskStamp::of);
+        self.disk = stamp;
         self.path = path;
         self.sync_base_dir();
         self.line_ending = line_ending;
@@ -1009,12 +1011,13 @@ impl DocumentView {
         &mut self,
         text: String,
         line_ending: LineEnding,
+        stamp: Option<DiskStamp>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
         let cursor = self.cursor(cx);
         let path = self.path.clone();
-        self.load_text(text, path, line_ending, window, cx);
+        self.load_text(text, path, line_ending, stamp, window, cx);
         self.set_cursor(cursor, window, cx);
         self.discard_recovery();
     }
