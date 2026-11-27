@@ -194,6 +194,8 @@ pub(crate) struct Workspace {
     saved_layout_before_glance: Option<Layout>,
     glance_drag_active: bool,
     explicit_layout: Option<Layout>,
+    #[cfg(test)]
+    config_dir: Option<PathBuf>,
 }
 
 use serde::{Deserialize, Serialize};
@@ -284,6 +286,8 @@ impl Workspace {
             saved_layout_before_glance: None,
             glance_drag_active: false,
             explicit_layout: layout,
+            #[cfg(test)]
+            config_dir: None,
         };
         this.restore(files, layout, glance, &settings, window, cx);
         this
@@ -572,6 +576,11 @@ impl Workspace {
             (offset.x + dx).min(px(0.))
         };
         self.tabs_scroll_handle.set_offset(point(new_x, offset.y));
+    }
+
+    #[cfg(test)]
+    fn set_config_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.config_dir = Some(dir.into());
     }
 
     fn scroll_tab_into_view(&mut self, ix: usize) {
@@ -921,6 +930,13 @@ impl Workspace {
             }),
         };
         if self.last_session.as_ref() != Some(&session) {
+            #[cfg(test)]
+            if let Some(dir) = &self.config_dir {
+                session.save_to(&dir.join("session.json"));
+            } else {
+                session.save();
+            }
+            #[cfg(not(test))]
             session.save();
             self.last_session = Some(session);
         }
@@ -2804,8 +2820,34 @@ mod tests {
         });
     }
 
+    struct TestConfigDir(PathBuf);
+
+    impl TestConfigDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "downmark-workspace-test-{name}-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create test config dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestConfigDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[gpui_kit::test]
     fn creating_tabs_adds_each_tab(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("creating_tabs");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2823,6 +2865,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             let initial_tab_count = ws.tabs.len();
             for _ in 0..15 {
                 ws.new_tab(TabActivation::Background, window, cx);
@@ -2835,6 +2878,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn tabs_scroll_methods_behave_correctly(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("tabs_scroll");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2852,6 +2896,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             for _ in 0..10 {
                 ws.new_tab(TabActivation::Background, window, cx);
             }
@@ -2870,6 +2915,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn new_tab_activates_newly_created_tab(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("new_tab_activates");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2887,6 +2933,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             assert_eq!(ws.tabs.len(), 1);
             assert_eq!(ws.active, 0);
 
@@ -2901,6 +2948,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn new_document_defaults_to_preview_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("new_document_preview");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2919,6 +2967,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
             ws.new_document(window, cx);
@@ -2930,6 +2979,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn toggles_glance_mode_and_restores_layout(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("toggles_glance");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2948,6 +2998,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
@@ -2965,6 +3016,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn glance_start_initializes_in_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("glance_start");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -2975,7 +3027,7 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let ws = Workspace::new(
+            let mut ws = Workspace::new(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
@@ -2983,6 +3035,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             assert!(AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
             ws
@@ -2992,6 +3045,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn switching_layout_or_new_tab_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("switching_layout");
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -3010,6 +3064,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             assert!(AppSettings::get(cx).glance_mode);
 
             ws.set_layout(&SetLayout(Layout::Editor), window, cx);
@@ -3027,6 +3082,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn escape_key_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("escape_exits_glance");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3048,6 +3104,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -3075,6 +3132,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn escape_closes_search_before_exiting_glance_mode(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("escape_closes_search");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3097,6 +3155,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -3134,6 +3193,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn view_table_opens_overlay_dialog(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("view_table");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -3158,6 +3218,7 @@ mod tests {
                         window,
                         cx,
                     );
+                    ws.set_config_dir(config_dir.path());
                     ws.tabs[0] = WorkspaceTab::Document(doc);
                     ws
                 });
@@ -3185,6 +3246,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn title_bar_mouse_down_suppresses_text_selection(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("title_bar_mouse_down");
         let (_ws, cx) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -3211,6 +3273,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             ws.tabs[0] = WorkspaceTab::Document(doc);
             ws
         });
@@ -3243,6 +3306,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn copy_file_path_shortcut_copies_saved_tab_path(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("copy_file_path_saved");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3280,6 +3344,7 @@ mod tests {
                         window,
                         cx,
                     );
+                    ws.set_config_dir(config_dir.path());
                     ws.tabs[0] = WorkspaceTab::Document(saved_doc);
                     ws.focus_active(window, cx);
                     ws
@@ -3337,6 +3402,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn copy_file_path_shortcut_ignores_unsaved_and_home_tabs(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("copy_file_path_ignores");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3359,6 +3425,7 @@ mod tests {
                         window,
                         cx,
                     );
+                    ws.set_config_dir(config_dir.path());
                     let unsaved_doc = cx.new(|cx| {
                         DocumentView::new(
                             "# Unsaved\n".to_string(),
@@ -3418,6 +3485,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn code_block_shortcut_inserts_fence_after_rebind(cx: &mut gpui_kit::TestAppContext) {
+        let config_dir = TestConfigDir::new("code_block_shortcut");
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::actions::bind_keys(cx);
@@ -3440,6 +3508,7 @@ mod tests {
                 window,
                 cx,
             );
+            ws.set_config_dir(config_dir.path());
             let doc =
                 cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
             doc_entity = Some(doc.clone());
