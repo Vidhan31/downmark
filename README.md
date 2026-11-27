@@ -1,24 +1,32 @@
 # Downmark
 
-Downmark is a fast, native Markdown editor and previewer built with GPUI for Linux, macOS, and Windows.
+Downmark is a fast, native Markdown viewer and editor built with GPUI for Linux, macOS, and Windows.
+
+Set it as your default Markdown app and open `.md` files with no extra setup. If you work with AI coding agents, the home tab also indexes your project and global skills, rules, and instruction files in one place.
 
 ![Downmark preview](assets/screenshots/downmark-preview.png)
 
 ## Features
 
-- Split view with synchronized two-way scrolling between editor and preview.
-- Preview, editor, and split layouts.
-- Glance mode for distraction-free reading (F11 or Ctrl+Shift+D / Cmd+Shift+D).
+- Agent workflow hub on the home tab that indexes skills, rules, and Markdown docs across tracked workspaces and global directories for Google Antigravity, Claude Code, OpenAI Codex, Cursor, OpenCode, Windsurf, GitHub Copilot, Amp, Devin, and Kiro, with project filtering.
+- Automatic reload when open files or tracked folders change on disk.
+- Preview, editor, and split layouts with synchronized two-way scrolling.
+- Glance mode for distraction-free reading (`F11` or `Ctrl+Shift+D` / `Cmd+Shift+D`).
+- Interactive task list checkboxes in preview mode that update the source file and record undo history.
+- Find bar with case-sensitive, whole-word, and regular expression matching, plus scrollbar match markers.
 - Native Mermaid diagram rendering with an interactive, zoomable viewer.
 - Inline and display LaTeX math equations rendered with Typst.
 - Tables with horizontal scrolling, Markdown copy buttons, and an expanded full-width view.
 - Syntax highlighting for 28 languages with code block copy buttons.
 - GitHub alert callouts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
-- Tab strip for multiple open documents.
-- Single-instance window reuse that brings your existing window forward and opens new files in tabs.
+- Copy active file path shortcut (`Ctrl+Shift+C` or `Cmd+Shift+C` on macOS).
 - Bundled light and dark themes.
 
 ## Screenshots
+
+| Home project docs | Home skill catalog |
+| --- | --- |
+| ![Home tab showing project docs](assets/screenshots/home-project-docs.png) | ![Home tab showing agent skill catalog](assets/screenshots/home-skills.png) |
 
 | Diagram viewer | Math and tables |
 | --- | --- |
