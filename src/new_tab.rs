@@ -200,6 +200,15 @@ impl NewTabView {
         }
     }
 
+    fn emit_open_file_for_click(event: &ClickEvent, path: PathBuf, cx: &mut Context<'_, Self>) {
+        let modifiers = event.modifiers();
+        if modifiers.control || modifiers.platform {
+            cx.emit(NewTabEvent::OpenFileInNewTab(path));
+        } else {
+            cx.emit(NewTabEvent::OpenFile(path));
+        }
+    }
+
     /// Binds left-click (respecting Ctrl/Cmd to open in a new tab) and middle-click
     /// handlers to a row or item so actions fire only after press and release on the same element.
     fn with_open_file_clicks<E: StatefulInteractiveElement>(
@@ -210,12 +219,7 @@ impl NewTabView {
         let path_middle = path.clone();
         element
             .on_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
-                let modifiers = event.modifiers();
-                if modifiers.control || modifiers.platform {
-                    cx.emit(NewTabEvent::OpenFileInNewTab(path.clone()));
-                } else {
-                    cx.emit(NewTabEvent::OpenFile(path.clone()));
-                }
+                Self::emit_open_file_for_click(event, path.clone(), cx);
             }))
             .on_aux_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
                 if event.is_middle_click() {
@@ -224,8 +228,9 @@ impl NewTabView {
             }))
     }
 
-    /// Wraps an "Open" button with left-click and middle-click handlers that wait
-    /// for release on the button and stop propagation to any enclosing clickable row.
+    /// Wraps an "Open" button with left-click (respecting Ctrl/Cmd to open in a new tab)
+    /// and middle-click handlers that wait for release on the button and stop propagation
+    /// to any enclosing clickable row.
     fn render_open_file_button(
         button: Button,
         wrap_id: impl Into<ElementId>,
@@ -244,10 +249,12 @@ impl NewTabView {
                     cx.emit(NewTabEvent::OpenFileInNewTab(path_middle.clone()));
                 }
             }))
-            .child(button.on_click(cx.listener(move |_this, _, _, cx| {
-                cx.stop_propagation();
-                cx.emit(NewTabEvent::OpenFile(path_left.clone()));
-            })))
+            .child(
+                button.on_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    Self::emit_open_file_for_click(event, path_left.clone(), cx);
+                })),
+            )
     }
 
     /// Renders the floating workspace switcher popover anchored to the top toolbar.
@@ -2385,5 +2392,30 @@ mod tests {
         view.read_with(visual_cx, |this, _| {
             assert!(!this.show_project_manager);
         });
+    }
+
+    #[gpui_kit::test]
+    fn open_button_modifier_click_emits_single_open_in_new_tab_event(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::Modifiers;
+
+        let (_view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectDocs);
+        let open_doc_btn = visual_cx
+            .debug_bounds("open-doc-btn-0")
+            .expect("open-doc-btn-0 bounds");
+
+        for modifiers in [Modifiers::control(), Modifiers::command()] {
+            events.borrow_mut().clear();
+            visual_cx.simulate_mouse_move(open_doc_btn.center(), None, modifiers);
+            visual_cx.simulate_mouse_down(open_doc_btn.center(), MouseButton::Left, modifiers);
+            visual_cx.simulate_mouse_up(open_doc_btn.center(), MouseButton::Left, modifiers);
+            assert_eq!(
+                events.borrow().as_slice(),
+                &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                    "/tmp/downmark-test-proj/README.md"
+                ))]
+            );
+        }
     }
 }
