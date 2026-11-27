@@ -46,10 +46,15 @@ impl SearchOptions {
 
 #[derive(Debug, Clone)]
 enum CompiledMatcher {
-    /// Exact literal substring search via `str::match_indices` (zero compile, SIMD-accelerated).
+    /// Exact literal substring search (zero compile).
     LiteralExact(String),
     /// Case-insensitive literal or regular-expression search via linear-time `regex::Regex`.
-    Regex(Regex),
+    Regex {
+        re: Regex,
+        /// Optional right-word-bounded variant used when `whole_word` rejects a shorter
+        /// leftmost-first regex alternative (e.g., `foo|foobar` on `"foobar"`).
+        word_end: Option<Regex>,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -414,10 +419,28 @@ fn compile_matcher(query: &str, options: SearchOptions) -> Result<CompiledMatche
         builder.multi_line(true).crlf(true);
     }
 
-    builder
-        .build()
-        .map(CompiledMatcher::Regex)
-        .map_err(|err| format_regex_error(&err))
+    let re = builder.build().map_err(|err| format_regex_error(&err))?;
+
+    let word_end = if options.regex && options.whole_word {
+        let end_pattern = format!("(?:{pattern})\\b");
+        let mut end_builder = RegexBuilder::new(&end_pattern);
+        end_builder
+            .case_insensitive(!options.case_sensitive)
+            .multi_line(true)
+            .crlf(true);
+        end_builder.build().ok()
+    } else {
+        None
+    };
+
+    Ok(CompiledMatcher::Regex { re, word_end })
+}
+
+fn next_char_offset(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .chars()
+        .next()
+        .map_or(text.len() + 1, |ch| offset + ch.len_utf8())
 }
 
 fn collect_matches(
@@ -429,10 +452,7 @@ fn collect_matches(
     let mut results = Vec::new();
     let mut truncated = false;
 
-    let mut push_if_valid = |range: Range<usize>| -> bool {
-        if options.whole_word && !is_whole_word(text, &range) {
-            return true;
-        }
+    let mut push_range = |range: Range<usize>| -> bool {
         if results.len() >= limit {
             truncated = true;
             return false;
@@ -442,17 +462,75 @@ fn collect_matches(
     };
 
     match matcher {
-        CompiledMatcher::LiteralExact(needle) => {
+        CompiledMatcher::LiteralExact(needle) if !options.whole_word => {
             for (ix, found) in text.match_indices(needle) {
-                if !push_if_valid(ix..ix + found.len()) {
+                if !push_range(ix..ix + found.len()) {
                     break;
                 }
             }
         }
-        CompiledMatcher::Regex(re) => {
-            for found in re.find_iter(text) {
-                if !push_if_valid(found.start()..found.end()) {
+        CompiledMatcher::LiteralExact(needle) => {
+            let mut pos = 0;
+            while pos <= text.len() {
+                let Some(rel_ix) = text[pos..].find(needle) else {
                     break;
+                };
+                let start = pos + rel_ix;
+                let end = start + needle.len();
+                if is_whole_word(text, &(start..end)) {
+                    if !push_range(start..end) {
+                        break;
+                    }
+                    pos = if end > start {
+                        end
+                    } else {
+                        next_char_offset(text, start)
+                    };
+                } else {
+                    pos = next_char_offset(text, start);
+                }
+            }
+        }
+        CompiledMatcher::Regex { re, .. } if !options.whole_word => {
+            for found in re.find_iter(text) {
+                if !push_range(found.start()..found.end()) {
+                    break;
+                }
+            }
+        }
+        CompiledMatcher::Regex { re, word_end } => {
+            let mut pos = 0;
+            while pos <= text.len() {
+                let Some(found) = re.find_at(text, pos) else {
+                    break;
+                };
+                let start = found.start();
+                let end = found.end();
+                let candidate = if is_whole_word(text, &(start..end)) {
+                    Some(start..end)
+                } else {
+                    word_end
+                        .as_ref()
+                        .and_then(|re_end| re_end.find_at(text, start))
+                        .filter(|longer| {
+                            longer.start() == start
+                                && is_whole_word(text, &(longer.start()..longer.end()))
+                        })
+                        .map(|longer| longer.start()..longer.end())
+                };
+
+                if let Some(range) = candidate {
+                    let range_end = range.end;
+                    if !push_range(range) {
+                        break;
+                    }
+                    pos = if range_end > start {
+                        range_end
+                    } else {
+                        next_char_offset(text, start)
+                    };
+                } else {
+                    pos = next_char_offset(text, start);
                 }
             }
         }
@@ -614,6 +692,23 @@ mod tests {
         search.update_query("(foo)", rendered);
         assert_eq!(search.total_matches(), 1);
         assert_eq!(search.current_match(), Some(&(25..30)));
+
+        // Overlapping literal candidate: "a a" in "xa a a" must reject 1..4 and still find 3..6
+        // in both case-insensitive and case-sensitive literal modes.
+        let overlapping = "xa a a";
+        search.update_query("a a", overlapping);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(3..6)));
+        search.set_options(
+            SearchOptions {
+                whole_word: true,
+                case_sensitive: true,
+                regex: false,
+            },
+            overlapping,
+        );
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(3..6)));
     }
 
     #[test]
@@ -649,6 +744,11 @@ mod tests {
         );
         search.update_query(r"foo|item", rendered);
         assert_eq!(search.matches(), &[8..12, 23..26]);
+
+        // Longer regex alternation must still match when an earlier branch fails whole-word check.
+        search.update_query(r"foo|foobar", "foobar");
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(0..6)));
     }
 
     #[test]
