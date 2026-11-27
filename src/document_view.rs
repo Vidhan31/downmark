@@ -211,14 +211,26 @@ impl TaskState {
 
 impl DocumentView {
     /// A document showing `text`, saved at `path` when it has one.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Initializes editor, preview, sync, and analysis tasks"
-    )]
     pub(crate) fn new(
         text: String,
         path: Option<PathBuf>,
         line_ending: LineEnding,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let stamp = path.as_deref().and_then(DiskStamp::of);
+        Self::new_with_disk_stamp(text, path, line_ending, stamp, window, cx)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Initializes editor, preview, sync, and analysis tasks"
+    )]
+    pub(crate) fn new_with_disk_stamp(
+        text: String,
+        path: Option<PathBuf>,
+        line_ending: LineEnding,
+        stamp: Option<DiskStamp>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -350,7 +362,6 @@ impl DocumentView {
             preview_style,
             _subscriptions: subscriptions,
         };
-        let stamp = path.as_deref().and_then(DiskStamp::of);
         this.load_text(text, path, line_ending, stamp, window, cx);
         this
     }

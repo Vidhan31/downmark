@@ -297,13 +297,36 @@ pub(crate) struct GlobalWatchDirs {
 }
 
 /// Resolves an agent path template relative to `home` (or as an absolute `/...` path).
-fn resolve_agent_path(path_spec: &str, home: Option<&Path>) -> PathBuf {
+/// Returns `None` for home-relative templates when `home` is unavailable.
+fn resolve_agent_path(path_spec: &str, home: Option<&Path>) -> Option<PathBuf> {
     if let Some(stripped) = path_spec.strip_prefix('/') {
-        PathBuf::from(format!("/{stripped}"))
-    } else if let Some(h) = home {
-        h.join(path_spec)
+        Some(PathBuf::from(format!("/{stripped}")))
     } else {
-        PathBuf::from(path_spec)
+        home.map(|h| h.join(path_spec))
+    }
+}
+
+/// Splits a wildcard instruction pattern (e.g. `.copilot/instructions/*.instructions.md`)
+/// into `(relative_dir, filename_pattern)`.
+fn parse_instruction_pattern(inst_path: &str) -> Option<(&str, &str)> {
+    if !inst_path.contains('*') {
+        return None;
+    }
+    match inst_path.rsplit_once('/') {
+        Some((dir, pat)) => Some((dir.trim_end_matches('/'), pat)),
+        None => Some(("", inst_path)),
+    }
+}
+
+fn matches_instruction_pattern(file_name: &str, pattern: &str) -> bool {
+    if pattern == "*.md" {
+        is_markdown_file_name(file_name)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        file_name
+            .get(file_name.len().saturating_sub(suffix.len())..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    } else {
+        file_name.eq_ignore_ascii_case(pattern)
     }
 }
 
@@ -316,14 +339,18 @@ pub(crate) fn global_watch_dirs() -> GlobalWatchDirs {
 
     for agent in PREDEFINED_AGENTS {
         for &inst_path in agent.instruction_paths {
-            let candidate = if inst_path.contains('*') {
-                let rel_dir = inst_path.trim_end_matches("*.md").trim_end_matches('/');
-                home.as_deref().map(|h| h.join(rel_dir))
+            let candidate = if let Some((rel_dir, _)) = parse_instruction_pattern(inst_path) {
+                if rel_dir.is_empty() {
+                    home.clone()
+                } else {
+                    home.as_deref().map(|h| h.join(rel_dir))
+                }
             } else {
-                let full = resolve_agent_path(inst_path, home.as_deref());
-                full.parent()
-                    .filter(|parent| home.as_deref() != Some(*parent))
-                    .map(Path::to_path_buf)
+                resolve_agent_path(inst_path, home.as_deref()).and_then(|full| {
+                    full.parent()
+                        .filter(|parent| home.as_deref() != Some(*parent))
+                        .map(Path::to_path_buf)
+                })
             };
             if let Some(dir) = candidate {
                 if dir.is_dir() {
@@ -337,7 +364,9 @@ pub(crate) fn global_watch_dirs() -> GlobalWatchDirs {
         }
 
         for &skill_rel in agent.skill_paths.iter().chain(agent.fallback_skills) {
-            let full = resolve_agent_path(skill_rel, home.as_deref());
+            let Some(full) = resolve_agent_path(skill_rel, home.as_deref()) else {
+                continue;
+            };
             if full.is_dir() {
                 if seen_dirs.insert(full.clone()) {
                     result.skill_containers.push(full);
@@ -361,16 +390,20 @@ fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
 /// Parses name and description metadata from a `SKILL.md` file.
 pub(crate) fn parse_skill_metadata(skill_file_path: &Path, default_name: &str) -> (String, String) {
     let mut name = default_name.to_string();
+    let mut name_from_frontmatter = false;
     let mut description = String::new();
 
     let Ok(content) = fs::read_to_string(skill_file_path) else {
         return (name, description);
     };
 
+    let mut body = content.as_str();
     let trimmed = content.trim_start();
     if let Some(rest) = trimmed.strip_prefix("---")
         && let Some(end_idx) = rest.find("\n---")
     {
+        let after_delim = &rest[end_idx + "\n---".len()..];
+        body = after_delim.split_once('\n').map_or("", |(_, after)| after);
         let frontmatter = &rest[..end_idx];
         let mut current_key = "";
         let mut desc_lines = Vec::new();
@@ -382,6 +415,7 @@ pub(crate) fn parse_skill_metadata(skill_file_path: &Path, default_name: &str) -
                 let val = val.trim().trim_matches('"').trim_matches('\'');
                 if !val.is_empty() {
                     name = val.to_string();
+                    name_from_frontmatter = true;
                 }
             } else if let Some(val) = trimmed_line.strip_prefix("description:") {
                 current_key = "description";
@@ -406,10 +440,10 @@ pub(crate) fn parse_skill_metadata(skill_file_path: &Path, default_name: &str) -
     }
 
     if description.is_empty() {
-        for line in content.lines() {
+        for line in body.lines() {
             let l = line.trim();
             if l.starts_with('#') {
-                if name == default_name {
+                if !name_from_frontmatter && name == default_name {
                     let heading_text = l.trim_start_matches('#').trim();
                     if !heading_text.is_empty() {
                         name = heading_text.to_string();
@@ -426,6 +460,13 @@ pub(crate) fn parse_skill_metadata(skill_file_path: &Path, default_name: &str) -
 }
 
 /// Scans a single skill directory for its `SKILL.md` and companion Markdown files.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Convenience wrapper for tests without warning collection"
+    )
+)]
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "is_global flag distinguishes user-level from project-level skills"
@@ -436,6 +477,29 @@ pub(crate) fn scan_skill_dir(
     is_global: bool,
     project_name: Option<String>,
     project_path: Option<PathBuf>,
+) -> Option<SkillEntry> {
+    let mut warnings = Vec::new();
+    scan_skill_dir_with_warnings(
+        skill_dir,
+        agent_source,
+        is_global,
+        project_name,
+        project_path,
+        &mut warnings,
+    )
+}
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "is_global flag distinguishes user-level from project-level skills"
+)]
+fn scan_skill_dir_with_warnings(
+    skill_dir: &Path,
+    agent_source: &str,
+    is_global: bool,
+    project_name: Option<String>,
+    project_path: Option<PathBuf>,
+    warnings: &mut Vec<String>,
 ) -> Option<SkillEntry> {
     if !skill_dir.is_dir() {
         return None;
@@ -451,11 +515,22 @@ pub(crate) fn scan_skill_dir(
     let mut queue = vec![(skill_dir.to_path_buf(), String::new(), 0)];
 
     while let Some((dir, rel_prefix, depth)) = queue.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warnings.push(format!("Could not read {}: {err}", dir.display()));
+                continue;
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry_res in entries {
+            let entry = match entry_res {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.push(format!("Could not read entry in {}: {err}", dir.display()));
+                    continue;
+                }
+            };
             let Ok(file_name) = entry.file_name().into_string() else {
                 continue;
             };
@@ -474,6 +549,12 @@ pub(crate) fn scan_skill_dir(
                     queue.push((next_dir, next_rel, depth + 1));
                 }
             } else if ft.is_file() || ft.is_symlink() {
+                let is_root_entrypoint = (file_name.eq_ignore_ascii_case("SKILL.md")
+                    || file_name.eq_ignore_ascii_case("skill.md"))
+                    && rel_prefix.is_empty();
+                if is_root_entrypoint && !ft.is_file() {
+                    continue;
+                }
                 let full_path = dir.join(&file_name);
                 let meta = if ft.is_symlink() {
                     fs::metadata(&full_path)
@@ -497,10 +578,7 @@ pub(crate) fn scan_skill_dir(
                     modified,
                 };
 
-                if (file_name.eq_ignore_ascii_case("SKILL.md")
-                    || file_name.eq_ignore_ascii_case("skill.md"))
-                    && rel_prefix.is_empty()
-                {
+                if is_root_entrypoint {
                     skill_file = Some(scanned);
                 } else if is_markdown_file_name(&file_name) {
                     companion_files.push(scanned);
@@ -527,6 +605,7 @@ pub(crate) fn scan_skill_dir(
 }
 
 /// Scans a directory containing multiple skill subdirectories.
+/// Scans a directory containing multiple skill subdirectories.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "is_global flag distinguishes user-level from project-level skills"
@@ -535,20 +614,35 @@ pub(crate) fn scan_skill_dir(
     clippy::needless_pass_by_value,
     reason = "Takes project metadata for discovered skills"
 )]
-pub(crate) fn scan_skills_container(
+fn scan_skills_container_with_warnings(
     container: &Path,
     agent_source: &str,
     is_global: bool,
     seen_dirs: &mut HashSet<PathBuf>,
     project_name: Option<String>,
     project_path: Option<PathBuf>,
+    warnings: &mut Vec<String>,
 ) -> Vec<SkillEntry> {
     let mut skills = Vec::new();
-    let Ok(entries) = fs::read_dir(container) else {
-        return skills;
+    let entries = match fs::read_dir(container) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warnings.push(format!("Could not read {}: {err}", container.display()));
+            return skills;
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry_res in entries {
+        let entry = match entry_res {
+            Ok(entry) => entry,
+            Err(err) => {
+                warnings.push(format!(
+                    "Could not read entry in {}: {err}",
+                    container.display()
+                ));
+                continue;
+            }
+        };
         let Ok(ft) = entry.file_type() else {
             continue;
         };
@@ -556,12 +650,13 @@ pub(crate) fn scan_skills_container(
             let path = entry.path();
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             if seen_dirs.insert(canonical)
-                && let Some(skill) = scan_skill_dir(
+                && let Some(skill) = scan_skill_dir_with_warnings(
                     &path,
                     agent_source,
                     is_global,
                     project_name.clone(),
                     project_path.clone(),
+                    warnings,
                 )
             {
                 skills.push(skill);
@@ -600,11 +695,18 @@ pub(crate) fn scan_instruction_file(
         Err(_) => (0, None),
     };
 
+    let relative_path = project_path
+        .as_deref()
+        .and_then(|root| file_path.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or_else(|| file_name.clone());
+
     Some(InstructionEntry {
         name: file_name.clone(),
         agent_source: agent_source.to_string(),
         file: ScannedMarkdownFile {
-            relative_path: file_name.clone(),
+            relative_path,
             full_path: file_path.to_path_buf(),
             file_name,
             file_size,
@@ -628,6 +730,7 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) groups: Vec<ScannedFolderGroup>,
     pub(crate) sorted_modified_cache: Vec<WorkspaceFileEntry>,
     pub(crate) all_files_cache: Vec<WorkspaceFileEntry>,
+    pub(crate) scan_warnings: Vec<String>,
 }
 
 /// Manages tracked user directories, AI Agent skills, rules, and Markdown discovery.
@@ -642,6 +745,7 @@ pub(crate) struct FolderCatalog {
 
     pub(crate) global_instructions: Vec<InstructionEntry>,
     pub(crate) global_skills: Vec<SkillEntry>,
+    pub(crate) scan_warnings: Vec<String>,
 
     folders: Vec<PathBuf>,
     groups: Vec<ScannedFolderGroup>,
@@ -687,6 +791,7 @@ impl FolderCatalog {
             project_docs: Vec::new(),
             global_instructions: Vec::new(),
             global_skills: Vec::new(),
+            scan_warnings: Vec::new(),
             folders,
             groups: Vec::new(),
             sorted_modified_cache: Vec::new(),
@@ -726,27 +831,44 @@ impl FolderCatalog {
     }
 
     pub(crate) fn add_project_folder(&mut self, folder: PathBuf) {
-        let canonical = match folder.canonicalize() {
-            Ok(c) => c,
-            Err(_) => folder,
-        };
-        if !canonical.is_dir() {
-            return;
+        self.add_project_folders(&[folder]);
+    }
+
+    pub(crate) fn add_project_folders(&mut self, folders: &[PathBuf]) {
+        let mut last_valid = None;
+        for folder in folders {
+            let canonical = match folder.canonicalize() {
+                Ok(c) => c,
+                Err(_) => folder.clone(),
+            };
+            if !canonical.is_dir() {
+                continue;
+            }
+            if !self.project_folders.contains(&canonical) {
+                self.project_folders.push(canonical.clone());
+            }
+            if !self.folders.contains(&canonical) {
+                self.folders.push(canonical.clone());
+            }
+            last_valid = Some(canonical);
         }
-        if !self.project_folders.contains(&canonical) {
-            self.project_folders.push(canonical.clone());
+        if let Some(selected) = last_valid {
+            self.selected_project_filter = Some(selected);
+            self.rescan();
         }
-        if !self.folders.contains(&canonical) {
-            self.folders.push(canonical.clone());
-        }
-        self.selected_project_filter = Some(canonical);
-        self.rescan();
     }
 
     pub(crate) fn remove_project_folder(&mut self, path: &Path) {
-        self.project_folders.retain(|p| p != path);
-        self.folders.retain(|p| p != path);
-        if self.selected_project_filter.as_deref() == Some(path) {
+        let canon = path.canonicalize().ok();
+        let matches = |p: &PathBuf| {
+            p == path
+                || canon.as_ref().is_some_and(|c| p == c)
+                || p.canonicalize()
+                    .is_ok_and(|pc| pc == path || canon.as_ref().is_some_and(|c| &pc == c))
+        };
+        self.project_folders.retain(|p| !matches(p));
+        self.folders.retain(|p| !matches(p));
+        if self.selected_project_filter.as_ref().is_some_and(matches) {
             self.selected_project_filter = None;
         }
         self.rescan();
@@ -882,10 +1004,13 @@ impl FolderCatalog {
     pub(crate) fn scan_snapshot(mut project_folders: Vec<PathBuf>) -> CatalogSnapshot {
         project_folders.retain(|dir| crate::settings::path_exists_as_dir_or_unconfirmed(dir));
 
-        let (global_instructions, global_skills) = Self::scan_global();
+        let mut scan_warnings = Vec::new();
+        let (global_instructions, global_skills) = Self::scan_global(&mut scan_warnings);
         let (project_instructions, project_skills, project_docs, groups) =
-            Self::scan_project(&project_folders);
+            Self::scan_project(&project_folders, &mut scan_warnings);
         let (sorted_modified_cache, all_files_cache) = Self::build_caches(&groups);
+        scan_warnings.sort();
+        scan_warnings.dedup();
 
         CatalogSnapshot {
             project_folders,
@@ -897,6 +1022,7 @@ impl FolderCatalog {
             groups,
             sorted_modified_cache,
             all_files_cache,
+            scan_warnings,
         }
     }
 
@@ -916,9 +1042,10 @@ impl FolderCatalog {
         self.groups = snapshot.groups;
         self.sorted_modified_cache = snapshot.sorted_modified_cache;
         self.all_files_cache = snapshot.all_files_cache;
+        self.scan_warnings = snapshot.scan_warnings;
     }
 
-    fn scan_global() -> (Vec<InstructionEntry>, Vec<SkillEntry>) {
+    fn scan_global(warnings: &mut Vec<String>) -> (Vec<InstructionEntry>, Vec<SkillEntry>) {
         let mut instructions = Vec::new();
         let mut skills = Vec::new();
         let mut seen_inst = HashSet::new();
@@ -929,54 +1056,80 @@ impl FolderCatalog {
         // Predefined agent environments (at most one rule file per provider)
         for agent in PREDEFINED_AGENTS {
             'inst_loop: for &inst_path in agent.instruction_paths {
-                if inst_path.contains('*') {
+                if let Some((rel_dir, pattern)) = parse_instruction_pattern(inst_path) {
                     if let Some(ref h) = home {
-                        let rel_dir = inst_path.trim_end_matches("*.md").trim_end_matches('/');
-                        let dir = h.join(rel_dir);
-                        if dir.is_dir()
-                            && let Ok(entries) = fs::read_dir(&dir)
-                        {
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.is_file()
-                                    && is_markdown_file_name(&entry.file_name().to_string_lossy())
-                                    && let Ok(c) = path.canonicalize()
-                                    && seen_inst.insert(c)
-                                    && let Some(inst) =
-                                        scan_instruction_file(&path, agent.name, true, None, None)
-                                {
-                                    instructions.push(inst);
-                                    break 'inst_loop;
+                        let dir = if rel_dir.is_empty() {
+                            h.clone()
+                        } else {
+                            h.join(rel_dir)
+                        };
+                        if dir.is_dir() {
+                            match fs::read_dir(&dir) {
+                                Ok(entries) => {
+                                    let mut candidates = Vec::new();
+                                    for entry_res in entries {
+                                        match entry_res {
+                                            Ok(entry) => {
+                                                let path = entry.path();
+                                                let name = entry
+                                                    .file_name()
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                if path.is_file()
+                                                    && matches_instruction_pattern(&name, pattern)
+                                                {
+                                                    candidates.push(path);
+                                                }
+                                            }
+                                            Err(err) => warnings.push(format!(
+                                                "Could not read entry in {}: {err}",
+                                                dir.display()
+                                            )),
+                                        }
+                                    }
+                                    candidates.sort();
+                                    for path in candidates {
+                                        if let Ok(c) = path.canonicalize()
+                                            && seen_inst.insert(c)
+                                            && let Some(inst) = scan_instruction_file(
+                                                &path, agent.name, true, None, None,
+                                            )
+                                        {
+                                            instructions.push(inst);
+                                            break 'inst_loop;
+                                        }
+                                    }
                                 }
+                                Err(err) => warnings
+                                    .push(format!("Could not read {}: {err}", dir.display())),
                             }
                         }
                     }
-                } else {
-                    let full = resolve_agent_path(inst_path, home.as_deref());
-
-                    if full.is_file()
-                        && let Ok(c) = full.canonicalize()
-                        && seen_inst.insert(c)
-                        && let Some(inst) =
-                            scan_instruction_file(&full, agent.name, true, None, None)
-                    {
-                        instructions.push(inst);
-                        break 'inst_loop;
-                    }
+                } else if let Some(full) = resolve_agent_path(inst_path, home.as_deref())
+                    && full.is_file()
+                    && let Ok(c) = full.canonicalize()
+                    && seen_inst.insert(c)
+                    && let Some(inst) = scan_instruction_file(&full, agent.name, true, None, None)
+                {
+                    instructions.push(inst);
+                    break 'inst_loop;
                 }
             }
 
             for &skill_rel in agent.skill_paths.iter().chain(agent.fallback_skills) {
-                let full = resolve_agent_path(skill_rel, home.as_deref());
+                let Some(full) = resolve_agent_path(skill_rel, home.as_deref()) else {
+                    continue;
+                };
 
                 if full.is_dir() {
-                    let discovered = scan_skills_container(
+                    let discovered = scan_skills_container_with_warnings(
                         &full,
                         agent.name,
                         true,
                         &mut seen_skills,
                         None,
                         None,
+                        warnings,
                     );
                     skills.extend(discovered);
                 }
@@ -995,6 +1148,7 @@ impl FolderCatalog {
     )]
     fn scan_project(
         project_folders: &[PathBuf],
+        warnings: &mut Vec<String>,
     ) -> (
         Vec<InstructionEntry>,
         Vec<SkillEntry>,
@@ -1016,6 +1170,7 @@ impl FolderCatalog {
             "CLAUDE.md",
             "GEMINI.md",
             "copilot-instructions.md",
+            ".github/copilot-instructions.md",
             ".agents/AGENTS.md",
             ".claude/CLAUDE.md",
             ".gemini/AGENTS.md",
@@ -1044,6 +1199,7 @@ impl FolderCatalog {
                 .to_string();
 
             let mut seen_inst = HashSet::new();
+            let mut project_claimed_paths = HashSet::new();
 
             // 1. Project Instruction Files
             for &rel in SPECIAL_RULE_FILENAMES
@@ -1053,7 +1209,7 @@ impl FolderCatalog {
                 let path = project.join(rel);
                 if path.is_file()
                     && let Ok(c) = path.canonicalize()
-                    && seen_inst.insert(c)
+                    && seen_inst.insert(c.clone())
                 {
                     let source = if rel.contains('/') {
                         format!(
@@ -1070,31 +1226,73 @@ impl FolderCatalog {
                         Some(project_name.clone()),
                         Some(project.clone()),
                     ) {
+                        project_claimed_paths.insert(c);
                         all_instructions.push(inst);
                     }
                 }
             }
 
-            // Subdir rules like .claude/rules/*.md
-            let rules_dir = project.join(".claude").join("rules");
-            if rules_dir.is_dir()
-                && let Ok(entries) = fs::read_dir(&rules_dir)
-            {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file()
-                        && is_markdown_file_name(&entry.file_name().to_string_lossy())
-                        && let Ok(c) = path.canonicalize()
-                        && seen_inst.insert(c)
-                        && let Some(inst) = scan_instruction_file(
-                            &path,
-                            &format!("{project_name} · claude-rule"),
-                            false,
-                            Some(project_name.clone()),
-                            Some(project.clone()),
-                        )
-                    {
-                        all_instructions.push(inst);
+            // Subdir rules like .claude/rules/*.md and .github/instructions/*.instructions.md
+            let rule_dirs: [(&Path, &str, &str, usize); 2] = [
+                (Path::new(".claude/rules"), "claude-rule", "*.md", 1),
+                (
+                    Path::new(".github/instructions"),
+                    "copilot-instructions",
+                    "*.instructions.md",
+                    4,
+                ),
+            ];
+            for (rel_dir, label, pattern, max_depth) in rule_dirs {
+                let dir = project.join(rel_dir);
+                if !dir.is_dir() {
+                    continue;
+                }
+                let mut stack = vec![(dir, 0_usize)];
+                while let Some((cur, depth)) = stack.pop() {
+                    let entries = match fs::read_dir(&cur) {
+                        Ok(entries) => entries,
+                        Err(err) => {
+                            warnings.push(format!("Could not read {}: {err}", cur.display()));
+                            continue;
+                        }
+                    };
+                    for entry_res in entries {
+                        let entry = match entry_res {
+                            Ok(entry) => entry,
+                            Err(err) => {
+                                warnings.push(format!(
+                                    "Could not read entry in {}: {err}",
+                                    cur.display()
+                                ));
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        let Ok(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        if ft.is_dir() {
+                            if depth + 1 < max_depth {
+                                stack.push((path, depth + 1));
+                            }
+                        } else if path.is_file()
+                            && matches_instruction_pattern(
+                                &entry.file_name().to_string_lossy(),
+                                pattern,
+                            )
+                            && let Ok(c) = path.canonicalize()
+                            && seen_inst.insert(c.clone())
+                            && let Some(inst) = scan_instruction_file(
+                                &path,
+                                &format!("{project_name} · {label}"),
+                                false,
+                                Some(project_name.clone()),
+                                Some(project.clone()),
+                            )
+                        {
+                            project_claimed_paths.insert(c);
+                            all_instructions.push(inst);
+                        }
                     }
                 }
             }
@@ -1105,43 +1303,46 @@ impl FolderCatalog {
                 let path = project.join(rel);
                 if path.is_dir() {
                     let source = format!("{project_name} · {label}");
-                    let discovered = scan_skills_container(
+                    let discovered = scan_skills_container_with_warnings(
                         &path,
                         &source,
                         false,
                         &mut seen_skills,
                         Some(project_name.clone()),
                         Some(project.clone()),
+                        warnings,
                     );
+                    for skill in &discovered {
+                        if let Ok(c) = skill.skill_file.full_path.canonicalize() {
+                            project_claimed_paths.insert(c);
+                        }
+                        for comp in &skill.companion_files {
+                            if let Ok(c) = comp.full_path.canonicalize() {
+                                project_claimed_paths.insert(c);
+                            }
+                        }
+                    }
                     all_skills.extend(discovered);
                 }
             }
 
             // 3. Project Documentation (all other Markdown files)
-            let scanned_group = Self::scan_folder(project);
-            let mut claimed_paths = HashSet::new();
-            for inst in &all_instructions {
-                if let Ok(c) = inst.file.full_path.canonicalize() {
-                    claimed_paths.insert(c);
-                }
-            }
-            for skill in &all_skills {
-                if let Ok(c) = skill.skill_file.full_path.canonicalize() {
-                    claimed_paths.insert(c);
-                }
-                for comp in &skill.companion_files {
-                    if let Ok(c) = comp.full_path.canonicalize() {
-                        claimed_paths.insert(c);
-                    }
-                }
-            }
+            let scanned_group = Self::scan_folder_with_warnings(project, warnings);
 
             for file in &scanned_group.files {
+                let is_under_skill_root = PROJECT_SKILL_CONTAINER_RELS.iter().any(|rel| {
+                    file.relative_path
+                        .strip_prefix(rel)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                });
+                if is_under_skill_root {
+                    continue;
+                }
                 let canonical = file
                     .full_path
                     .canonicalize()
                     .unwrap_or_else(|_| file.full_path.clone());
-                if !claimed_paths.contains(&canonical) {
+                if !project_claimed_paths.contains(&canonical) {
                     all_docs.push(ProjectDocEntry {
                         file: file.clone(),
                         project_name: Some(project_name.clone()),
@@ -1169,7 +1370,13 @@ impl FolderCatalog {
     }
 
     /// Scans a single directory iteratively for Markdown files using a worklist queue.
+    #[expect(dead_code, reason = "Convenience wrapper without warning collection")]
     pub(crate) fn scan_folder(folder: &Path) -> ScannedFolderGroup {
+        let mut warnings = Vec::new();
+        Self::scan_folder_with_warnings(folder, &mut warnings)
+    }
+
+    fn scan_folder_with_warnings(folder: &Path, warnings: &mut Vec<String>) -> ScannedFolderGroup {
         const MAX_DEPTH: usize = 8;
 
         let folder_name = folder
@@ -1188,11 +1395,25 @@ impl FolderCatalog {
         });
 
         while let Some(task) = queue.pop() {
-            let Ok(entries) = fs::read_dir(&task.dir_path) else {
-                continue;
+            let entries = match fs::read_dir(&task.dir_path) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    warnings.push(format!("Could not read {}: {err}", task.dir_path.display()));
+                    continue;
+                }
             };
 
-            for entry in entries.flatten() {
+            for entry_res in entries {
+                let entry = match entry_res {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        warnings.push(format!(
+                            "Could not read entry in {}: {err}",
+                            task.dir_path.display()
+                        ));
+                        continue;
+                    }
+                };
                 let Ok(file_name) = entry.file_name().into_string() else {
                     continue;
                 };

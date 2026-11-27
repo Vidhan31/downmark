@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement, Styled as _,
-    Subscription, Window,
+    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled as _, Subscription, Window,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _,
@@ -75,6 +75,13 @@ impl HubTab {
     }
 }
 
+/// Whether an empty category view is due to an active filter or genuinely no entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmptyStateKind {
+    NoFilterMatches,
+    GenuinelyEmpty,
+}
+
 /// Visual selection state for tabs and sidebar rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionState {
@@ -141,12 +148,25 @@ fn group_skills_by_source<'a>(
     (ordered, groups)
 }
 
+fn abbreviate_home_path(path: &Path) -> String {
+    if let Some(home) = crate::catalog::user_home_dir()
+        && let Ok(rel) = path.strip_prefix(&home)
+    {
+        if rel.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display());
+    }
+    path.display().to_string()
+}
+
 pub(crate) struct NewTabView {
     catalog: Entity<FolderCatalog>,
     filter_input: Entity<InputState>,
     filter_query: String,
     active_tab: HubTab,
     selected_item_index: usize,
+    table_scroll_handle: ScrollHandle,
     show_project_manager: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -195,6 +215,7 @@ impl NewTabView {
             filter_query: String::new(),
             active_tab,
             selected_item_index: 0,
+            table_scroll_handle: ScrollHandle::new(),
             show_project_manager: false,
             _subscriptions: subscriptions,
         }
@@ -269,7 +290,6 @@ impl NewTabView {
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let home_dir = std::env::var("HOME").unwrap_or_default();
 
         div()
             .id("project-popover-container")
@@ -415,14 +435,15 @@ impl NewTabView {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("project")
                                     .to_string();
-                                let path_str = path.to_string_lossy().replace(&home_dir, "~");
+                                let path_str = abbreviate_home_path(path);
                                 let click_path = path.clone();
                                 let remove_path = path.clone();
+                                let row_id = format!("popover-item-{}", path.to_string_lossy());
                                 let item_selector = format!("popover-item-{name}");
                                 let rm_selector = format!("popover-rm-{name}");
 
                                 h_flex()
-                                    .id(SharedString::from(format!("popover-item-{name}")))
+                                    .id(SharedString::from(row_id))
                                     .debug_selector(move || item_selector)
                                     .role(gpui_kit::Role::Button)
                                     .aria_label(format!("Select workspace {name}"))
@@ -572,6 +593,47 @@ impl NewTabView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(message),
+            )
+            .into_any_element()
+    }
+
+    fn render_no_filter_matches_state(
+        icon: IconName,
+        cx: &Context<'_, Self>,
+    ) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2p5()
+            .child(Icon::new(icon).size_8().text_color(theme.muted_foreground))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child("No Matching Items"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("No entries in this category match the current filter."),
+            )
+            .child(
+                Button::new("clear-filter-btn")
+                    .debug_selector(|| "clear-filter-btn".to_string())
+                    .ghost()
+                    .small()
+                    .child("Clear Filter")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.filter_query.clear();
+                        this.filter_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        this.selected_item_index = 0;
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -730,20 +792,28 @@ impl NewTabView {
     }
 
     /// Renders the resizable source-list sidebar and right detail pane for Skills.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Master-detail skills view with precomputed grouping and empty-state context"
+    )]
     fn render_skills_master_detail(
         &self,
         id: &'static str,
-        skills: &[SkillEntry],
+        ordered: &[&SkillEntry],
+        groups: Vec<SkillGroup<'_>>,
+        empty_kind: EmptyStateKind,
         empty_title: &'static str,
         empty_msg: &'static str,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        if skills.is_empty() {
+        if ordered.is_empty() {
+            if empty_kind == EmptyStateKind::NoFilterMatches {
+                return Self::render_no_filter_matches_state(IconName::Sparkles, cx);
+            }
             return Self::render_empty_state(IconName::Sparkles, empty_title, empty_msg, cx);
         }
 
-        let (ordered, groups) = group_skills_by_source(skills);
         let selected_idx = self
             .selected_item_index
             .min(ordered.len().saturating_sub(1));
@@ -796,10 +866,7 @@ impl NewTabView {
         let agent_source = skill.agent_source.clone();
         let description = skill.description.clone();
         let full_path = skill.skill_file.full_path.clone();
-        let dir_display = skill
-            .dir_path
-            .to_string_lossy()
-            .replace(&std::env::var("HOME").unwrap_or_default(), "~");
+        let dir_display = abbreviate_home_path(&skill.dir_path);
         let companions = skill.companion_files.clone();
         let total_docs = companions.len() + 1;
         let files_count_label = if total_docs == 1 {
@@ -1077,18 +1144,20 @@ impl NewTabView {
         clippy::fn_params_excessive_bools,
         reason = "Global vs Project rule rendering flag"
     )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Renders full table view with header, empty states, and row elements"
-    )]
     fn render_rules_table(
         rules: &[InstructionEntry],
         is_global: bool,
         total_projects: usize,
+        empty_kind: EmptyStateKind,
+        selected_idx: usize,
+        scroll_handle: &ScrollHandle,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
         if rules.is_empty() {
+            if empty_kind == EmptyStateKind::NoFilterMatches {
+                return Self::render_no_filter_matches_state(IconName::Bot, cx);
+            }
             let (title, msg) = if is_global {
                 (
                     "No Global Rules Detected",
@@ -1105,29 +1174,7 @@ impl NewTabView {
                     "Add AGENTS.md, CLAUDE.md, or .cursorrules to your project.",
                 )
             };
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    Icon::new(IconName::Bot)
-                        .size_8()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(msg),
-                );
+            return Self::render_empty_state(IconName::Bot, title, msg, cx);
         }
 
         v_flex()
@@ -1191,13 +1238,20 @@ impl NewTabView {
                     .child(div().w(px(70.)).flex_none()),
             )
             .child(
-                v_flex().flex_1().overflow_y_scrollbar().children(
-                    rules
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, rule)| Self::render_rule_table_row(rule, is_global, ix, cx)),
-                ),
+                v_flex()
+                    .id(if is_global {
+                        "global-rules-scroll"
+                    } else {
+                        "project-rules-scroll"
+                    })
+                    .flex_1()
+                    .track_scroll(scroll_handle)
+                    .overflow_y_scrollbar()
+                    .children(rules.iter().enumerate().map(|(ix, rule)| {
+                        Self::render_rule_table_row(rule, is_global, ix, ix == selected_idx, cx)
+                    })),
             )
+            .into_any_element()
     }
 
     /// Renders a dense, responsive row for the Rules table.
@@ -1210,6 +1264,7 @@ impl NewTabView {
         rule: &InstructionEntry,
         is_global: bool,
         idx: usize,
+        is_selected: bool,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -1220,9 +1275,7 @@ impl NewTabView {
         let mod_str = rule.file.formatted_modified();
 
         let path_display = if is_global {
-            full_path
-                .to_string_lossy()
-                .replace(&std::env::var("HOME").unwrap_or_default(), "~")
+            abbreviate_home_path(&full_path)
         } else {
             rule.file.relative_path.clone()
         };
@@ -1232,6 +1285,7 @@ impl NewTabView {
                 .id(SharedString::from(format!("rule-row-{idx}")))
                 .debug_selector(move || format!("rule-row-{idx}"))
                 .role(gpui_kit::Role::ListItem)
+                .aria_selected(is_selected)
                 .aria_label(format!("Rule: {name} ({source})"))
                 .items_center()
                 .h_9()
@@ -1239,7 +1293,8 @@ impl NewTabView {
                 .border_b_1()
                 .border_color(theme.border.opacity(0.4))
                 .cursor_pointer()
-                .hover(|h| h.bg(theme.list_hover)),
+                .when(is_selected, |s| s.bg(theme.list_active))
+                .when(!is_selected, |s| s.hover(|h| h.bg(theme.list_hover))),
             full_path,
             cx,
         )
@@ -1329,8 +1384,10 @@ impl NewTabView {
     fn render_doc_table_row(
         doc: &ProjectDocEntry,
         idx: usize,
+        selection: SelectionState,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
+        let is_selected = selection.is_selected();
         let theme = cx.theme();
         let full_path = doc.file.full_path.clone();
         let name = doc.file.file_name.clone();
@@ -1347,6 +1404,7 @@ impl NewTabView {
                 .id(SharedString::from(format!("doc-row-{idx}")))
                 .debug_selector(move || format!("doc-row-{idx}"))
                 .role(gpui_kit::Role::ListItem)
+                .aria_selected(is_selected)
                 .aria_label(format!("Doc: {name}"))
                 .items_center()
                 .h_9()
@@ -1354,7 +1412,8 @@ impl NewTabView {
                 .border_b_1()
                 .border_color(theme.border.opacity(0.4))
                 .cursor_pointer()
-                .hover(|h| h.bg(theme.list_hover)),
+                .when(is_selected, |s| s.bg(theme.list_active))
+                .when(!is_selected, |s| s.hover(|h| h.bg(theme.list_hover))),
             full_path,
             cx,
         )
@@ -1444,10 +1503,16 @@ impl NewTabView {
     fn render_project_docs_table(
         docs: &[ProjectDocEntry],
         total_projects: usize,
+        empty_kind: EmptyStateKind,
+        selected_idx: usize,
+        scroll_handle: &ScrollHandle,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
         if docs.is_empty() {
+            if empty_kind == EmptyStateKind::NoFilterMatches {
+                return Self::render_no_filter_matches_state(IconName::BookOpen, cx);
+            }
             let (title, msg) = if total_projects == 0 {
                 (
                     "No Project Folders Chosen",
@@ -1520,11 +1585,19 @@ impl NewTabView {
                     ),
             )
             .child(
-                v_flex().flex_1().overflow_y_scrollbar().children(
-                    docs.iter()
-                        .enumerate()
-                        .map(|(ix, doc)| Self::render_doc_table_row(doc, ix, cx)),
-                ),
+                v_flex()
+                    .id("project-docs-scroll")
+                    .flex_1()
+                    .track_scroll(scroll_handle)
+                    .overflow_y_scrollbar()
+                    .children(docs.iter().enumerate().map(|(ix, doc)| {
+                        Self::render_doc_table_row(
+                            doc,
+                            ix,
+                            SelectionState::from_eq(&ix, &selected_idx),
+                            cx,
+                        )
+                    })),
             )
             .into_any_element()
     }
@@ -1543,14 +1616,25 @@ impl Render for NewTabView {
         let selected_project_filter = catalog.selected_project_filter().cloned();
         let total_projects = project_folders.len();
 
+        let has_filter = !self.filter_query.is_empty();
+        let unfiltered_hub = has_filter.then(|| catalog.filter_hub(""));
         let filtered_hub = catalog.filter_hub(&self.filter_query);
 
+        let mut grouped_skills = match self.active_tab {
+            HubTab::ProjectSkills => Some(group_skills_by_source(&filtered_hub.project_skills)),
+            HubTab::GlobalSkills => Some(group_skills_by_source(&filtered_hub.global_skills)),
+            _ => None,
+        };
+
         let active_tab_paths: Vec<PathBuf> = match self.active_tab {
-            HubTab::ProjectSkills => group_skills_by_source(&filtered_hub.project_skills)
-                .0
-                .into_iter()
-                .map(|s| s.skill_file.full_path.clone())
-                .collect(),
+            HubTab::ProjectSkills | HubTab::GlobalSkills => {
+                grouped_skills.as_ref().map_or_default(|(ordered, _)| {
+                    ordered
+                        .iter()
+                        .map(|s| s.skill_file.full_path.clone())
+                        .collect()
+                })
+            }
             HubTab::ProjectRules => filtered_hub
                 .project_instructions
                 .iter()
@@ -1561,11 +1645,6 @@ impl Render for NewTabView {
                 .iter()
                 .map(|d| d.file.full_path.clone())
                 .collect(),
-            HubTab::GlobalSkills => group_skills_by_source(&filtered_hub.global_skills)
-                .0
-                .into_iter()
-                .map(|s| s.skill_file.full_path.clone())
-                .collect(),
             HubTab::GlobalRules => filtered_hub
                 .global_instructions
                 .iter()
@@ -1575,6 +1654,7 @@ impl Render for NewTabView {
 
         let nav_count = active_tab_paths.len();
         self.selected_item_index = self.selected_item_index.min(nav_count.saturating_sub(1));
+        let selected_item_index = self.selected_item_index;
 
         v_flex()
             .id("new-tab-page")
@@ -1584,17 +1664,38 @@ impl Render for NewTabView {
             .gap_0()
             .overflow_hidden()
             .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if this.show_project_manager {
+                    if event.keystroke.key.as_str() == "escape" {
+                        this.show_project_manager = false;
+                        cx.notify();
+                    }
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "down" => {
                         if nav_count > 0 {
                             this.selected_item_index =
                                 (this.selected_item_index + 1).min(nav_count - 1);
+                            if matches!(
+                                this.active_tab,
+                                HubTab::ProjectRules | HubTab::GlobalRules | HubTab::ProjectDocs
+                            ) {
+                                this.table_scroll_handle
+                                    .scroll_to_item(this.selected_item_index);
+                            }
                             cx.notify();
                         }
                     }
                     "up" => {
                         if this.selected_item_index > 0 {
                             this.selected_item_index -= 1;
+                            if matches!(
+                                this.active_tab,
+                                HubTab::ProjectRules | HubTab::GlobalRules | HubTab::ProjectDocs
+                            ) {
+                                this.table_scroll_handle
+                                    .scroll_to_item(this.selected_item_index);
+                            }
                             cx.notify();
                         } else {
                             this.filter_input
@@ -1613,16 +1714,11 @@ impl Render for NewTabView {
                             }
                         }
                     }
-                    "escape" => {
-                        if this.show_project_manager {
-                            this.show_project_manager = false;
-                            cx.notify();
-                        } else if !this.filter_query.is_empty() {
-                            this.filter_query.clear();
-                            this.filter_input
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                            cx.notify();
-                        }
+                    "escape" if !this.filter_query.is_empty() => {
+                        this.filter_query.clear();
+                        this.filter_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        cx.notify();
                     }
                     _ => {}
                 }
@@ -1832,43 +1928,103 @@ impl Render for NewTabView {
                                 "Add skills to .agents/skills/ in your project to see them here.",
                             )
                         };
+                        let (ordered, groups) = grouped_skills.take().unwrap_or_default();
+                        let empty_kind = if has_filter
+                            && unfiltered_hub
+                                .as_ref()
+                                .is_some_and(|h| !h.project_skills.is_empty())
+                        {
+                            EmptyStateKind::NoFilterMatches
+                        } else {
+                            EmptyStateKind::GenuinelyEmpty
+                        };
                         pane.child(self.render_skills_master_detail(
                             "project-skills-split",
-                            &filtered_hub.project_skills,
+                            &ordered,
+                            groups,
+                            empty_kind,
                             title,
                             msg,
                             cx,
                         ))
                     })
                     .when(self.active_tab == HubTab::ProjectRules, |pane| {
+                        let empty_kind = if has_filter
+                            && unfiltered_hub
+                                .as_ref()
+                                .is_some_and(|h| !h.project_instructions.is_empty())
+                        {
+                            EmptyStateKind::NoFilterMatches
+                        } else {
+                            EmptyStateKind::GenuinelyEmpty
+                        };
                         pane.child(Self::render_rules_table(
                             &filtered_hub.project_instructions,
                             false,
                             total_projects,
+                            empty_kind,
+                            selected_item_index,
+                            &self.table_scroll_handle,
                             cx,
                         ))
                     })
                     .when(self.active_tab == HubTab::GlobalSkills, |pane| {
+                        let (ordered, groups) = grouped_skills.take().unwrap_or_default();
+                        let empty_kind = if has_filter
+                            && unfiltered_hub
+                                .as_ref()
+                                .is_some_and(|h| !h.global_skills.is_empty())
+                        {
+                            EmptyStateKind::NoFilterMatches
+                        } else {
+                            EmptyStateKind::GenuinelyEmpty
+                        };
                         pane.child(self.render_skills_master_detail(
                             "global-skills-split",
-                            &filtered_hub.global_skills,
+                            &ordered,
+                            groups,
+                            empty_kind,
                             "No Global Skills Detected",
                             "Standard paths like ~/.agents/skills or ~/.gemini/config/skills were not found.",
                             cx,
                         ))
                     })
                     .when(self.active_tab == HubTab::GlobalRules, |pane| {
+                        let empty_kind = if has_filter
+                            && unfiltered_hub
+                                .as_ref()
+                                .is_some_and(|h| !h.global_instructions.is_empty())
+                        {
+                            EmptyStateKind::NoFilterMatches
+                        } else {
+                            EmptyStateKind::GenuinelyEmpty
+                        };
                         pane.child(Self::render_rules_table(
                             &filtered_hub.global_instructions,
                             true,
                             total_projects,
+                            empty_kind,
+                            selected_item_index,
+                            &self.table_scroll_handle,
                             cx,
                         ))
                     })
                     .when(self.active_tab == HubTab::ProjectDocs, |pane| {
+                        let empty_kind = if has_filter
+                            && unfiltered_hub
+                                .as_ref()
+                                .is_some_and(|h| !h.project_docs.is_empty())
+                        {
+                            EmptyStateKind::NoFilterMatches
+                        } else {
+                            EmptyStateKind::GenuinelyEmpty
+                        };
                         pane.child(Self::render_project_docs_table(
                             &filtered_hub.project_docs,
                             total_projects,
+                            empty_kind,
+                            selected_item_index,
+                            &self.table_scroll_handle,
                             cx,
                         ))
                     }),

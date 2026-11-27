@@ -194,8 +194,13 @@ impl DiskWatcher {
         targets: &WatchTargets,
         dir_set: &WatchDirSet,
     ) -> WatchSyncOutcome {
-        {
+        let newly_covered_file_parent = {
             let mut filter = self.filter.lock().expect("watch filter lock poisoned");
+            let prev_file_parents = std::mem::take(&mut filter.file_parents);
+            let newly_covered = dir_set
+                .file_parents
+                .iter()
+                .any(|dir| !prev_file_parents.contains(dir) && self.watched_dirs.contains(dir));
             filter.open_files = expand_path_variants(&targets.open_files);
             filter.recent_files = expand_path_variants(&targets.recent_files);
             filter.file_parents.clone_from(&dir_set.file_parents);
@@ -213,9 +218,13 @@ impl DiskWatcher {
             filter
                 .external_catalog_targets
                 .clone_from(&dir_set.external_catalog_targets);
-        }
+            newly_covered
+        };
 
-        let mut outcome = WatchSyncOutcome::default();
+        let mut outcome = WatchSyncOutcome {
+            added_file_parents: newly_covered_file_parent,
+            ..WatchSyncOutcome::default()
+        };
         let Some(watcher) = self.watcher.as_mut() else {
             self.degraded = true;
             return outcome;
@@ -374,6 +383,22 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     }
                     walk_skills_container_dirs(
                         &canon_container,
+                        &mut set.catalog_dirs,
+                        &mut set.external_catalog_targets,
+                        &mut set.catalog_ancestors,
+                        &mut explored_remaining,
+                        &mut set.incomplete,
+                    );
+                }
+            }
+            let rules_dir = root.join(".claude").join("rules");
+            if rules_dir.is_dir() {
+                let canon_rules = canonical_or_owned(&rules_dir);
+                if canon_rules != rules_dir {
+                    set.skill_container_links.insert(rules_dir);
+                    walk_non_noise_dirs(
+                        &canon_rules,
+                        1,
                         &mut set.catalog_dirs,
                         &mut set.external_catalog_targets,
                         &mut set.catalog_ancestors,
@@ -664,6 +689,12 @@ fn walk_skills_container_dirs(
                 explored_remaining,
                 incomplete,
             );
+        } else if ft.is_symlink()
+            && !path.exists()
+            && let Ok(raw_target) = std::fs::read_link(&path)
+        {
+            let dest = resolve_dangling_target(container, &raw_target);
+            register_missing_ancestor(&dest, catalog_ancestors);
         }
     }
 }
@@ -759,12 +790,14 @@ fn is_catalog_relevant_path(kind: EventKind, path: &Path, filter: &ActiveWatchFi
         return true;
     }
 
-    if path.parent().is_some_and(|parent| {
-        filter
-            .external_catalog_targets
-            .get(parent)
-            .is_some_and(|targets| targets.contains(path))
-    }) {
+    if (is_dir_invalidation_event(kind) && filter.external_catalog_targets.contains_key(path))
+        || path.parent().is_some_and(|parent| {
+            filter
+                .external_catalog_targets
+                .get(parent)
+                .is_some_and(|targets| targets.contains(path))
+        })
+    {
         return true;
     }
 

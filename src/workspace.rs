@@ -843,13 +843,14 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) {
         let read_path = path.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { document::load(&read_path) });
+        let task = cx.background_executor().spawn(async move {
+            let stamp = DiskStamp::of(&read_path);
+            document::load(&read_path).map(|loaded| (loaded, stamp))
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(loaded) => {
+                Ok((loaded, stamp)) => {
                     AppSettings::update(cx, |settings| {
                         settings.push_recent(&path);
                         if let Some(layout) = this.explicit_layout {
@@ -859,10 +860,11 @@ impl Workspace {
                         }
                     });
                     let doc = cx.new(|cx| {
-                        DocumentView::new(
+                        DocumentView::new_with_disk_stamp(
                             loaded.text,
                             Some(path.clone()),
                             loaded.line_ending,
+                            stamp,
                             window,
                             cx,
                         )
@@ -878,11 +880,11 @@ impl Workspace {
                         this.replace_active(tab, window, cx);
                     } else {
                         this.add_tab(tab, TabActivation::Activate, window, cx);
+                        this.sync_disk_watcher(cx);
                     }
                     if let Some(target) = target {
                         this.reveal_target(&doc, target, window, cx);
                     }
-                    this.sync_disk_watcher(cx);
                 }
                 Err(err) => {
                     AppSettings::update(cx, |settings| {
@@ -970,29 +972,37 @@ impl Workspace {
                 return;
             };
             _ = this.update_in(cx, |this, _window, cx| {
-                for path in paths {
-                    let path = path.canonicalize().unwrap_or(path);
-                    if path.is_dir() {
-                        AppSettings::update(cx, |settings| {
-                            if !settings.project_folders.contains(&path) {
-                                settings.project_folders.push(path.clone());
-                            }
-                            settings.selected_project_filter = Some(path.clone());
-                            if !settings.recent_projects.contains(&path) {
-                                settings.recent_projects.insert(0, path.clone());
-                            }
-                            if !settings.tracked_folders.contains(&path) {
-                                settings.tracked_folders.push(path.clone());
-                            }
-                        });
-                        this.rescan_generation += 1;
-                        this.catalog.update(cx, |catalog, cx| {
-                            catalog.add_project_folder(path);
-                            cx.notify();
-                        });
-                        this.sync_disk_watcher(cx);
-                    }
+                let valid_dirs: Vec<PathBuf> = paths
+                    .into_iter()
+                    .map(|p| p.canonicalize().unwrap_or(p))
+                    .filter(|p| p.is_dir())
+                    .collect();
+                if valid_dirs.is_empty() {
+                    return;
                 }
+                let last_dir = valid_dirs.last().cloned();
+                AppSettings::update(cx, |settings| {
+                    for path in &valid_dirs {
+                        if !settings.project_folders.contains(path) {
+                            settings.project_folders.push(path.clone());
+                        }
+                        if !settings.recent_projects.contains(path) {
+                            settings.recent_projects.insert(0, path.clone());
+                        }
+                        if !settings.tracked_folders.contains(path) {
+                            settings.tracked_folders.push(path.clone());
+                        }
+                    }
+                    if let Some(last) = last_dir {
+                        settings.selected_project_filter = Some(last);
+                    }
+                });
+                this.rescan_generation += 1;
+                this.catalog.update(cx, |catalog, cx| {
+                    catalog.add_project_folders(&valid_dirs);
+                    cx.notify();
+                });
+                this.sync_disk_watcher(cx);
             });
         })
         .detach();
@@ -1011,10 +1021,21 @@ impl Workspace {
 
     fn remove_project_folder(&mut self, path: &Path, cx: &mut Context<'_, Self>) {
         let path = path.to_path_buf();
+        let canon = path.canonicalize().ok();
+        let matches = |p: &PathBuf| {
+            p == &path
+                || canon.as_ref().is_some_and(|c| p == c)
+                || p.canonicalize()
+                    .is_ok_and(|pc| pc == path || canon.as_ref().is_some_and(|c| &pc == c))
+        };
         AppSettings::update(cx, |settings| {
-            settings.project_folders.retain(|p| p != &path);
-            settings.recent_projects.retain(|p| p != &path);
-            if settings.selected_project_filter.as_ref() == Some(&path) {
+            settings.project_folders.retain(|p| !matches(p));
+            settings.recent_projects.retain(|p| !matches(p));
+            if settings
+                .selected_project_filter
+                .as_ref()
+                .is_some_and(matches)
+            {
                 settings.selected_project_filter = None;
             }
         });
@@ -1096,6 +1117,13 @@ impl Workspace {
                         snapshot.project_folders.extend(existing_roots);
                         followup = true;
                     }
+                    let prev_warnings = this.catalog.read(cx).scan_warnings.clone();
+                    let new_warnings: Vec<String> = snapshot
+                        .scan_warnings
+                        .iter()
+                        .filter(|w| !prev_warnings.contains(w))
+                        .cloned()
+                        .collect();
                     AppSettings::update(cx, |settings| {
                         settings.prune_missing_with_projects(&snapshot.project_folders);
                     });
@@ -1103,6 +1131,10 @@ impl Workspace {
                         catalog.apply_snapshot(snapshot);
                         cx.notify();
                     });
+                    if !new_warnings.is_empty() {
+                        window
+                            .push_notification(Notification::warning(new_warnings.join("\n")), cx);
+                    }
                     this.sync_disk_watcher(cx);
                 }
                 if followup {
@@ -1300,6 +1332,11 @@ impl Workspace {
         if retry_sync == SyncRetry::Retry || uncovered_recent_pruned {
             self.sync_disk_watcher(cx);
         }
+        if retry_sync == SyncRetry::Retry
+            && (!self.catalog.read(cx).project_folders().is_empty() || !cfg!(test))
+        {
+            self.rescan_catalog(window, cx);
+        }
     }
 
     fn apply_watch_dispatch(
@@ -1481,23 +1518,116 @@ impl Workspace {
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;
-            let mut needs_retry = false;
+            let mut retry_targets: Vec<(EntityId, PathBuf)> = Vec::new();
             _ = this.update_in(cx, |this, window, cx| {
                 for checked in changes {
                     if matches!(checked.outcome, DiskReadOutcome::Retry) {
-                        needs_retry = true;
+                        retry_targets.push((checked.id, checked.expected_path));
                     } else {
                         this.apply_disk_change(checked, window, cx);
                     }
                 }
             });
-            if needs_retry && retry_attempt < 2 {
-                let delay = Duration::from_millis(100 * u64::from(retry_attempt + 1));
-                cx.background_executor().timer(delay).await;
-                _ = this.update_in(cx, |this, window, cx| {
-                    this.check_disk_with_retry(retry_attempt + 1, window, cx);
-                });
+            if !retry_targets.is_empty() {
+                if retry_attempt < 2 {
+                    let delay = Duration::from_millis(100 * u64::from(retry_attempt + 1));
+                    cx.background_executor().timer(delay).await;
+                    _ = this.update_in(cx, |this, window, cx| {
+                        this.check_disk_with_retry(retry_attempt + 1, window, cx);
+                    });
+                } else {
+                    _ = this.update_in(cx, |_, window, cx| {
+                        for (id, path) in retry_targets {
+                            Self::schedule_slow_disk_retry(id, path, 0, window, cx);
+                        }
+                    });
+                }
             }
+        })
+        .detach();
+    }
+
+    fn schedule_slow_disk_retry(
+        id: EntityId,
+        expected_path: PathBuf,
+        backoff_step: u8,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let secs = match backoff_step {
+            0 => 1,
+            1 => 2,
+            _ => 5,
+        };
+        let delay = Duration::from_secs(secs);
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let target = this
+                .read_with(cx, |this, cx| {
+                    let doc = this.tab_index(id).and_then(|ix| match &this.tabs[ix] {
+                        WorkspaceTab::Document(doc) => Some(doc.clone()),
+                        WorkspaceTab::NewTab(_) => None,
+                    })?;
+                    let doc_ref = doc.read(cx);
+                    if doc_ref.path() != Some(&expected_path)
+                        || this.pending_disk_prompt.contains(&id)
+                    {
+                        return None;
+                    }
+                    Some((
+                        expected_path.clone(),
+                        doc_ref.disk_stamp(),
+                        doc_ref.saved_hash(),
+                    ))
+                })
+                .ok()
+                .flatten();
+            let Some((path, known, saved_hash)) = target else {
+                return;
+            };
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { read_validated_disk_change(&path, known, saved_hash) })
+                .await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let still_same = this
+                    .tab_index(id)
+                    .and_then(|ix| match &this.tabs[ix] {
+                        WorkspaceTab::Document(doc) => {
+                            Some(doc.read(cx).path() == Some(&expected_path))
+                        }
+                        WorkspaceTab::NewTab(_) => None,
+                    })
+                    .unwrap_or(false);
+                if !still_same {
+                    return;
+                }
+                match outcome {
+                    DiskReadOutcome::Retry => {
+                        Self::schedule_slow_disk_retry(
+                            id,
+                            expected_path,
+                            backoff_step.saturating_add(1),
+                            window,
+                            cx,
+                        );
+                    }
+                    DiskReadOutcome::NoChange => {}
+                    DiskReadOutcome::Change(_) => {
+                        this.apply_disk_change(
+                            CheckedDiskChange {
+                                id,
+                                expected_path,
+                                expected_known: known,
+                                expected_saved_hash: saved_hash,
+                                outcome,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -1545,16 +1675,19 @@ impl Workspace {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
                 if crate::settings::path_exists_as_file_or_unconfirmed(&expected_path) {
+                    self.deferred_disk_docs.insert(id);
+                    cx.notify();
                     return;
                 }
-                if let Some(missing_path) = doc.read(cx).path().cloned()
-                    && !crate::settings::path_exists_as_file_or_unconfirmed(&missing_path)
-                {
-                    AppSettings::update(cx, |settings| {
-                        settings
-                            .recent_files
-                            .retain(|recent| recent != &missing_path);
-                    });
+                let mut recent_changed = false;
+                AppSettings::update(cx, |settings| {
+                    let prev = settings.recent_files.len();
+                    settings
+                        .recent_files
+                        .retain(|recent| recent != &expected_path);
+                    recent_changed = settings.recent_files.len() != prev;
+                });
+                if recent_changed {
                     self.sync_disk_watcher(cx);
                 }
                 doc.update(cx, DocumentView::mark_missing);
@@ -3442,7 +3575,18 @@ mod tests {
 
     #[gpui_kit::test]
     fn placement_new_tab_retains_home_tab(cx: &mut gpui_kit::TestAppContext) {
-        let (workspace, _) = cx.add_window_view(|window, cx| {
+        let config_dir = TestConfigDir::new("placement_new_tab");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let doc_path = std::env::temp_dir().join(format!(
+            "downmark_placement_new_tab_{}_{nanos}.md",
+            std::process::id()
+        ));
+        std::fs::write(&doc_path, "# Opened in new tab\n").unwrap();
+        let canon_doc = doc_path.canonicalize().unwrap();
+
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
                 tabs: true,
@@ -3451,11 +3595,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let ws = Workspace::new(
+            let ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
@@ -3464,18 +3609,21 @@ mod tests {
             ws
         });
 
-        workspace.update(cx, |ws, cx| {
-            let active = ws.active_tab();
-            let replace = match Placement::NewTab {
-                Placement::NewTab => false,
-                Placement::ReplaceActive => true,
-                Placement::Default => active.is_blank(cx) || !AppSettings::get(cx).tabs,
-            };
-            assert!(
-                !replace,
-                "Placement::NewTab must never replace active blank/Home tab"
-            );
+        cx_window.update(|window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.load_path(canon_doc.clone(), Placement::NewTab, None, window, cx);
+            });
         });
+        cx_window.run_until_parked();
+
+        workspace.read_with(cx_window, |ws, cx| {
+            assert_eq!(ws.tabs.len(), 2);
+            assert!(matches!(ws.tabs[0], WorkspaceTab::NewTab(_)));
+            assert!(matches!(ws.tabs[1], WorkspaceTab::Document(_)));
+            assert_eq!(ws.tabs[1].path(cx), Some(&canon_doc));
+        });
+
+        let _ = std::fs::remove_file(&doc_path);
     }
 
     #[gpui_kit::test]
@@ -4633,6 +4781,7 @@ mod tests {
         let canon_gone = recent_deleted.canonicalize().unwrap();
         let canon_proj = proj.canonicalize().unwrap();
 
+        let config_dir = TestConfigDir::new("rescan_catalog_prunes");
         let (workspace, cx_window) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);
             let settings = crate::settings::Settings {
@@ -4645,11 +4794,12 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            Workspace::new(
+            Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             )
@@ -4694,6 +4844,7 @@ mod tests {
         std::fs::write(&file_path, "# Before\n").unwrap();
         let canon_file = file_path.canonicalize().unwrap();
 
+        let config_dir = TestConfigDir::new("stale_disk_change");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -4706,7 +4857,7 @@ mod tests {
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                 let app_menu_bar = AppMenuBar::new(cx);
                 let entity = cx.new(|cx| {
-                    Workspace::new(
+                    Workspace::new_with_config_dir(
                         vec![FileTarget {
                             path: canon_file.clone(),
                             target: None,
@@ -4714,6 +4865,7 @@ mod tests {
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     )
@@ -4798,6 +4950,7 @@ mod tests {
         std::fs::write(&gone, "# Gone\n").unwrap();
         let canon_gone = gone.canonicalize().unwrap();
 
+        let config_dir = TestConfigDir::new("watch_dispatch_prunes_recent");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -4811,11 +4964,12 @@ mod tests {
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                 let app_menu_bar = AppMenuBar::new(cx);
                 let entity = cx.new(|cx| {
-                    Workspace::new(
+                    Workspace::new_with_config_dir(
                         Vec::new(),
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     )
@@ -4871,6 +5025,7 @@ mod tests {
         std::fs::write(&file_path, "# Before\n").unwrap();
         let canon_file = file_path.canonicalize().unwrap();
 
+        let config_dir = TestConfigDir::new("stale_disk_change");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -4883,7 +5038,7 @@ mod tests {
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                 let app_menu_bar = AppMenuBar::new(cx);
                 let entity = cx.new(|cx| {
-                    Workspace::new(
+                    Workspace::new_with_config_dir(
                         vec![FileTarget {
                             path: canon_file.clone(),
                             target: None,
@@ -4891,6 +5046,7 @@ mod tests {
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     )
@@ -4959,6 +5115,7 @@ mod tests {
         std::fs::write(&file_path, "# Live\n").unwrap();
         let canon_file = file_path.canonicalize().unwrap();
 
+        let config_dir = TestConfigDir::new("unconfirmed_metadata_error");
         cx.update(gpui_kit::init);
         let mut ws_entity = None;
         let (window_handle, _) = cx.update(|cx| {
@@ -4972,7 +5129,7 @@ mod tests {
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                 let app_menu_bar = AppMenuBar::new(cx);
                 let entity = cx.new(|cx| {
-                    Workspace::new(
+                    Workspace::new_with_config_dir(
                         vec![FileTarget {
                             path: canon_file.clone(),
                             target: None,
@@ -4980,6 +5137,7 @@ mod tests {
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     )

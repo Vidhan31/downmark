@@ -183,7 +183,6 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = true
-panic = "abort"
 
 # Profiling / Release-with-Debug:
 # Inherits release optimizations, but preserves full debug symbols and prevents
