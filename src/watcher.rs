@@ -526,10 +526,12 @@ fn resolve_dangling_target_inner(
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !cur.pop() {
+                if !resolve_existing {
+                    cur.push(comp.as_os_str());
+                } else if !cur.pop() {
                     cur.push(comp.as_os_str());
                     resolve_existing = false;
-                } else if resolve_existing {
+                } else {
                     cur = canonical_or_owned(&cur);
                 }
             }
@@ -1242,6 +1244,41 @@ mod tests {
                 .get(&canon_proj)
                 .is_some_and(|targets| targets.contains(&canon_proj.join("missing_sub/ghost.md"))),
             "must not resolve symlink + .. lexically under proj/"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_with_missing_prefix_before_parent_dir_keeps_unresolved_component() {
+        let root = unique_temp_dir("dangling_sym_missing_dotdot");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        let external = root.join("external");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&external).unwrap();
+
+        let canon_external = external.canonicalize().unwrap();
+        std::os::unix::fs::symlink(
+            canon_external.join("missing/../ghost.md"),
+            proj.join("guide.md"),
+        )
+        .unwrap();
+
+        let targets = WatchTargets {
+            open_files: Vec::new(),
+            recent_files: Vec::new(),
+            project_folders: vec![proj],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+
+        assert!(
+            dirs.catalog_ancestors.get(&canon_external).is_some_and(
+                |targets| targets.contains(&canon_external.join("missing/../ghost.md"))
+            ),
+            "expected catalog ancestor to preserve missing/../ghost.md"
         );
 
         let _ = fs::remove_dir_all(&root);
