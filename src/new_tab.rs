@@ -1592,6 +1592,7 @@ impl Render for NewTabView {
         };
 
         let nav_count = active_tab_paths.len();
+        self.selected_item_index = self.selected_item_index.min(nav_count.saturating_sub(1));
 
         v_flex()
             .id("new-tab-page")
