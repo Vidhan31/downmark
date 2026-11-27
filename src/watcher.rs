@@ -391,21 +391,18 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     );
                 }
             }
-            let rules_dir = root.join(".claude").join("rules");
-            if rules_dir.is_dir() {
-                let canon_rules = canonical_or_owned(&rules_dir);
-                if canon_rules != rules_dir {
-                    set.skill_container_links.insert(rules_dir);
-                    walk_non_noise_dirs(
-                        &canon_rules,
-                        1,
-                        &mut set.catalog_dirs,
-                        &mut set.external_catalog_targets,
-                        &mut set.catalog_ancestors,
-                        &mut explored_remaining,
-                        &mut set.incomplete,
-                    );
-                }
+            let rules_dirs = [
+                (root.join(".claude").join("rules"), 1),
+                (root.join(".github").join("instructions"), 4),
+            ];
+            for (rules_dir, max_depth) in rules_dirs {
+                register_project_rule_dir(
+                    &root,
+                    &rules_dir,
+                    max_depth,
+                    &mut set,
+                    &mut explored_remaining,
+                );
             }
             register_missing_ancestor(&root, &mut set.catalog_ancestors);
             if project != &root {
@@ -455,6 +452,38 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
     }
 
     set
+}
+
+fn register_project_rule_dir(
+    project_root: &Path,
+    rules_dir: &Path,
+    max_depth: usize,
+    set: &mut WatchDirSet,
+    explored_remaining: &mut HashMap<PathBuf, usize>,
+) {
+    if rules_dir.is_dir() {
+        let canon_rules = canonical_or_owned(rules_dir);
+        if canon_rules != rules_dir {
+            set.skill_container_links.insert(rules_dir.to_path_buf());
+            walk_non_noise_dirs(
+                &canon_rules,
+                max_depth,
+                &mut set.catalog_dirs,
+                &mut set.external_catalog_targets,
+                &mut set.catalog_ancestors,
+                explored_remaining,
+                &mut set.incomplete,
+            );
+        }
+    } else if std::fs::symlink_metadata(rules_dir).is_ok_and(|meta| meta.file_type().is_symlink())
+        && !rules_dir.exists()
+        && let Ok(raw_target) = std::fs::read_link(rules_dir)
+    {
+        let parent = rules_dir.parent().unwrap_or(project_root);
+        let dest = resolve_dangling_target(parent, &raw_target);
+        register_missing_ancestor(&dest, &mut set.catalog_ancestors);
+        set.skill_container_links.insert(rules_dir.to_path_buf());
+    }
 }
 
 fn insert_parent_dir(
@@ -1312,6 +1341,45 @@ mod tests {
                 |targets| targets.contains(&canon_external.join("missing/../ghost.md"))
             ),
             "expected catalog ancestor to preserve missing/../ghost.md"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_watch_dirs_handles_symlinked_instructions_and_dangling_rules_dir() {
+        let root = unique_temp_dir("rules_dirs_symlinks");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        let ext_inst = root.join("ext_instructions");
+        let ext_missing_rules = root.join("ext_missing_rules");
+        fs::create_dir_all(proj.join(".github")).unwrap();
+        fs::create_dir_all(proj.join(".claude")).unwrap();
+        fs::create_dir_all(&ext_inst).unwrap();
+
+        std::os::unix::fs::symlink(&ext_inst, proj.join(".github/instructions")).unwrap();
+        std::os::unix::fs::symlink(&ext_missing_rules, proj.join(".claude/rules")).unwrap();
+
+        let targets = WatchTargets {
+            open_files: Vec::new(),
+            recent_files: Vec::new(),
+            project_folders: vec![proj],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+
+        let canon_ext_inst = ext_inst.canonicalize().unwrap();
+        let canon_root = root.canonicalize().unwrap();
+        assert!(
+            dirs.catalog_dirs.contains(&canon_ext_inst),
+            "expected symlinked .github/instructions target to be watched"
+        );
+        assert!(
+            dirs.catalog_ancestors
+                .get(&canon_root)
+                .is_some_and(|targets| targets.contains(&canon_root.join("ext_missing_rules"))),
+            "expected dangling .claude/rules target ancestor to be registered"
         );
 
         let _ = fs::remove_dir_all(&root);

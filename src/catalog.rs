@@ -1,9 +1,12 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     time::SystemTime,
 };
+
+const MAX_SKILL_METADATA_BYTES: usize = 64 * 1024;
 
 /// Represents a discovered Markdown file inside a tracked folder or skill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,55 +390,147 @@ fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.chars().map(|c| c.to_ascii_lowercase()))
 }
 
+fn read_bounded_utf8_prefix(path: &Path, max_bytes: usize) -> Option<(String, bool)> {
+    let file = fs::File::open(path).ok()?;
+    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let mut buf = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
+    let truncated = buf.len() > max_bytes;
+    if truncated {
+        buf.truncate(max_bytes);
+    }
+    let text = match std::str::from_utf8(&buf) {
+        Ok(s) => s.to_string(),
+        Err(err) => std::str::from_utf8(&buf[..err.valid_up_to()])
+            .unwrap_or("")
+            .to_string(),
+    };
+    Some((text, truncated))
+}
+
+fn split_closing_frontmatter(after_open: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = after_open
+        .strip_prefix("---\n")
+        .or_else(|| after_open.strip_prefix("---\r\n"))
+    {
+        return Some(("", rest));
+    }
+    if after_open == "---" {
+        return Some(("", ""));
+    }
+    let mut search_from = 0;
+    while let Some(rel_idx) = after_open[search_from..].find("\n---") {
+        let idx = search_from + rel_idx;
+        let after_delim = &after_open[idx + "\n---".len()..];
+        if after_delim.is_empty()
+            || after_delim.starts_with('\n')
+            || after_delim.starts_with("\r\n")
+        {
+            let body = after_delim
+                .strip_prefix("\r\n")
+                .or_else(|| after_delim.strip_prefix('\n'))
+                .unwrap_or("");
+            return Some((&after_open[..idx], body));
+        }
+        search_from = idx + "\n---".len();
+    }
+    None
+}
+
+fn is_yaml_key_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || line.starts_with(' ')
+        || line.starts_with('\t')
+    {
+        return false;
+    }
+    let Some((key, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !key.is_empty() && !key.chars().any(char::is_whitespace)
+}
+
+fn looks_like_frontmatter(frontmatter: &str) -> bool {
+    let mut saw_key = false;
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if is_yaml_key_line(line) {
+            saw_key = true;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if saw_key {
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    saw_key || frontmatter.trim().is_empty()
+}
+
 /// Parses name and description metadata from a `SKILL.md` file.
 pub(crate) fn parse_skill_metadata(skill_file_path: &Path, default_name: &str) -> (String, String) {
     let mut name = default_name.to_string();
     let mut name_from_frontmatter = false;
     let mut description = String::new();
 
-    let Ok(content) = fs::read_to_string(skill_file_path) else {
+    let Some((content, truncated)) =
+        read_bounded_utf8_prefix(skill_file_path, MAX_SKILL_METADATA_BYTES)
+    else {
         return (name, description);
     };
 
     let mut body = content.as_str();
     let trimmed = content.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("---")
-        && let Some(end_idx) = rest.find("\n---")
+    if let Some(rest) = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
     {
-        let after_delim = &rest[end_idx + "\n---".len()..];
-        body = after_delim.split_once('\n').map_or("", |(_, after)| after);
-        let frontmatter = &rest[..end_idx];
-        let mut current_key = "";
-        let mut desc_lines = Vec::new();
+        if let Some((frontmatter, after_close)) = split_closing_frontmatter(rest) {
+            if looks_like_frontmatter(frontmatter) {
+                body = after_close;
+                let mut current_key = "";
+                let mut desc_lines = Vec::new();
 
-        for line in frontmatter.lines() {
-            let trimmed_line = line.trim();
-            if let Some(val) = trimmed_line.strip_prefix("name:") {
-                current_key = "name";
-                let val = val.trim().trim_matches('"').trim_matches('\'');
-                if !val.is_empty() {
-                    name = val.to_string();
-                    name_from_frontmatter = true;
+                for line in frontmatter.lines() {
+                    let trimmed_line = line.trim();
+                    if let Some(val) = trimmed_line.strip_prefix("name:") {
+                        current_key = "name";
+                        let val = val.trim().trim_matches('"').trim_matches('\'');
+                        if !val.is_empty() {
+                            name = val.to_string();
+                            name_from_frontmatter = true;
+                        }
+                    } else if let Some(val) = trimmed_line.strip_prefix("description:") {
+                        current_key = "description";
+                        let val = val.trim().trim_matches('"').trim_matches('\'');
+                        if val != ">-" && val != "|" && !val.is_empty() {
+                            desc_lines.push(val.to_string());
+                        }
+                    } else if current_key == "description" {
+                        if trimmed_line.starts_with("---") || is_yaml_key_line(line) {
+                            current_key = "";
+                        } else if !trimmed_line.is_empty() {
+                            desc_lines.push(trimmed_line.to_string());
+                        }
+                    }
                 }
-            } else if let Some(val) = trimmed_line.strip_prefix("description:") {
-                current_key = "description";
-                let val = val.trim().trim_matches('"').trim_matches('\'');
-                if val != ">-" && val != "|" && !val.is_empty() {
-                    desc_lines.push(val.to_string());
-                }
-            } else if current_key == "description" {
-                if trimmed_line.starts_with("---")
-                    || (line.contains(':') && !line.starts_with(' ') && !line.starts_with('\t'))
-                {
-                    current_key = "";
-                } else if !trimmed_line.is_empty() {
-                    desc_lines.push(trimmed_line.to_string());
+
+                if !desc_lines.is_empty() {
+                    description = desc_lines.join(" ");
                 }
             }
-        }
-
-        if !desc_lines.is_empty() {
-            description = desc_lines.join(" ");
+        } else if truncated {
+            // Unclosed frontmatter exceeded the bounded prefix; fall back to defaults.
+            return (name, description);
         }
     }
 
@@ -1188,8 +1283,14 @@ impl FolderCatalog {
         ];
 
         for project in project_folders {
-            if !project.is_dir() {
-                continue;
+            match fs::metadata(project) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => continue,
+                Err(err) if crate::settings::is_confirmed_absent(&err) => continue,
+                Err(err) => {
+                    warnings.push(format!("Could not inspect {}: {err}", project.display()));
+                    continue;
+                }
             }
 
             let project_name = project
@@ -1200,6 +1301,7 @@ impl FolderCatalog {
 
             let mut seen_inst = HashSet::new();
             let mut project_claimed_paths = HashSet::new();
+            let mut skill_package_roots = Vec::new();
 
             // 1. Project Instruction Files
             for &rel in SPECIAL_RULE_FILENAMES
@@ -1244,8 +1346,14 @@ impl FolderCatalog {
             ];
             for (rel_dir, label, pattern, max_depth) in rule_dirs {
                 let dir = project.join(rel_dir);
-                if !dir.is_dir() {
-                    continue;
+                match fs::metadata(&dir) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(err) if crate::settings::is_confirmed_absent(&err) => continue,
+                    Err(err) => {
+                        warnings.push(format!("Could not inspect {}: {err}", dir.display()));
+                        continue;
+                    }
                 }
                 let mut stack = vec![(dir, 0_usize)];
                 while let Some((cur, depth)) = stack.pop() {
@@ -1301,48 +1409,56 @@ impl FolderCatalog {
             let mut seen_skills = HashSet::new();
             for (rel, label) in &candidate_skill_containers {
                 let path = project.join(rel);
-                if path.is_dir() {
-                    let source = format!("{project_name} · {label}");
-                    let discovered = scan_skills_container_with_warnings(
-                        &path,
-                        &source,
-                        false,
-                        &mut seen_skills,
-                        Some(project_name.clone()),
-                        Some(project.clone()),
-                        warnings,
-                    );
-                    for skill in &discovered {
-                        if let Ok(c) = skill.skill_file.full_path.canonicalize() {
+                match fs::metadata(&path) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(err) if crate::settings::is_confirmed_absent(&err) => continue,
+                    Err(err) => {
+                        warnings.push(format!("Could not inspect {}: {err}", path.display()));
+                        continue;
+                    }
+                }
+                let source = format!("{project_name} · {label}");
+                let discovered = scan_skills_container_with_warnings(
+                    &path,
+                    &source,
+                    false,
+                    &mut seen_skills,
+                    Some(project_name.clone()),
+                    Some(project.clone()),
+                    warnings,
+                );
+                for skill in &discovered {
+                    if let Some(pkg_root) = skill.skill_file.full_path.parent() {
+                        let canon_root = pkg_root
+                            .canonicalize()
+                            .unwrap_or_else(|_| pkg_root.to_path_buf());
+                        skill_package_roots.push(canon_root);
+                    }
+                    if let Ok(c) = skill.skill_file.full_path.canonicalize() {
+                        project_claimed_paths.insert(c);
+                    }
+                    for comp in &skill.companion_files {
+                        if let Ok(c) = comp.full_path.canonicalize() {
                             project_claimed_paths.insert(c);
                         }
-                        for comp in &skill.companion_files {
-                            if let Ok(c) = comp.full_path.canonicalize() {
-                                project_claimed_paths.insert(c);
-                            }
-                        }
                     }
-                    all_skills.extend(discovered);
                 }
+                all_skills.extend(discovered);
             }
 
             // 3. Project Documentation (all other Markdown files)
             let scanned_group = Self::scan_folder_with_warnings(project, warnings);
 
             for file in &scanned_group.files {
-                let is_under_skill_root = PROJECT_SKILL_CONTAINER_RELS.iter().any(|rel| {
-                    file.relative_path
-                        .strip_prefix(rel)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                });
-                if is_under_skill_root {
-                    continue;
-                }
                 let canonical = file
                     .full_path
                     .canonicalize()
                     .unwrap_or_else(|_| file.full_path.clone());
-                if !project_claimed_paths.contains(&canonical) {
+                let under_skill_package = skill_package_roots
+                    .iter()
+                    .any(|pkg_root| canonical.starts_with(pkg_root));
+                if !under_skill_package && !project_claimed_paths.contains(&canonical) {
                     all_docs.push(ProjectDocEntry {
                         file: file.clone(),
                         project_name: Some(project_name.clone()),
@@ -2080,6 +2196,84 @@ mod tests {
         catalog.set_selected_project_filter(Some(proj_b.clone()));
         catalog.apply_snapshot(snapshot);
         assert_eq!(catalog.selected_project_filter(), Some(&proj_b));
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn test_parse_skill_metadata_bounded_and_thematic_breaks() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base_dir = std::env::temp_dir().join(format!(
+            "downmark_test_skill_meta_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir);
+        fs::create_dir_all(&base_dir).unwrap();
+
+        // 1. Two thematic breaks without frontmatter should preserve the first paragraph.
+        let thematic_path = base_dir.join("thematic.md");
+        fs::write(
+            &thematic_path,
+            "---\n\nFirst paragraph between breaks.\n\n---\n\nSecond paragraph.\n",
+        )
+        .unwrap();
+        let (name, desc) = parse_skill_metadata(&thematic_path, "fallback");
+        assert_eq!(name, "fallback");
+        assert_eq!(desc, "First paragraph between breaks.");
+
+        // 2. Valid frontmatter with name only falls back to body for description.
+        let name_only_path = base_dir.join("name_only.md");
+        fs::write(
+            &name_only_path,
+            "---\nname: custom-skill\n---\n\nBody description here.\n",
+        )
+        .unwrap();
+        let (name, desc) = parse_skill_metadata(&name_only_path, "fallback");
+        assert_eq!(name, "custom-skill");
+        assert_eq!(desc, "Body description here.");
+
+        // 3. Large file with unclosed frontmatter exceeding bounded prefix returns defaults.
+        let huge_unclosed_path = base_dir.join("huge_unclosed.md");
+        let mut huge = String::from("---\nname: huge\ndescription: >-\n");
+        huge.push_str(&"  line of frontmatter\n".repeat(5000));
+        fs::write(&huge_unclosed_path, huge).unwrap();
+        let (name, desc) = parse_skill_metadata(&huge_unclosed_path, "fallback");
+        assert_eq!(name, "fallback");
+        assert_eq!(desc, "");
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn test_scan_project_preserves_unclaimed_markdown_under_skills_container() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base_dir = std::env::temp_dir().join(format!(
+            "downmark_test_unclaimed_skills_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir);
+        let proj = base_dir.join("proj");
+        let skill_pkg = proj.join("skills/my-skill");
+        fs::create_dir_all(&skill_pkg).unwrap();
+        fs::write(proj.join("skills/README.md"), "# Skills Overview\n").unwrap();
+        fs::write(
+            skill_pkg.join("SKILL.md"),
+            "---\nname: my-skill\n---\nBody\n",
+        )
+        .unwrap();
+        fs::write(skill_pkg.join("ref.md"), "# Ref\n").unwrap();
+
+        let snapshot = FolderCatalog::scan_snapshot(vec![proj]);
+        assert_eq!(snapshot.project_skills.len(), 1);
+        assert_eq!(snapshot.project_docs.len(), 1);
+        assert_eq!(
+            snapshot.project_docs[0].file.relative_path,
+            "skills/README.md"
+        );
 
         let _ = fs::remove_dir_all(&base_dir);
     }

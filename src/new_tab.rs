@@ -160,12 +160,128 @@ fn abbreviate_home_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+
+    fn indicator(self) -> &'static str {
+        match self {
+            Self::Asc => " ↑",
+            Self::Desc => " ↓",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulesSortColumn {
+    Source,
+    Name,
+    Path,
+    Modified,
+    Size,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocsSortColumn {
+    Name,
+    Path,
+    Modified,
+    Size,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RulesScope {
+    Project,
+    Global,
+}
+
+fn sort_rules(
+    rules: &mut [InstructionEntry],
+    scope: RulesScope,
+    sort: Option<(RulesSortColumn, SortDirection)>,
+) {
+    let Some((col, dir)) = sort else {
+        return;
+    };
+    rules.sort_by(|a, b| {
+        let ord = match col {
+            RulesSortColumn::Source => a
+                .agent_source
+                .to_ascii_lowercase()
+                .cmp(&b.agent_source.to_ascii_lowercase()),
+            RulesSortColumn::Name => a
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
+            RulesSortColumn::Path => {
+                let pa = match scope {
+                    RulesScope::Global => abbreviate_home_path(&a.file.full_path),
+                    RulesScope::Project => a.file.relative_path.clone(),
+                };
+                let pb = match scope {
+                    RulesScope::Global => abbreviate_home_path(&b.file.full_path),
+                    RulesScope::Project => b.file.relative_path.clone(),
+                };
+                pa.to_ascii_lowercase().cmp(&pb.to_ascii_lowercase())
+            }
+            RulesSortColumn::Modified => a.file.modified.cmp(&b.file.modified),
+            RulesSortColumn::Size => a.file.file_size.cmp(&b.file.file_size),
+        };
+        let ord = if dir == SortDirection::Desc {
+            ord.reverse()
+        } else {
+            ord
+        };
+        ord.then_with(|| a.file.full_path.cmp(&b.file.full_path))
+    });
+}
+
+fn sort_docs(docs: &mut [ProjectDocEntry], sort: Option<(DocsSortColumn, SortDirection)>) {
+    let Some((col, dir)) = sort else {
+        return;
+    };
+    docs.sort_by(|a, b| {
+        let ord = match col {
+            DocsSortColumn::Name => a
+                .file
+                .file_name
+                .to_ascii_lowercase()
+                .cmp(&b.file.file_name.to_ascii_lowercase()),
+            DocsSortColumn::Path => a
+                .file
+                .relative_path
+                .to_ascii_lowercase()
+                .cmp(&b.file.relative_path.to_ascii_lowercase()),
+            DocsSortColumn::Modified => a.file.modified.cmp(&b.file.modified),
+            DocsSortColumn::Size => a.file.file_size.cmp(&b.file.file_size),
+        };
+        let ord = if dir == SortDirection::Desc {
+            ord.reverse()
+        } else {
+            ord
+        };
+        ord.then_with(|| a.file.full_path.cmp(&b.file.full_path))
+    });
+}
+
 pub(crate) struct NewTabView {
     catalog: Entity<FolderCatalog>,
     filter_input: Entity<InputState>,
     filter_query: String,
     active_tab: HubTab,
     selected_item_index: usize,
+    rules_sort: Option<(RulesSortColumn, SortDirection)>,
+    docs_sort: Option<(DocsSortColumn, SortDirection)>,
     table_scroll_handle: ScrollHandle,
     show_project_manager: bool,
     _subscriptions: Vec<Subscription>,
@@ -215,6 +331,8 @@ impl NewTabView {
             filter_query: String::new(),
             active_tab,
             selected_item_index: 0,
+            rules_sort: None,
+            docs_sort: None,
             table_scroll_handle: ScrollHandle::new(),
             show_project_manager: false,
             _subscriptions: subscriptions,
@@ -1142,18 +1260,21 @@ impl NewTabView {
     /// Renders a full-width high-density table for Rules (both Global and Project).
     #[expect(
         clippy::fn_params_excessive_bools,
-        reason = "Global vs Project rule rendering flag"
+        clippy::too_many_lines,
+        reason = "Global vs Project rule rendering flag and declarative GPUI table layout"
     )]
     fn render_rules_table(
+        &self,
         rules: &[InstructionEntry],
         is_global: bool,
         total_projects: usize,
         empty_kind: EmptyStateKind,
-        selected_idx: usize,
-        scroll_handle: &ScrollHandle,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let selected_idx = self.selected_item_index;
+        let sort = self.rules_sort;
+        let scroll_handle = &self.table_scroll_handle;
         if rules.is_empty() {
             if empty_kind == EmptyStateKind::NoFilterMatches {
                 return Self::render_no_filter_matches_state(IconName::Bot, cx);
@@ -1177,6 +1298,32 @@ impl NewTabView {
             return Self::render_empty_state(IconName::Bot, title, msg, cx);
         }
 
+        let header_cell = |id: &'static str, label: String, col: RulesSortColumn| {
+            let suffix = sort
+                .filter(|(c, _)| *c == col)
+                .map_or("", |(_, d)| d.indicator());
+            div()
+                .id(id)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(if sort.is_some_and(|(c, _)| c == col) {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .cursor_pointer()
+                .hover(|h| h.text_color(theme.foreground))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.rules_sort = Some(match this.rules_sort {
+                        Some((c, d)) if c == col => (col, d.toggled()),
+                        _ => (col, SortDirection::Asc),
+                    });
+                    this.selected_item_index = 0;
+                    cx.notify();
+                }))
+                .child(format!("{label}{suffix}"))
+        };
+
         v_flex()
             .size_full()
             .child(
@@ -1188,52 +1335,48 @@ impl NewTabView {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        div()
-                            .w(px(220.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child(if is_global {
-                                "AGENT / PROVIDER"
+                        header_cell(
+                            "rules-sort-source",
+                            if is_global {
+                                "AGENT / PROVIDER".to_string()
                             } else {
-                                "PROJECT"
-                            }),
+                                "PROJECT".to_string()
+                            },
+                            RulesSortColumn::Source,
+                        )
+                        .w(px(220.))
+                        .flex_none(),
                     )
                     .child(
-                        div()
-                            .w(px(160.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("RULE FILE"),
+                        header_cell(
+                            "rules-sort-name",
+                            "RULE FILE".to_string(),
+                            RulesSortColumn::Name,
+                        )
+                        .w(px(160.))
+                        .flex_none(),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("FILE PATH"),
+                        header_cell(
+                            "rules-sort-path",
+                            "FILE PATH".to_string(),
+                            RulesSortColumn::Path,
+                        )
+                        .flex_1(),
                     )
                     .child(
-                        div()
-                            .w(px(110.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("MODIFIED"),
+                        header_cell(
+                            "rules-sort-modified",
+                            "MODIFIED".to_string(),
+                            RulesSortColumn::Modified,
+                        )
+                        .w(px(110.))
+                        .flex_none(),
                     )
                     .child(
-                        div()
+                        header_cell("rules-sort-size", "SIZE".to_string(), RulesSortColumn::Size)
                             .w(px(80.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("SIZE"),
+                            .flex_none(),
                     )
                     .child(div().w(px(70.)).flex_none()),
             )
@@ -1505,6 +1648,7 @@ impl NewTabView {
         total_projects: usize,
         empty_kind: EmptyStateKind,
         selected_idx: usize,
+        sort: Option<(DocsSortColumn, SortDirection)>,
         scroll_handle: &ScrollHandle,
         cx: &Context<'_, Self>,
     ) -> impl IntoElement {
@@ -1527,6 +1671,32 @@ impl NewTabView {
             return Self::render_empty_state(IconName::BookOpen, title, msg, cx);
         }
 
+        let header_cell = |id: &'static str, label: &'static str, col: DocsSortColumn| {
+            let suffix = sort
+                .filter(|(c, _)| *c == col)
+                .map_or("", |(_, d)| d.indicator());
+            div()
+                .id(id)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(if sort.is_some_and(|(c, _)| c == col) {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .cursor_pointer()
+                .hover(|h| h.text_color(theme.foreground))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.docs_sort = Some(match this.docs_sort {
+                        Some((c, d)) if c == col => (col, d.toggled()),
+                        _ => (col, SortDirection::Asc),
+                    });
+                    this.selected_item_index = 0;
+                    cx.notify();
+                }))
+                .child(format!("{label}{suffix}"))
+        };
+
         v_flex()
             .size_full()
             .child(
@@ -1538,39 +1708,23 @@ impl NewTabView {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        div()
+                        header_cell("docs-sort-name", "FILE NAME", DocsSortColumn::Name)
                             .w(px(280.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("FILE NAME"),
+                            .flex_none(),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("PROJECT & PATH"),
+                        header_cell("docs-sort-path", "PROJECT & PATH", DocsSortColumn::Path)
+                            .flex_1(),
                     )
                     .child(
-                        div()
+                        header_cell("docs-sort-modified", "MODIFIED", DocsSortColumn::Modified)
                             .w(px(110.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("MODIFIED"),
+                            .flex_none(),
                     )
                     .child(
-                        div()
+                        header_cell("docs-sort-size", "SIZE", DocsSortColumn::Size)
                             .w(px(80.))
-                            .flex_none()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.muted_foreground)
-                            .child("SIZE"),
+                            .flex_none(),
                     )
                     .child(
                         div()
@@ -1618,7 +1772,18 @@ impl Render for NewTabView {
 
         let has_filter = !self.filter_query.is_empty();
         let unfiltered_hub = has_filter.then(|| catalog.filter_hub(""));
-        let filtered_hub = catalog.filter_hub(&self.filter_query);
+        let mut filtered_hub = catalog.filter_hub(&self.filter_query);
+        sort_rules(
+            &mut filtered_hub.project_instructions,
+            RulesScope::Project,
+            self.rules_sort,
+        );
+        sort_rules(
+            &mut filtered_hub.global_instructions,
+            RulesScope::Global,
+            self.rules_sort,
+        );
+        sort_docs(&mut filtered_hub.project_docs, self.docs_sort);
 
         let mut grouped_skills = match self.active_tab {
             HubTab::ProjectSkills => Some(group_skills_by_source(&filtered_hub.project_skills)),
@@ -1958,13 +2123,11 @@ impl Render for NewTabView {
                         } else {
                             EmptyStateKind::GenuinelyEmpty
                         };
-                        pane.child(Self::render_rules_table(
+                        pane.child(self.render_rules_table(
                             &filtered_hub.project_instructions,
                             false,
                             total_projects,
                             empty_kind,
-                            selected_item_index,
-                            &self.table_scroll_handle,
                             cx,
                         ))
                     })
@@ -1999,13 +2162,11 @@ impl Render for NewTabView {
                         } else {
                             EmptyStateKind::GenuinelyEmpty
                         };
-                        pane.child(Self::render_rules_table(
+                        pane.child(self.render_rules_table(
                             &filtered_hub.global_instructions,
                             true,
                             total_projects,
                             empty_kind,
-                            selected_item_index,
-                            &self.table_scroll_handle,
                             cx,
                         ))
                     })
@@ -2024,6 +2185,7 @@ impl Render for NewTabView {
                             total_projects,
                             empty_kind,
                             selected_item_index,
+                            self.docs_sort,
                             &self.table_scroll_handle,
                             cx,
                         ))

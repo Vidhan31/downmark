@@ -275,6 +275,10 @@ pub(crate) struct Workspace {
     pending_disk_prompt: HashSet<EntityId>,
     /// Documents whose disk-change check was deferred while a dialog was open.
     deferred_disk_docs: HashSet<EntityId>,
+    /// Active slow-backoff disk-retry chains keyed by `(document_id, path)`.
+    slow_disk_retries: HashSet<(EntityId, PathBuf)>,
+    /// Catalog scan warnings already displayed to the user.
+    shown_scan_warnings: HashSet<String>,
     last_session: Option<Session>,
     catalog: Entity<FolderCatalog>,
     disk_watcher: DiskWatcher,
@@ -411,6 +415,8 @@ impl Workspace {
             discarded: HashSet::new(),
             pending_disk_prompt: HashSet::new(),
             deferred_disk_docs: HashSet::new(),
+            slow_disk_retries: HashSet::new(),
+            shown_scan_warnings: HashSet::new(),
             last_session: None,
             catalog,
             disk_watcher,
@@ -1117,13 +1123,13 @@ impl Workspace {
                         snapshot.project_folders.extend(existing_roots);
                         followup = true;
                     }
-                    let prev_warnings = this.catalog.read(cx).scan_warnings.clone();
                     let new_warnings: Vec<String> = snapshot
                         .scan_warnings
                         .iter()
-                        .filter(|w| !prev_warnings.contains(w))
+                        .filter(|w| !this.shown_scan_warnings.contains(*w))
                         .cloned()
                         .collect();
+                    this.shown_scan_warnings = snapshot.scan_warnings.iter().cloned().collect();
                     AppSettings::update(cx, |settings| {
                         settings.prune_missing_with_projects(&snapshot.project_folders);
                     });
@@ -1536,9 +1542,11 @@ impl Workspace {
                         this.check_disk_with_retry(retry_attempt + 1, window, cx);
                     });
                 } else {
-                    _ = this.update_in(cx, |_, window, cx| {
+                    _ = this.update_in(cx, |this, window, cx| {
                         for (id, path) in retry_targets {
-                            Self::schedule_slow_disk_retry(id, path, 0, window, cx);
+                            if this.slow_disk_retries.insert((id, path.clone())) {
+                                Self::schedule_slow_disk_retry(id, path, 0, window, cx);
+                            }
                         }
                     });
                 }
@@ -1563,15 +1571,20 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let target = this
-                .read_with(cx, |this, cx| {
+                .update(cx, |this, cx| {
                     let doc = this.tab_index(id).and_then(|ix| match &this.tabs[ix] {
                         WorkspaceTab::Document(doc) => Some(doc.clone()),
                         WorkspaceTab::NewTab(_) => None,
-                    })?;
+                    });
+                    let Some(doc) = doc else {
+                        this.slow_disk_retries.remove(&(id, expected_path.clone()));
+                        return None;
+                    };
                     let doc_ref = doc.read(cx);
                     if doc_ref.path() != Some(&expected_path)
                         || this.pending_disk_prompt.contains(&id)
                     {
+                        this.slow_disk_retries.remove(&(id, expected_path.clone()));
                         return None;
                     }
                     Some((
@@ -1600,6 +1613,7 @@ impl Workspace {
                     })
                     .unwrap_or(false);
                 if !still_same {
+                    this.slow_disk_retries.remove(&(id, expected_path));
                     return;
                 }
                 match outcome {
@@ -1612,8 +1626,11 @@ impl Workspace {
                             cx,
                         );
                     }
-                    DiskReadOutcome::NoChange => {}
+                    DiskReadOutcome::NoChange => {
+                        this.slow_disk_retries.remove(&(id, expected_path));
+                    }
                     DiskReadOutcome::Change(_) => {
+                        this.slow_disk_retries.remove(&(id, expected_path.clone()));
                         this.apply_disk_change(
                             CheckedDiskChange {
                                 id,

@@ -207,6 +207,17 @@ impl AppSettings {
 }
 
 impl Settings {
+    /// Parse settings from JSON, migrating legacy `tracked_folders` into
+    /// `project_folders` when `project_folders` is absent from the payload.
+    pub(crate) fn from_json_str(json: &str) -> Option<Self> {
+        let value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+        let mut settings = serde_json::from_value::<Settings>(value.clone()).ok()?;
+        if value.get("project_folders").is_none() && !settings.tracked_folders.is_empty() {
+            settings.project_folders = settings.tracked_folders.clone();
+        }
+        Some(settings)
+    }
+
     /// Load settings, falling back to defaults when the file is missing or
     /// unreadable. Out-of-range values are clamped.
     pub(crate) fn load() -> Self {
@@ -215,7 +226,7 @@ impl Settings {
         };
         let mut settings = std::fs::read_to_string(path)
             .ok()
-            .and_then(|json| serde_json::from_str::<Settings>(&json).ok())
+            .and_then(|json| Self::from_json_str(&json))
             .unwrap_or_default();
         settings.font_size = clamp_font_size(settings.font_size);
         settings.layout = Layout::Preview;
@@ -298,10 +309,21 @@ impl Settings {
         self.recent_projects
             .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
         if let Some(ref filter) = self.selected_project_filter {
-            let filter_canon = filter.canonicalize().unwrap_or_else(|_| filter.clone());
-            let in_projects = self.project_folders.iter().any(|dir| {
-                dir == filter || dir.canonicalize().unwrap_or_else(|_| dir.clone()) == filter_canon
-            });
+            let in_projects = if self.project_folders.is_empty() {
+                false
+            } else {
+                match filter.canonicalize() {
+                    Ok(filter_canon) => self.project_folders.iter().any(|dir| {
+                        dir == filter
+                            || match dir.canonicalize() {
+                                Ok(dir_canon) => dir_canon == filter_canon,
+                                Err(err) => !is_confirmed_absent(&err),
+                            }
+                    }),
+                    Err(err) if !is_confirmed_absent(&err) => true,
+                    Err(_) => self.project_folders.iter().any(|dir| dir == filter),
+                }
+            };
             if !path_exists_as_dir_or_unconfirmed(filter) || !in_projects {
                 self.selected_project_filter = None;
             }
@@ -338,7 +360,7 @@ pub(crate) fn path_exists_as_dir_or_unconfirmed(path: &Path) -> bool {
     }
 }
 
-fn is_confirmed_absent(err: &std::io::Error) -> bool {
+pub(crate) fn is_confirmed_absent(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
@@ -598,5 +620,16 @@ mod tests {
         assert!(!changed);
         assert_eq!(settings.project_folders, vec![symlink]);
         assert_eq!(settings.selected_project_filter, Some(canon_target));
+    }
+
+    #[test]
+    fn from_json_str_migrates_tracked_folders_only_when_project_folders_absent() {
+        let legacy_json = r#"{"tracked_folders": ["/tmp/proj_a"]}"#;
+        let migrated = Settings::from_json_str(legacy_json).unwrap();
+        assert_eq!(migrated.project_folders, vec![PathBuf::from("/tmp/proj_a")]);
+
+        let explicit_empty_json = r#"{"tracked_folders": ["/tmp/proj_a"], "project_folders": []}"#;
+        let preserved = Settings::from_json_str(explicit_empty_json).unwrap();
+        assert_eq!(preserved.project_folders, Vec::<PathBuf>::new());
     }
 }
