@@ -8,6 +8,7 @@ use gpui_kit::{
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _,
+        alert::Alert,
         button::{Button, ButtonVariants as _},
         h_flex,
         input::{Input, InputEvent, InputState},
@@ -38,6 +39,8 @@ const SKILLS_SIDEBAR_WIDTH_PX: f32 = 268.;
 const SKILLS_SIDEBAR_MIN_WIDTH_PX: f32 = 210.;
 /// Maximum width when dragging the skills sidebar splitter.
 const SKILLS_SIDEBAR_MAX_WIDTH_PX: f32 = 400.;
+/// Maximum width of the workspace picker button in the category tab bar.
+const WORKSPACE_PICKER_MAX_WIDTH_PX: f32 = 180.;
 
 /// Events emitted by the Home page to be handled by the workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,7 +439,7 @@ impl NewTabView {
                     .top(px(40.))
                     .right_4()
                     .w(px(320.))
-                    .max_h(px(380.))
+                    .max_h(px(430.))
                     .rounded(theme.radius_lg)
                     .border_1()
                     .border_color(theme.border)
@@ -489,7 +492,7 @@ impl NewTabView {
                     .child(
                         v_flex()
                             .id("popover-workspaces-scroll")
-                            .max_h(px(250.))
+                            .max_h(px(210.))
                             .overflow_y_scrollbar()
                             .gap_0p5()
                             .child({
@@ -666,10 +669,14 @@ impl NewTabView {
                             })),
                     )
                     .child(
-                        h_flex()
+                        v_flex()
                             .pt_1p5()
+                            .gap_1p5()
                             .border_t_1()
                             .border_color(theme.border)
+                            .child(Self::render_large_folder_warning(
+                                "popover-large-folder-warning",
+                            ))
                             .child(
                                 Button::new("popover-add-folder-btn")
                                     .ghost()
@@ -685,6 +692,16 @@ impl NewTabView {
             )
     }
 
+    /// Renders a compact warning advising users not to pick very large folders.
+    fn render_large_folder_warning(id: &'static str) -> Alert {
+        Alert::warning(
+            id,
+            "Avoid selecting very large folders (such as your home directory); scanning them can take a long time.",
+        )
+        .xsmall()
+        .text_xs()
+    }
+
     /// Renders a centered empty-state message with icon, title, and guidance.
     fn render_empty_state(
         icon: IconName,
@@ -693,6 +710,7 @@ impl NewTabView {
         cx: &Context<'_, Self>,
     ) -> gpui_kit::AnyElement {
         let theme = cx.theme();
+        let show_folder_warning = title == "No Project Folders Chosen";
         v_flex()
             .size_full()
             .items_center()
@@ -712,6 +730,16 @@ impl NewTabView {
                     .text_color(theme.muted_foreground)
                     .child(message),
             )
+            .when(show_folder_warning, |this| {
+                this.child(
+                    div()
+                        .pt_2()
+                        .max_w(px(420.))
+                        .child(Self::render_large_folder_warning(
+                            "empty-large-folder-warning",
+                        )),
+                )
+            })
             .into_any_element()
     }
 
@@ -787,6 +815,7 @@ impl NewTabView {
                 .child(Icon::new(icon).xsmall().text_color(icon_color))
                 .child(
                     div()
+                        .text_xs()
                         .text_color(label_color)
                         .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
                         .child(label),
@@ -1976,11 +2005,13 @@ impl Render for NewTabView {
 
                                 controls.child(
                                     Button::new("workspace-picker-btn")
+                                        .debug_selector(|| "workspace-picker-btn".to_string())
                                         .outline()
                                         .small()
+                                        .max_w(px(WORKSPACE_PICKER_MAX_WIDTH_PX))
                                         .icon(Icon::new(IconName::FolderOpen))
                                         .dropdown_caret(true)
-                                        .child(label)
+                                        .child(div().min_w_0().truncate().child(label))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.show_project_manager =
                                                 !this.show_project_manager;
@@ -2692,5 +2723,31 @@ mod tests {
                 ))]
             );
         }
+    }
+
+    #[gpui_kit::test]
+    fn workspace_picker_width_is_bounded_for_long_project_name(cx: &mut gpui_kit::TestAppContext) {
+        let long_name = "W".repeat(200);
+        let long_path = PathBuf::from(format!("/tmp/{long_name}"));
+        let (view, visual_cx, _events) = open_test_hub(cx, HubTab::ProjectSkills);
+
+        view.update(visual_cx, |this, cx| {
+            this.catalog.update(cx, |cat, cx| {
+                cat.project_folders = vec![long_path.clone()];
+                cat.selected_project_filter = Some(long_path.clone());
+                cx.notify();
+            });
+        });
+        visual_cx.run_until_parked();
+
+        let picker = visual_cx
+            .debug_bounds("workspace-picker-btn")
+            .expect("workspace-picker-btn bounds");
+        assert!(
+            picker.size.width <= px(WORKSPACE_PICKER_MAX_WIDTH_PX),
+            "workspace picker width {:?} exceeded max {:?}",
+            picker.size.width,
+            px(WORKSPACE_PICKER_MAX_WIDTH_PX)
+        );
     }
 }

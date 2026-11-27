@@ -3,14 +3,14 @@
 use std::{cell::Cell, path::PathBuf, rc::Rc};
 
 use gpui_kit::{
-    App, InteractiveElement as _, ParentElement as _, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    App, FontWeight, InteractiveElement as _, ParentElement as _, StatefulInteractiveElement as _,
+    Styled as _, Window,
     component::{
         ActiveTheme as _, WindowExt as _,
         button::{Button, ButtonVariants as _},
         checkbox::Checkbox,
         dialog::DialogFooter,
-        v_flex,
+        h_flex, v_flex,
     },
     div,
     prelude::FluentBuilder as _,
@@ -21,29 +21,89 @@ use crate::themes::AppSettings;
 /// Show the version, a one-line description and the license.
 pub(crate) fn open_about(window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, |alert, _, cx| {
-        let muted = cx.theme().muted_foreground;
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let foreground = theme.foreground;
+        let link = theme.link;
+        let border = theme.border;
+        let card_bg = theme.muted.opacity(0.35);
+        let radius = theme.radius;
+
         alert
             .title("Downmark")
             .description(
                 v_flex()
-                    .gap_2()
+                    .gap_3()
                     .child(concat!(
                         "Version ",
                         env!("CARGO_PKG_VERSION"),
                         ". A fast, native Markdown viewer built with GPUI Kit."
                     ))
-                    .child(div().text_xs().text_color(muted).child("By Vidhan Raut"))
                     .child(
-                        div()
-                            .id("about-github-url")
-                            .text_xs()
-                            .text_color(cx.theme().link)
-                            .cursor_pointer()
-                            .hover(gpui_kit::Styled::underline)
-                            .child("https://github.com/Vidhan31/downmark")
-                            .on_click(|_, _, cx| {
-                                cx.open_url("https://github.com/Vidhan31/downmark");
-                            }),
+                        v_flex()
+                            .gap_1p5()
+                            .px_3()
+                            .py_2()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(border)
+                            .bg(card_bg)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(div().text_xs().text_color(muted).child("Author"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(foreground)
+                                            .child("Vidhan Raut"),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(div().text_xs().text_color(muted).child("Repository"))
+                                    .child(
+                                        div()
+                                            .id("about-github-url")
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(link)
+                                            .cursor_pointer()
+                                            .hover(gpui_kit::Styled::underline)
+                                            .child("github.com/Vidhan31/downmark")
+                                            .on_click(|_, _, cx| {
+                                                cx.open_url("https://github.com/Vidhan31/downmark");
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .child(div().text_xs().text_color(muted).child("Issues"))
+                                    .child(
+                                        div()
+                                            .id("about-issues-url")
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(link)
+                                            .cursor_pointer()
+                                            .hover(gpui_kit::Styled::underline)
+                                            .child("github.com/Vidhan31/downmark/issues")
+                                            .on_click(|_, _, cx| {
+                                                cx.open_url(
+                                                    "https://github.com/Vidhan31/downmark/issues",
+                                                );
+                                            }),
+                                    ),
+                            ),
                     )
                     .child(
                         div()

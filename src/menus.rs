@@ -18,9 +18,9 @@ use crate::{
         About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, CopyFilePath,
         FindInPreview, GoToHeading, Heading, InlineCode, InsertLink, InstallShellCommand, Italic,
         NewFile, NewTab, NumberedList, Open, OpenMarkdownGuide, OpenRecent, OpenSettings, Quit,
-        Quote, RevealInFolder, Save, SaveAs, SetAppearance, SetLayout, SetTheme, Strikethrough,
-        TaskList, TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap,
-        ToggleTabs, ZoomIn, ZoomOut, ZoomReset,
+        Quote, ReportIssue, RevealInFolder, Save, SaveAs, SetAppearance, SetLayout, SetTheme,
+        Strikethrough, TaskList, TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync,
+        ToggleSoftWrap, ToggleTabs, ZoomIn, ZoomOut, ZoomReset,
     },
     default_app,
     document::display_name,
@@ -221,7 +221,10 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
         ),
     ];
 
-    let mut help = vec![MenuItem::action("Markdown guide", OpenMarkdownGuide)];
+    let mut help = vec![
+        MenuItem::action("Markdown guide", OpenMarkdownGuide),
+        MenuItem::action("Report an issue…", ReportIssue),
+    ];
     if default_app::can_install_shell_command() {
         help.push(MenuItem::action(
             "Install shell command…",
