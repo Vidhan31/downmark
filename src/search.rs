@@ -1,25 +1,114 @@
 //! Document search inside rendered Markdown preview.
 //!
-//! Provides text searching across rendered preview text, cycling through
-//! matches, building highlights for GPUI Kit, and binary-searching block
-//! spans to scroll to matches accurately and efficiently.
+//! Provides text and regular-expression searching across rendered preview text,
+//! cycling through matches, building highlights for GPUI Kit, and binary-searching
+//! block spans to scroll to matches accurately and efficiently.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
-use gpui_kit::Hsla;
-use gpui_kit::component::text::RangeHighlight;
+use gpui_kit::{Hsla, component::text::RangeHighlight};
+use regex::{Regex, RegexBuilder};
 
 /// Maximum number of match highlights to paint at once to prevent layout stalls
 /// on massive documents with thousands of common occurrences.
 const MAX_HIGHLIGHTS: usize = 2000;
 
+/// Maximum number of matches retained per query to bound memory and UI work
+/// on broad patterns (e.g., `.` in regex mode on large documents).
+const MAX_MATCHES: usize = 20_000;
+
+/// Toggleable matching modes for [`DocumentSearch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchOption {
+    CaseSensitive,
+    WholeWord,
+    Regex,
+}
+
+/// Matching options controlling how [`DocumentSearch`] interprets a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SearchOptions {
+    pub(crate) case_sensitive: bool,
+    pub(crate) whole_word: bool,
+    pub(crate) regex: bool,
+}
+
+impl SearchOptions {
+    /// Flips the given search option flag.
+    pub(crate) fn toggle(&mut self, option: SearchOption) {
+        match option {
+            SearchOption::CaseSensitive => self.case_sensitive = !self.case_sensitive,
+            SearchOption::WholeWord => self.whole_word = !self.whole_word,
+            SearchOption::Regex => self.regex = !self.regex,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CompiledMatcher {
+    /// Exact literal substring search (zero compile).
+    LiteralExact(String),
+    /// Case-insensitive literal or regular-expression search via linear-time `regex::Regex`.
+    Regex {
+        re: Regex,
+        /// Optional right-word-bounded variant used when `whole_word` rejects a shorter
+        /// leftmost-first regex alternative (e.g., `foo|foobar` on `"foobar"`).
+        word_end: Option<Regex>,
+    },
+}
+
+/// Self-contained match job that can be executed off the UI thread.
+#[derive(Debug, Clone)]
+pub(crate) struct SearchJob {
+    matcher: CompiledMatcher,
+    options: SearchOptions,
+    pub(crate) query: String,
+    preserve_near_offset: Option<usize>,
+}
+
+/// Output of a completed [`SearchJob`].
+#[derive(Debug)]
+pub(crate) struct SearchJobResult {
+    pub(crate) query: String,
+    pub(crate) options: SearchOptions,
+    pub(crate) matches: Vec<Range<usize>>,
+    pub(crate) truncated: bool,
+    pub(crate) preserve_near_offset: Option<usize>,
+    pub(crate) ruler_matches: Option<Vec<Range<usize>>>,
+}
+
+impl SearchJob {
+    pub(crate) fn run(
+        self,
+        rendered_text: &str,
+        editor_text: Option<&str>,
+        ruler_limit: usize,
+    ) -> SearchJobResult {
+        let (matches, truncated) =
+            collect_matches(&self.matcher, self.options, rendered_text, MAX_MATCHES);
+        let ruler_matches = editor_text
+            .map(|text| collect_matches(&self.matcher, self.options, text, ruler_limit).0);
+        SearchJobResult {
+            query: self.query,
+            options: self.options,
+            matches,
+            truncated,
+            preserve_near_offset: self.preserve_near_offset,
+            ruler_matches,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DocumentSearch {
     query: String,
+    options: SearchOptions,
     matches: Vec<Range<usize>>,
+    matches_truncated: bool,
     current_match_index: usize,
-    cached_rendered_lower: Option<String>,
-    last_rendered_len: usize,
+    error: Option<String>,
+    compiled_for: Option<(String, SearchOptions)>,
+    compiled: Option<CompiledMatcher>,
 }
 
 impl DocumentSearch {
@@ -29,6 +118,14 @@ impl DocumentSearch {
 
     pub(crate) fn query(&self) -> &str {
         &self.query
+    }
+
+    pub(crate) fn options(&self) -> SearchOptions {
+        self.options
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     pub(crate) fn matches(&self) -> &[Range<usize>] {
@@ -48,79 +145,159 @@ impl DocumentSearch {
     }
 
     pub(crate) fn match_display(&self) -> String {
+        if self.error.is_some() {
+            return "Invalid regex".to_string();
+        }
         if self.matches.is_empty() {
-            if self.query.is_empty() {
+            if self.query.trim().is_empty() {
                 String::new()
             } else {
                 "No matches".to_string()
             }
+        } else if self.matches_truncated {
+            format!("{}/{}+", self.current_match_index + 1, self.matches.len())
         } else {
             format!("{}/{}", self.current_match_index + 1, self.matches.len())
         }
     }
 
+    /// Clears the active query and match state while preserving search options.
     pub(crate) fn clear_query(&mut self) {
         self.query.clear();
         self.matches.clear();
+        self.matches_truncated = false;
         self.current_match_index = 0;
-    }
-
-    /// Invalidate cached lowercase text (e.g. after document edits).
-    pub(crate) fn invalidate_cache(&mut self) {
-        self.cached_rendered_lower = None;
-        self.last_rendered_len = 0;
+        self.error = None;
+        self.compiled_for = None;
+        self.compiled = None;
     }
 
     /// Updates the query and recomputes all matching ranges against rendered preview text.
     ///
-    /// Performance optimizations:
-    /// 1. Caches lowercased rendered text to avoid reallocating full document strings on every search keystroke.
-    /// 2. If the user is typing additional characters (the new query extends the old query),
-    ///    narrows the existing match list in O(M) time rather than rescanning the whole document in O(N).
+    /// Preserves the nearest match position when the query and options are unchanged
+    /// (for example, after a document edit refreshes the preview).
+    #[cfg(test)]
     pub(crate) fn update_query(&mut self, query: &str, rendered_text: &str) {
-        let previous_query_lower = self.query.to_lowercase();
-        self.query = query.to_string();
+        let same_spec = self
+            .compiled_for
+            .as_ref()
+            .is_some_and(|(prev_q, prev_opts)| prev_q == query && *prev_opts == self.options);
+        let prev_offset = same_spec
+            .then(|| self.current_match().map(|range| range.start))
+            .flatten();
 
-        if query.trim().is_empty() {
-            self.clear_query();
+        self.query = query.to_string();
+        self.recompute(rendered_text, prev_offset);
+    }
+
+    /// Replaces the active search options and recomputes matches against `rendered_text`.
+    #[cfg(test)]
+    pub(crate) fn set_options(&mut self, options: SearchOptions, rendered_text: &str) {
+        if self.options == options {
             return;
         }
+        let prev_offset = self.current_match().map(|range| range.start);
+        self.options = options;
+        self.recompute(rendered_text, prev_offset);
+    }
 
-        let doc_changed =
-            self.cached_rendered_lower.is_none() || self.last_rendered_len != rendered_text.len();
-        if doc_changed {
-            self.cached_rendered_lower = Some(rendered_text.to_lowercase());
-            self.last_rendered_len = rendered_text.len();
-        }
+    /// Toggles one search option and recomputes matches against `rendered_text`.
+    #[cfg(test)]
+    pub(crate) fn toggle_option(&mut self, option: SearchOption, rendered_text: &str) {
+        let prev_offset = self.current_match().map(|range| range.start);
+        self.options.toggle(option);
+        self.recompute(rendered_text, prev_offset);
+    }
 
-        let query_lower = query.to_lowercase();
-        let rendered_lower = self
-            .cached_rendered_lower
+    /// Finds matches for the current compiled query and options in an arbitrary text buffer
+    /// (such as the Markdown source for the editor overview ruler), capped at `limit`.
+    pub(crate) fn find_matches_in(&self, text: &str, limit: usize) -> Vec<Range<usize>> {
+        let Some(matcher) = &self.compiled else {
+            return Vec::new();
+        };
+        collect_matches(matcher, self.options, text, limit).0
+    }
+
+    /// Toggles one search option flag without running matching yet.
+    pub(crate) fn toggle_option_flag(&mut self, option: SearchOption) {
+        self.options.toggle(option);
+    }
+
+    /// Returns true when `query` and `options` match the last compiled specification.
+    pub(crate) fn matches_spec(&self, query: &str, options: SearchOptions) -> bool {
+        self.compiled_for
             .as_ref()
-            .expect("cached_rendered_lower was initialized or populated above");
+            .is_some_and(|(prev_q, prev_opts)| prev_q == query && *prev_opts == options)
+    }
 
-        let is_query_extension = !doc_changed
-            && !previous_query_lower.is_empty()
-            && query_lower.starts_with(&previous_query_lower)
-            && !self.matches.is_empty();
-
-        if is_query_extension {
-            let q_len = query_lower.len();
-            self.matches.retain(|range| {
-                let start = range.start;
-                rendered_lower.get(start..start + q_len) == Some(query_lower.as_str())
-            });
-            for range in &mut self.matches {
-                range.end = range.start + q_len;
-            }
-        } else {
-            self.matches = rendered_lower
-                .match_indices(&query_lower)
-                .map(|(ix, found)| ix..ix + found.len())
-                .collect();
+    /// Updates query/compilation state and returns a background [`SearchJob`] if non-empty
+    /// and valid. Clears matches immediately when empty or on regex syntax error.
+    pub(crate) fn prepare_job(
+        &mut self,
+        query: &str,
+        preserve_near_offset: Option<usize>,
+    ) -> Option<SearchJob> {
+        if query.trim().is_empty() {
+            let options = self.options;
+            self.clear_query();
+            self.options = options;
+            return None;
         }
 
-        self.current_match_index = 0;
+        self.query = query.to_string();
+
+        let needs_compile = self
+            .compiled_for
+            .as_ref()
+            .is_none_or(|(q, opts)| q != &self.query || *opts != self.options);
+
+        if needs_compile {
+            match compile_matcher(&self.query, self.options) {
+                Ok(matcher) => {
+                    self.error = None;
+                    self.compiled = Some(matcher);
+                    self.compiled_for = Some((self.query.clone(), self.options));
+                }
+                Err(err) => {
+                    self.error = Some(err);
+                    self.compiled = None;
+                    self.compiled_for = Some((self.query.clone(), self.options));
+                    self.matches.clear();
+                    self.matches_truncated = false;
+                    self.current_match_index = 0;
+                    return None;
+                }
+            }
+        }
+
+        self.compiled.as_ref().map(|matcher| SearchJob {
+            matcher: matcher.clone(),
+            options: self.options,
+            query: self.query.clone(),
+            preserve_near_offset,
+        })
+    }
+
+    /// Applies match ranges produced by a [`SearchJob`].
+    pub(crate) fn apply_result(&mut self, result: SearchJobResult) {
+        self.matches = result.matches;
+        self.matches_truncated = result.truncated;
+        self.current_match_index = match result.preserve_near_offset {
+            Some(offset) if !self.matches.is_empty() => self
+                .matches
+                .partition_point(|range| range.start < offset)
+                .min(self.matches.len() - 1),
+            _ => 0,
+        };
+    }
+
+    #[cfg(test)]
+    fn recompute(&mut self, rendered_text: &str, preserve_near_offset: Option<usize>) {
+        let query = self.query.clone();
+        if let Some(job) = self.prepare_job(&query, preserve_near_offset) {
+            let result = job.run(rendered_text, None, 0);
+            self.apply_result(result);
+        }
     }
 
     pub(crate) fn next_match(&mut self) -> Option<&Range<usize>> {
@@ -298,6 +475,218 @@ impl DocumentSearch {
     }
 }
 
+fn compile_matcher(query: &str, options: SearchOptions) -> Result<CompiledMatcher, String> {
+    if !options.regex && options.case_sensitive {
+        return Ok(CompiledMatcher::LiteralExact(query.to_string()));
+    }
+
+    let pattern = if options.regex {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(regex::escape(query))
+    };
+
+    let mut builder = RegexBuilder::new(&pattern);
+    builder.case_insensitive(!options.case_sensitive);
+    if options.regex {
+        // Match VS Code's Find bar: ^ and $ match line boundaries by default,
+        // while `.` stays within a single line.
+        builder.multi_line(true).crlf(true);
+    }
+
+    let re = builder.build().map_err(|err| format_regex_error(&err))?;
+
+    let word_end = if options.regex && options.whole_word {
+        let end_pattern = format!("(?:{pattern})\\b");
+        let mut end_builder = RegexBuilder::new(&end_pattern);
+        end_builder
+            .case_insensitive(!options.case_sensitive)
+            .multi_line(true)
+            .crlf(true);
+        end_builder.build().ok()
+    } else {
+        None
+    };
+
+    Ok(CompiledMatcher::Regex { re, word_end })
+}
+
+fn next_char_offset(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .chars()
+        .next()
+        .map_or(text.len() + 1, |ch| offset + ch.len_utf8())
+}
+
+fn starts_inside_word_run(text: &str, start: usize) -> bool {
+    let prev_is_word = text[..start].chars().next_back().is_some_and(is_word_char);
+    let first_is_word = text[start..].chars().next().is_some_and(is_word_char);
+    prev_is_word && first_is_word
+}
+
+fn next_rejected_offset(text: &str, start: usize) -> usize {
+    if starts_inside_word_run(text, start) {
+        let mut end = start;
+        for ch in text[start..].chars() {
+            if !is_word_char(ch) {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        end
+    } else {
+        next_char_offset(text, start)
+    }
+}
+
+fn collect_matches(
+    matcher: &CompiledMatcher,
+    options: SearchOptions,
+    text: &str,
+    limit: usize,
+) -> (Vec<Range<usize>>, bool) {
+    let mut results = Vec::new();
+    let mut truncated = false;
+
+    let mut push_range = |range: Range<usize>| -> bool {
+        if results.len() >= limit {
+            truncated = true;
+            return false;
+        }
+        results.push(range);
+        true
+    };
+
+    match matcher {
+        CompiledMatcher::LiteralExact(needle) if !options.whole_word => {
+            for (ix, found) in text.match_indices(needle) {
+                if !push_range(ix..ix + found.len()) {
+                    break;
+                }
+            }
+        }
+        CompiledMatcher::LiteralExact(needle) => {
+            let mut pos = 0;
+            while pos <= text.len() {
+                let Some(rel_ix) = text[pos..].find(needle) else {
+                    break;
+                };
+                let start = pos + rel_ix;
+                let end = start + needle.len();
+                if is_whole_word(text, &(start..end)) {
+                    if !push_range(start..end) {
+                        break;
+                    }
+                    pos = if end > start {
+                        end
+                    } else {
+                        next_char_offset(text, start)
+                    };
+                } else {
+                    pos = next_rejected_offset(text, start);
+                }
+            }
+        }
+        CompiledMatcher::Regex { re, .. } if !options.whole_word => {
+            for found in re.find_iter(text) {
+                if !push_range(found.start()..found.end()) {
+                    break;
+                }
+            }
+        }
+        CompiledMatcher::Regex { re, word_end } => {
+            let mut pos = 0;
+            let mut last_nonempty_end: Option<usize> = None;
+            while pos <= text.len() {
+                let Some(found) = re.find_at(text, pos) else {
+                    break;
+                };
+                let start = found.start();
+                let end = found.end();
+                if start == end && last_nonempty_end == Some(start) {
+                    pos = next_char_offset(text, start);
+                    continue;
+                }
+                let candidate = if is_whole_word(text, &(start..end)) {
+                    Some(start..end)
+                } else if starts_inside_word_run(text, start) {
+                    None
+                } else {
+                    word_end
+                        .as_ref()
+                        .and_then(|re_end| re_end.find_at(text, start))
+                        .filter(|longer| {
+                            longer.start() == start
+                                && is_whole_word(text, &(longer.start()..longer.end()))
+                        })
+                        .map(|longer| longer.start()..longer.end())
+                };
+
+                if let Some(range) = candidate {
+                    let range_end = range.end;
+                    if range_end > start {
+                        last_nonempty_end = Some(range_end);
+                    }
+                    if !push_range(range) {
+                        break;
+                    }
+                    pos = if range_end > start {
+                        range_end
+                    } else {
+                        next_char_offset(text, start)
+                    };
+                } else {
+                    pos = next_rejected_offset(text, start);
+                }
+            }
+        }
+    }
+
+    (results, truncated)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Checks VS Code-style whole-word boundaries: a boundary is only required on a
+/// side of the match whose edge character is itself a word character (so queries
+/// like `c++` or `(foo)` still match when bounded on their word-character edges).
+fn is_whole_word(text: &str, range: &Range<usize>) -> bool {
+    let Some(matched) = text.get(range.clone()) else {
+        return false;
+    };
+    let prev_is_word = text[..range.start]
+        .chars()
+        .next_back()
+        .is_some_and(is_word_char);
+    let next_is_word = text[range.end..].chars().next().is_some_and(is_word_char);
+
+    let mut chars = matched.chars();
+    let Some(first) = chars.next() else {
+        return prev_is_word != next_is_word;
+    };
+    let last = chars.next_back().unwrap_or(first);
+
+    (!is_word_char(first) || !prev_is_word) && (!is_word_char(last) || !next_is_word)
+}
+
+fn format_regex_error(err: &regex::Error) -> String {
+    match err {
+        regex::Error::Syntax(msg) => msg
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map_or("invalid regular expression", |line| {
+                line.strip_prefix("error: ").unwrap_or(line)
+            })
+            .to_string(),
+        regex::Error::CompiledTooBig(_) => "regular expression is too large".to_string(),
+        _ => err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,22 +739,206 @@ mod tests {
     }
 
     #[test]
-    fn test_search_cached_lowercase_and_incremental_filtering() {
+    fn test_search_query_refinement() {
         let mut search = DocumentSearch::new();
         let rendered = "Alpha Beta Gamma Delta";
 
         search.update_query("a", rendered);
         assert_eq!(search.total_matches(), 6);
-        assert!(search.cached_rendered_lower.is_some());
 
         search.update_query("al", rendered);
         assert_eq!(search.total_matches(), 1);
 
         search.update_query("alpha", rendered);
         assert_eq!(search.total_matches(), 1);
+    }
 
-        search.invalidate_cache();
-        assert!(search.cached_rendered_lower.is_none());
+    #[test]
+    fn test_case_sensitive_matching() {
+        let mut search = DocumentSearch::new();
+        let rendered = "Alpha alpha ALPHA Café café";
+
+        search.update_query("alpha", rendered);
+        assert_eq!(search.total_matches(), 3);
+
+        search.toggle_option(SearchOption::CaseSensitive, rendered);
+        assert!(search.options().case_sensitive);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(6..11)));
+
+        search.update_query("Café", rendered);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(18..23)));
+    }
+
+    #[test]
+    fn test_whole_word_matching_including_punctuation_edges() {
+        let mut search = DocumentSearch::new();
+        let rendered = "foo bar foobar _foo foo_ (foo) foo-bar c++ objc++ c++11";
+
+        search.set_options(
+            SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            },
+            rendered,
+        );
+
+        search.update_query("foo", rendered);
+        // Matches: "foo" (0..3), "(foo)" (26..29), "foo-bar" (31..34).
+        // Excludes: "foobar", "_foo", "foo_".
+        assert_eq!(search.matches(), &[0..3, 26..29, 31..34]);
+
+        // Leading word char + trailing non-word chars: matches standalone "c++" and "c++11",
+        // rejects "objc++".
+        search.update_query("c++", rendered);
+        assert_eq!(search.matches(), &[39..42, 50..53]);
+
+        // Both edges non-word chars: still matches "(foo)".
+        search.update_query("(foo)", rendered);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(25..30)));
+
+        // Overlapping literal candidate: "a a" in "xa a a" must reject 1..4 and still find 3..6
+        // in both case-insensitive and case-sensitive literal modes.
+        let overlapping = "xa a a";
+        search.update_query("a a", overlapping);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(3..6)));
+        search.set_options(
+            SearchOptions {
+                whole_word: true,
+                case_sensitive: true,
+                regex: false,
+            },
+            overlapping,
+        );
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(3..6)));
+    }
+
+    #[test]
+    fn test_regex_matching_multiline_case_and_whole_word_combinations() {
+        let mut search = DocumentSearch::new();
+        let rendered = "Item 12\nitem 345\nfoo12\nfoo bar";
+
+        search.set_options(
+            SearchOptions {
+                regex: true,
+                ..Default::default()
+            },
+            rendered,
+        );
+
+        // Multiline ^ and case-insensitive by default.
+        search.update_query(r"^item \d+", rendered);
+        assert_eq!(search.matches(), &[0..7, 8..16]);
+
+        // Combine regex + case_sensitive.
+        search.toggle_option(SearchOption::CaseSensitive, rendered);
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(8..16)));
+
+        // Combine regex + whole_word (should reject "foo" inside "foo12", match "foo" in "foo bar").
+        search.set_options(
+            SearchOptions {
+                regex: true,
+                whole_word: true,
+                case_sensitive: true,
+            },
+            rendered,
+        );
+        search.update_query(r"foo|item", rendered);
+        assert_eq!(search.matches(), &[8..12, 23..26]);
+
+        // Longer regex alternation must still match when an earlier branch fails whole-word check.
+        search.update_query(r"foo|foobar", "foobar");
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.current_match(), Some(&(0..6)));
+
+        // Empty matches overlapping the end of a previous nonempty match must be suppressed,
+        // while standalone zero-width searches (like \b) remain intact.
+        search.update_query(r"\w*", "foo bar");
+        assert_eq!(search.matches(), &[0..3, 4..7]);
+
+        search.update_query(r"\b", "foo bar");
+        assert_eq!(search.matches(), &[0..0, 3..3, 4..4, 7..7]);
+
+        // Rejected candidates inside a long word run must skip to the end of the run
+        // instead of rescanning every interior position quadratically.
+        let mut long_run = String::from("x");
+        long_run.extend(std::iter::repeat_n('a', 100_000));
+        search.update_query("a+", &long_run);
+        assert_eq!(search.total_matches(), 0);
+    }
+
+    #[test]
+    fn test_invalid_regex_reports_error_and_recovers() {
+        let mut search = DocumentSearch::new();
+        let rendered = "hello [world]";
+
+        search.set_options(
+            SearchOptions {
+                regex: true,
+                ..Default::default()
+            },
+            rendered,
+        );
+        search.update_query("[unclosed", rendered);
+        assert_eq!(search.total_matches(), 0);
+        assert!(search.error().is_some());
+        assert_eq!(search.match_display(), "Invalid regex");
+
+        // Fixing the regex or turning off regex mode clears the error and finds matches.
+        search.toggle_option(SearchOption::Regex, "hello [unclosed world");
+        assert!(search.error().is_none());
+        assert_eq!(search.total_matches(), 1);
+        assert_eq!(search.match_display(), "1/1");
+    }
+
+    #[test]
+    fn test_clear_query_preserves_search_options() {
+        let mut search = DocumentSearch::new();
+        search.set_options(
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: true,
+                regex: true,
+            },
+            "alpha",
+        );
+        search.update_query("alpha", "alpha");
+        assert_eq!(search.total_matches(), 1);
+
+        search.clear_query();
+        assert_eq!(search.total_matches(), 0);
+        assert!(search.error().is_none());
+        assert_eq!(
+            search.options(),
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: true,
+                regex: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_toggling_option_preserves_nearest_match_offset() {
+        let mut search = DocumentSearch::new();
+        let rendered = "alpha Alpha alpha";
+
+        search.update_query("alpha", rendered);
+        assert_eq!(search.total_matches(), 3);
+        search.next_match(); // now on "Alpha" at 6..11
+        search.next_match(); // now on "alpha" at 12..17
+        assert_eq!(search.current_match(), Some(&(12..17)));
+
+        // Toggling case-sensitive drops "Alpha" at 6..11, leaving 0..5 and 12..17;
+        // nearest match to offset 12 should remain 12..17 (index 1).
+        search.toggle_option(SearchOption::CaseSensitive, rendered);
+        assert_eq!(search.current_match(), Some(&(12..17)));
+        assert_eq!(search.current_match_index(), 1);
     }
 
     #[test]
@@ -440,14 +1013,19 @@ mod tests {
         search.update_query("🦀", rendered);
         assert_eq!(search.total_matches(), 2);
 
-        // Incremental search extension with multi-byte unicode characters adjacent to matches
+        // Multi-byte unicode characters adjacent to matches
         let text_with_multibyte = "a・b and ab";
         search.update_query("a", text_with_multibyte);
         assert_eq!(search.total_matches(), 3);
-        // Typing "ab" narrows the matches. Index into "a・" must not panic on char boundary.
         search.update_query("ab", text_with_multibyte);
         assert_eq!(search.total_matches(), 1);
         assert_eq!(search.current_match(), Some(&(10..12)));
+
+        // Characters whose lowercase changes UTF-8 byte length (İ -> i\u{307}) must still yield
+        // exact byte offsets in the original text.
+        let turkish = "İstanbul test";
+        search.update_query("test", turkish);
+        assert_eq!(search.current_match(), Some(&(10..14)));
     }
 
     #[test]
