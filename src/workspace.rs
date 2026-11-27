@@ -1939,8 +1939,8 @@ impl Workspace {
                             format_tab_tooltip(&tab_name, tab_path.as_deref(), dirty_state);
 
                         let tab_icon = match tab {
-                            WorkspaceTab::Document(_) => IconName::FileText,
-                            WorkspaceTab::NewTab(_) => IconName::House,
+                            WorkspaceTab::Document(_) => None,
+                            WorkspaceTab::NewTab(_) => Some(IconName::House),
                         };
 
                         let tab_id = tab.entity_id();
@@ -1982,16 +1982,15 @@ impl Workspace {
                             .tooltip(move |window, cx| {
                                 Tooltip::new(tab_tooltip.clone()).build(window, cx)
                             })
-                            .child(
-                                Icon::new(tab_icon)
-                                    .xsmall()
-                                    .flex_none()
-                                    .text_color(if active {
+                            .when_some(tab_icon, |this, icon| {
+                                this.child(Icon::new(icon).xsmall().flex_none().text_color(
+                                    if active {
                                         theme.primary
                                     } else {
                                         theme.muted_foreground
-                                    }),
-                            )
+                                    },
+                                ))
+                            })
                             .child(
                                 div()
                                     .flex_1()
