@@ -2,9 +2,7 @@
 # See: https://docs.zizmor.sh/configuration/
 
 rules:
-  # Release and packaging workflows reuse cargo build caches across runs.
+  # Release builds reuse cargo caches across tag runs.
   cache-poisoning:
-    disable: true
-  # MSIX packaging scripts interpolate GitHub context values into PowerShell blocks.
-  template-injection:
-    disable: true
+    ignore:
+      - release.yml

@@ -5,9 +5,9 @@
 # The macOS job attaches its disk image to the draft itself rather than
 # handing it over as an artifact, so it doesn't depend on GitHub-hosted
 # runners or Actions artifact storage. Code signing and notarization happen when the
-# repository secrets (macOS) and variables (Windows, Azure Artifact Signing)
-# described in docs/RELEASING.md are set; without them the macOS app is
-# signed ad hoc and the Windows files are unsigned.
+# repository secrets (macOS) and Azure Artifact Signing variables (Windows)
+# are configured; without them the macOS app is signed ad hoc and the Windows
+# files are unsigned.
 name: Release
 
 on:
@@ -25,12 +25,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ci:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      run_windows: false
+
   version:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -47,9 +59,8 @@ jobs:
 
   macos:
     # The repository variable MACOS_RUNNER picks another macOS runner, such
-    # as GetMac's; GitHub's macOS 26 runner otherwise. The job checks the
-    # version itself rather than waiting on a GitHub-hosted job, so it runs
-    # wherever its runner is available.
+    # as GetMac's; GitHub's macOS 26 runner otherwise.
+    needs: [version, ci]
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 180
     permissions:
@@ -81,6 +92,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-auditable
       # Compiled dependencies, restored so a release rebuilds little but
       # Downmark itself. Saved even when a later step (signing, packaging)
       # fails, so a retry doesn't start from scratch.
@@ -168,8 +183,8 @@ jobs:
           # One after the other: building both in a single cargo run was
           # slower (26 minutes against 17), as the two link-time-optimized
           # builds compete for the runner's memory.
-          cargo build --release --locked --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+          cargo auditable build --release --locked --target aarch64-apple-darwin
+          cargo auditable build --release --locked --target x86_64-apple-darwin
           mkdir -p dist
           lipo -create -output dist/downmark \
             target/aarch64-apple-darwin/release/downmark \
@@ -265,7 +280,7 @@ jobs:
           echo "::notice::$DMG is attached to the draft release $tag"
 
   windows:
-    needs: version
+    needs: [version, ci]
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -275,7 +290,7 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
       # Signing with Azure Artifact Signing (formerly Trusted Signing) when
-      # the repository variables in docs/RELEASING.md are set.
+      # the repository variables are configured.
       HAS_SIGNING: ${{ vars.AZURE_CLIENT_ID != '' && vars.AZURE_TENANT_ID != '' && vars.AZURE_SUBSCRIPTION_ID != '' && vars.ARTIFACT_SIGNING_ENDPOINT != '' && vars.ARTIFACT_SIGNING_ACCOUNT != '' && vars.ARTIFACT_SIGNING_PROFILE != '' }}
       # aws-lc-sys (TLS for remote images) needs NASM on x86_64 Windows
       # unless it may use its prebuilt objects.
@@ -290,6 +305,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-auditable
       # Compiled dependencies; see the macOS job.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -297,7 +316,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo auditable build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Stage Downmark.exe
         run: |
@@ -340,23 +359,17 @@ jobs:
           Compress-Archive -Path $staging -DestinationPath "dist/$name.zip"
 
       - name: Build the MSIX package
+        env:
+          MSIX_PACKAGE_NAME: ${{ vars.MSIX_PACKAGE_NAME }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
         run: |
           $dist = (Resolve-Path dist).Path
-          $packageName = if ('${{ vars.MSIX_PACKAGE_NAME }}') { '${{ vars.MSIX_PACKAGE_NAME }}' } else { 'Downmark' }
-          $publisher = if ('${{ vars.MSIX_PUBLISHER }}') {
-            '${{ vars.MSIX_PUBLISHER }}'
-          } else {
-            'CN=Downmark'
-          }
-          $displayName = if ('${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}') { '${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}' } else { 'Downmark Contributors' }
           $signSelfSigned = ($env:HAS_SIGNING -ne 'true')
           & packaging/windows/build-msix.ps1 `
             -Version $env:VERSION `
             -SourceExe "$dist\Downmark.exe" `
             -OutputDir $dist `
-            -PackageName $packageName `
-            -Publisher $publisher `
-            -PublisherDisplayName $displayName `
             -SignSelfSigned:$signSelfSigned
 
       - name: Sign the MSIX package
@@ -393,8 +406,8 @@ jobs:
           if-no-files-found: error
 
   linux:
-    needs: version
-    runs-on: ubuntu-latest
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
@@ -404,6 +417,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare writable Flatpak system repo
+        run: |
+          cp -a /var/lib/flatpak /var/lib/flatpak.tmp
+          rm -rf /var/lib/flatpak
+          mv /var/lib/flatpak.tmp /var/lib/flatpak
+
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
         with:
@@ -412,9 +431,11 @@ jobs:
           cache: true
 
       - name: Stage package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p dist
-          mv Downmark-${{ needs.version.outputs.version }}-x86_64.flatpak dist/
+          mv "Downmark-$VERSION-x86_64.flatpak" dist/
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -425,7 +446,7 @@ jobs:
   # Collects every package on the draft release the macOS job started and
   # publishes the final release.
   release:
-    needs: [version, macos, windows, linux]
+    needs: [version, ci, macos, windows, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -438,13 +459,19 @@ jobs:
       TAG: ${{ github.ref_name }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
-      # Read release notes from CHANGELOG.md or fallback notes.
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
+        with:
+          egress-policy: audit
+      # Full checkout so cargo metadata / cargo-cyclonedx can inspect the workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: |
-            .github/release-notes
-            CHANGELOG.md
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: cargo-cyclonedx
       - name: Extract release notes from CHANGELOG
         id: changelog_reader
         uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31 # v2.4.0
@@ -462,7 +489,8 @@ jobs:
         run: gh release download "$TAG" --pattern '*.dmg' --dir dist
       - name: Generate SBOM (CycloneDX)
         run: |
-          npx --yes @cyclonedx/cdxgen@12.8.4 -r -o dist/bom.json --spec-version 1.6 .
+          cargo cyclonedx --format json --spec-version 1.6 --target all --override-filename bom
+          mv bom.json dist/bom.json
           test -f dist/bom.json
       - name: Checksums
         working-directory: dist
@@ -473,14 +501,15 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            dist/*
-            dist/SHA256SUMS.txt
+          subject-path: 'dist/*'
       - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
-            dist/*
+            dist/*.dmg
+            dist/*.zip
+            dist/*.msix
+            dist/*.flatpak
           sbom-path: 'dist/bom.json'
       - name: Attach the packages
         run: gh release upload "$TAG" dist/* --clobber
