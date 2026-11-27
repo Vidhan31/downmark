@@ -483,6 +483,8 @@ fn register_project_rule_dir(
         let dest = resolve_dangling_target(parent, &raw_target);
         register_missing_ancestor(&dest, &mut set.catalog_ancestors);
         set.skill_container_links.insert(rules_dir.to_path_buf());
+    } else {
+        register_missing_ancestor(rules_dir, &mut set.catalog_ancestors);
     }
 }
 
@@ -1380,6 +1382,60 @@ mod tests {
                 .get(&canon_root)
                 .is_some_and(|targets| targets.contains(&canon_root.join("ext_missing_rules"))),
             "expected dangling .claude/rules target ancestor to be registered"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_github_observes_later_instructions_creation() {
+        let root = unique_temp_dir("symlinked_github_missing_instructions");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        let ext_gh = root.join("ext_gh");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&ext_gh).unwrap();
+
+        std::os::unix::fs::symlink(&ext_gh, proj.join(".github")).unwrap();
+
+        let targets = WatchTargets {
+            open_files: Vec::new(),
+            recent_files: Vec::new(),
+            project_folders: vec![proj],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+
+        let canon_ext_gh = ext_gh.canonicalize().unwrap();
+        let expected_inst_dir = canon_ext_gh.join("instructions");
+        assert!(
+            dirs.catalog_ancestors
+                .get(&canon_ext_gh)
+                .is_some_and(|targets| targets.contains(&expected_inst_dir)),
+            "expected symlinked .github target to register missing instructions ancestor"
+        );
+
+        fs::create_dir_all(&expected_inst_dir).unwrap();
+        let filter = ActiveWatchFilter {
+            open_files: HashSet::new(),
+            recent_files: HashSet::new(),
+            file_parents: dirs.file_parents,
+            catalog_dirs: dirs.catalog_dirs,
+            external_catalog_targets: dirs.external_catalog_targets,
+            catalog_ancestors: dirs.catalog_ancestors,
+            file_ancestors: dirs.file_ancestors,
+            skill_containers: dirs.skill_containers,
+            skill_container_links: dirs.skill_container_links,
+        };
+        let dispatch = classify_event(
+            EventKind::Create(notify::event::CreateKind::Folder),
+            &[expected_inst_dir],
+            &filter,
+        );
+        assert!(
+            dispatch.catalog,
+            "expected creating instructions under symlinked .github target to trigger catalog refresh"
         );
 
         let _ = fs::remove_dir_all(&root);

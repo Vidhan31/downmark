@@ -970,8 +970,18 @@ impl FolderCatalog {
     }
 
     pub(crate) fn set_selected_project_filter(&mut self, filter: Option<PathBuf>) {
-        // Project folders are stored canonicalized; normalize the filter to match (e.g. Windows \\?\ / 8.3 paths).
-        self.selected_project_filter = filter.map(|f| f.canonicalize().unwrap_or(f));
+        // Project folders are usually stored canonicalized, but an unavailable path can remain
+        // raw/aliased across a snapshot; resolve against stored entries by canonical equivalence.
+        self.selected_project_filter = filter.map(|f| {
+            let canonical = f.canonicalize().unwrap_or_else(|_| f.clone());
+            self.project_folders
+                .iter()
+                .find(|p| {
+                    **p == f || **p == canonical || p.canonicalize().is_ok_and(|pc| pc == canonical)
+                })
+                .cloned()
+                .unwrap_or(canonical)
+        });
     }
 
     #[expect(dead_code, reason = "Legacy adapter for setting active project")]
@@ -2274,6 +2284,43 @@ mod tests {
             snapshot.project_docs[0].file.relative_path,
             "skills/README.md"
         );
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_set_selected_project_filter_resolves_canonical_to_stored_alias() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base_dir = std::env::temp_dir().join(format!(
+            "downmark_test_filter_alias_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir);
+        let real_proj = base_dir.join("real_proj");
+        let alias_proj = base_dir.join("alias_proj");
+        fs::create_dir_all(&real_proj).unwrap();
+        std::os::unix::fs::symlink(&real_proj, &alias_proj).unwrap();
+
+        let mut catalog = FolderCatalog::default();
+        // Simulate an alias path retained in project_folders across a snapshot.
+        let snapshot = FolderCatalog::scan_snapshot(vec![alias_proj.clone()]);
+        catalog.apply_snapshot(snapshot);
+        assert_eq!(catalog.project_folders(), std::slice::from_ref(&alias_proj));
+
+        // Selecting the canonical path must resolve to the stored alias path.
+        let canonical = real_proj.canonicalize().unwrap();
+        catalog.set_selected_project_filter(Some(canonical));
+        assert_eq!(catalog.selected_project_filter(), Some(&alias_proj));
+
+        // Selecting an unrelated path still stores its canonicalized form.
+        let other = base_dir.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let canon_other = other.canonicalize().unwrap();
+        catalog.set_selected_project_filter(Some(other));
+        assert_eq!(catalog.selected_project_filter(), Some(&canon_other));
 
         let _ = fs::remove_dir_all(&base_dir);
     }
