@@ -2963,6 +2963,101 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn single_external_file_opens_in_standard_layout_by_default(cx: &mut gpui_kit::TestAppContext) {
+        let temp_file = std::env::temp_dir().join(format!(
+            "downmark-external-default-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&temp_file, "# Hello\n").expect("write temp markdown file");
+
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(
+                vec![FileTarget {
+                    path: temp_file.clone(),
+                    target: None,
+                }],
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+            assert!(
+                !AppSettings::get(cx).glance_mode,
+                "launching with a single external file should use standard layout by default"
+            );
+
+            ws.open_external(vec![temp_file.clone()], GlanceStart::Normal, window, cx);
+            assert!(
+                !AppSettings::get(cx).glance_mode,
+                "opening a single external file should use standard layout by default"
+            );
+            ws
+        });
+        let _ = workspace;
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[gpui_kit::test]
+    fn single_external_file_enters_glance_mode_when_requested_or_enabled(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let temp_file = std::env::temp_dir().join(format!(
+            "downmark-external-glance-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&temp_file, "# Hello\n").expect("write temp markdown file");
+
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+
+            ws.open_external(vec![temp_file.clone()], GlanceStart::Glance, window, cx);
+            assert!(
+                AppSettings::get(cx).glance_mode,
+                "--glance flag should still open a single file in glance mode"
+            );
+
+            ws.toggle_glance_mode(window, cx);
+            assert!(!AppSettings::get(cx).glance_mode);
+
+            cx.set_global(AppSettings(crate::settings::Settings {
+                glance_on_external: true,
+                restore_session: false,
+                ..Default::default()
+            }));
+            ws.open_external(vec![temp_file.clone()], GlanceStart::Normal, window, cx);
+            assert!(
+                AppSettings::get(cx).glance_mode,
+                "glance_on_external = true should open a single external file in glance mode"
+            );
+            ws
+        });
+        let _ = workspace;
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[gpui_kit::test]
     fn switching_layout_or_new_tab_exits_glance_mode(cx: &mut gpui_kit::TestAppContext) {
         let (workspace, _) = cx.add_window_view(|window, cx| {
             gpui_kit::init(cx);

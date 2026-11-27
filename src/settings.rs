@@ -116,7 +116,7 @@ impl Default for Settings {
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
             tabs: true,
-            glance_on_external: true,
+            glance_on_external: false,
             restore_session: true,
             image_folder: "assets".to_string(),
             open_links_in: LinkPlacement::NewTab,
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(settings.font_family, None);
         assert_eq!(settings.mono_font_family, None);
         assert!(settings.tabs);
-        assert!(settings.glance_on_external);
+        assert!(!settings.glance_on_external);
         assert!(!settings.glance_mode);
         assert!(settings.restore_session);
         assert_eq!(settings.open_links_in, LinkPlacement::NewTab);
