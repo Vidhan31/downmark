@@ -116,7 +116,7 @@ impl Default for Settings {
             recent_files: Vec::new(),
             tracked_folders: Vec::new(),
             tabs: true,
-            glance_on_external: true,
+            glance_on_external: false,
             restore_session: true,
             image_folder: "assets".to_string(),
             open_links_in: LinkPlacement::NewTab,
@@ -247,25 +247,42 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 /// Where Downmark keeps its settings, session and recovered documents.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "non-test builds return None when home/config env vars are unset"
+    )
+)]
 pub(crate) fn config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("DOWNMARK_CONFIG_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    #[cfg(target_os = "windows")]
+    #[cfg(test)]
     {
-        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Downmark"))
+        // Isolate test runs from the user's real configuration directory.
+        Some(std::env::temp_dir().join(format!("downmark-test-config-{}", std::process::id())))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(test))]
     {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join("Library/Application Support/Downmark"))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|dir| dir.join("downmark"))
+        if let Some(dir) = std::env::var_os("DOWNMARK_CONFIG_DIR") {
+            return Some(PathBuf::from(dir));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Downmark"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join("Library/Application Support/Downmark"))
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .map(|dir| dir.join("downmark"))
+        }
     }
 }
 
@@ -284,7 +301,7 @@ mod tests {
         assert_eq!(settings.font_family, None);
         assert_eq!(settings.mono_font_family, None);
         assert!(settings.tabs);
-        assert!(settings.glance_on_external);
+        assert!(!settings.glance_on_external);
         assert!(!settings.glance_mode);
         assert!(settings.restore_session);
         assert_eq!(settings.open_links_in, LinkPlacement::NewTab);
@@ -347,5 +364,15 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.font_family.as_deref(), Some("Inter"));
         assert_eq!(settings.mono_font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn config_dir_is_isolated_in_tests() {
+        let dir = config_dir().expect("test config_dir should be Some");
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "expected {dir:?} to live under temp_dir {:?}",
+            std::env::temp_dir()
+        );
     }
 }
