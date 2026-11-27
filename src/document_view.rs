@@ -136,6 +136,9 @@ pub(crate) struct DocumentView {
     search: DocumentSearch,
     search_input: Entity<InputState>,
     search_open: bool,
+    search_generation: u64,
+    preview_revision: u64,
+    search_task: Option<Task<()>>,
 
     path: Option<PathBuf>,
     line_ending: LineEnding,
@@ -316,6 +319,9 @@ impl DocumentView {
             search: DocumentSearch::new(),
             search_input,
             search_open: false,
+            search_generation: 0,
+            preview_revision: 0,
+            search_task: None,
             path: None,
             line_ending: LineEnding::Lf,
             saved_hash: content_hash(""),
@@ -619,6 +625,8 @@ impl DocumentView {
     }
 
     pub(crate) fn clear_search(&mut self, cx: &mut Context<'_, Self>) {
+        self.search_generation += 1;
+        self.search_task = None;
         self.search.clear_query();
         self.last_search_ruler_query.clear();
         self.search_ruler_decorations.set(Vec::new(), cx);
@@ -629,16 +637,79 @@ impl DocumentView {
 
     fn on_search_query_changed(&mut self, cx: &mut Context<'_, Self>) {
         let query = self.search_input.read(cx).value().to_string();
-        let rendered_text = self.preview.read(cx).rendered_text();
-        self.search.update_query(&query, rendered_text.as_str());
+        let same_spec = self.search.matches_spec(&query, self.search.options());
+        let preserve_near_offset = same_spec
+            .then(|| self.search.current_match().map(|range| range.start))
+            .flatten();
+        self.schedule_search(&query, preserve_near_offset, cx);
+    }
 
-        self.update_search_highlights(cx);
-        self.last_search_ruler_query = query;
-        self.sync_editor_search_ruler(cx);
-        if let Some(target_range) = self.search.current_match().cloned() {
-            self.scroll_to_match(&target_range, cx);
-        }
-        cx.notify();
+    fn schedule_search(
+        &mut self,
+        query: &str,
+        preserve_near_offset: Option<usize>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.search_generation += 1;
+        let generation = self.search_generation;
+
+        let Some(job) = self.search.prepare_job(query, preserve_near_offset) else {
+            self.search_task = None;
+            self.last_search_ruler_query.clear();
+            self.update_search_highlights(cx);
+            self.sync_editor_search_ruler(cx);
+            cx.notify();
+            return;
+        };
+
+        let rendered_text = self.preview.read(cx).rendered_text();
+        let preview_revision = self.preview_revision;
+        let editor_text = (!self.editor.read(cx).search_session().is_active())
+            .then(|| self.editor.read(cx).value());
+
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let mut result = cx
+                .background_executor()
+                .spawn(async move { job.run(rendered_text.as_str(), editor_text.as_deref(), 2000) })
+                .await;
+
+            _ = this.update(cx, |this, cx| {
+                if !this.search_open
+                    || this.search_generation != generation
+                    || this.preview_revision != preview_revision
+                    || this.search.query() != result.query
+                    || this.search.options() != result.options
+                {
+                    return;
+                }
+
+                this.last_search_ruler_query = std::mem::take(&mut result.query);
+                let ruler_matches = result.ruler_matches.take();
+                this.search.apply_result(result);
+                this.update_search_highlights(cx);
+
+                if let Some(ruler_matches) = ruler_matches
+                    && !this.editor.read(cx).search_session().is_active()
+                {
+                    let color = cx.theme().warning;
+                    let decorations = ruler_matches
+                        .into_iter()
+                        .map(|range| {
+                            gpui_kit::base::input::OverviewRulerDecoration::new(range)
+                                .with_lane(gpui_kit::base::input::OverviewRulerLane::Full)
+                                .with_color(color)
+                        })
+                        .collect();
+                    this.search_ruler_decorations.set(decorations, cx);
+                }
+
+                if let Some(target_range) = this.search.current_match().cloned() {
+                    this.scroll_to_match(&target_range, cx);
+                }
+                this.search_task = None;
+                cx.notify();
+            });
+        }));
     }
 
     fn update_search_highlights(&mut self, cx: &mut Context<'_, Self>) {
@@ -671,17 +742,13 @@ impl DocumentView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let rendered_text = self.preview.read(cx).rendered_text();
-        self.search.toggle_option(option, rendered_text.as_str());
-        self.update_search_highlights(cx);
-        self.sync_editor_search_ruler(cx);
-        if let Some(target_range) = self.search.current_match().cloned() {
-            self.scroll_to_match(&target_range, cx);
-        }
+        let preserve_near_offset = self.search.current_match().map(|range| range.start);
+        self.search.toggle_option_flag(option);
+        let query = self.search.query().to_string();
+        self.schedule_search(&query, preserve_near_offset, cx);
         self.search_input.update(cx, |state, cx| {
             state.focus(window, cx);
         });
-        cx.notify();
     }
 
     fn scroll_to_match(&mut self, target_range: &Range<usize>, cx: &mut Context<'_, Self>) {
@@ -1005,6 +1072,7 @@ impl DocumentView {
                         return;
                     }
                     let resolved = preview_ext::resolve_reference_links(&source);
+                    this.preview_revision += 1;
                     this.preview
                         .update(cx, |preview, cx| preview.set_text(&resolved, cx));
                     if this.search_open && !this.search.query().is_empty() {
@@ -1018,6 +1086,7 @@ impl DocumentView {
         } else {
             self.preview_task = None;
             let resolved = preview_ext::resolve_reference_links(&source);
+            self.preview_revision += 1;
             self.preview
                 .update(cx, |preview, cx| preview.set_text(&resolved, cx));
             if self.search_open && !self.search.query().is_empty() {
@@ -2357,26 +2426,33 @@ mod tests {
             })
             .unwrap()
         });
+        let doc = doc_entity.unwrap();
         cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
-            use gpui_kit::component::WindowExt as _;
-
-            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.open_search(window, cx);
                 doc.search_input.update(cx, |input, cx| {
                     input.set_value("TargetMatch", window, cx);
                 });
                 doc.on_search_query_changed(cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            use gpui_kit::component::WindowExt as _;
+
+            doc.read_with(cx, |doc, _| {
                 assert_eq!(doc.search.total_matches(), 1);
             });
             window.draw(cx).clear(cx);
 
-            doc_entity.as_ref().unwrap().read_with(cx, |doc, _| {
+            doc.read_with(cx, |doc, _| {
                 assert!(doc.analysis.blocks.is_table(1));
             });
 
             assert!(!window.has_active_dialog(cx));
             let table_md = "| Column 1 | Column 2 |\n| --- | --- |\n| Item Alpha | TargetMatch |\n| Item Gamma | Item Delta |";
-            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.open_expanded_table(table_md, None, window, cx);
             });
             assert!(window.has_active_dialog(cx));
@@ -2495,21 +2571,46 @@ mod tests {
             })
             .unwrap()
         });
+        let doc = doc_entity.unwrap();
         cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
-            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.open_search(window, cx);
                 doc.search_input.update(cx, |input, cx| {
                     input.set_value("alpha", window, cx);
                 });
                 doc.on_search_query_changed(cx);
-                assert_eq!(doc.search.total_matches(), 4);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(doc.read(cx).search.total_matches(), 4);
+        });
 
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.toggle_search_option(SearchOption::CaseSensitive, window, cx);
-                assert_eq!(doc.search.total_matches(), 3);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(doc.read(cx).search.total_matches(), 3);
+        });
 
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.toggle_search_option(SearchOption::WholeWord, window, cx);
-                assert_eq!(doc.search.total_matches(), 2);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(doc.read(cx).search.total_matches(), 2);
+        });
 
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc.update(cx, |doc, cx| {
                 // Switch to regex mode and verify invalid + valid regex rendering without panic.
                 doc.toggle_search_option(SearchOption::WholeWord, window, cx);
                 doc.toggle_search_option(SearchOption::Regex, window, cx);
@@ -2522,16 +2623,43 @@ mod tests {
             });
             window.draw(cx).clear(cx);
 
-            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+            doc.update(cx, |doc, cx| {
                 doc.search_input.update(cx, |input, cx| {
                     input.set_value(r"alpha \d+", window, cx);
                 });
                 doc.on_search_query_changed(cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc.read_with(cx, |doc, _| {
                 assert!(doc.search.error().is_none());
                 assert_eq!(doc.search.total_matches(), 1);
             });
             window.draw(cx).clear(cx);
         })
         .unwrap();
+
+        // Superseded query must be cancelled/ignored so only the latest query's matches apply.
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc.update(cx, |doc, cx| {
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value("alpha", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value("456", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let search = &doc.read(cx).search;
+            assert_eq!(search.query(), "456");
+            assert_eq!(search.total_matches(), 1);
+        });
     }
 }

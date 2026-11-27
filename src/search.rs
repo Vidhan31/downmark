@@ -57,6 +57,48 @@ enum CompiledMatcher {
     },
 }
 
+/// Self-contained match job that can be executed off the UI thread.
+#[derive(Debug, Clone)]
+pub(crate) struct SearchJob {
+    matcher: CompiledMatcher,
+    options: SearchOptions,
+    pub(crate) query: String,
+    preserve_near_offset: Option<usize>,
+}
+
+/// Output of a completed [`SearchJob`].
+#[derive(Debug)]
+pub(crate) struct SearchJobResult {
+    pub(crate) query: String,
+    pub(crate) options: SearchOptions,
+    pub(crate) matches: Vec<Range<usize>>,
+    pub(crate) truncated: bool,
+    pub(crate) preserve_near_offset: Option<usize>,
+    pub(crate) ruler_matches: Option<Vec<Range<usize>>>,
+}
+
+impl SearchJob {
+    pub(crate) fn run(
+        self,
+        rendered_text: &str,
+        editor_text: Option<&str>,
+        ruler_limit: usize,
+    ) -> SearchJobResult {
+        let (matches, truncated) =
+            collect_matches(&self.matcher, self.options, rendered_text, MAX_MATCHES);
+        let ruler_matches = editor_text
+            .map(|text| collect_matches(&self.matcher, self.options, text, ruler_limit).0);
+        SearchJobResult {
+            query: self.query,
+            options: self.options,
+            matches,
+            truncated,
+            preserve_near_offset: self.preserve_near_offset,
+            ruler_matches,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DocumentSearch {
     query: String,
@@ -134,6 +176,7 @@ impl DocumentSearch {
     ///
     /// Preserves the nearest match position when the query and options are unchanged
     /// (for example, after a document edit refreshes the preview).
+    #[cfg(test)]
     pub(crate) fn update_query(&mut self, query: &str, rendered_text: &str) {
         let same_spec = self
             .compiled_for
@@ -148,7 +191,7 @@ impl DocumentSearch {
     }
 
     /// Replaces the active search options and recomputes matches against `rendered_text`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used in tests"))]
+    #[cfg(test)]
     pub(crate) fn set_options(&mut self, options: SearchOptions, rendered_text: &str) {
         if self.options == options {
             return;
@@ -159,6 +202,7 @@ impl DocumentSearch {
     }
 
     /// Toggles one search option and recomputes matches against `rendered_text`.
+    #[cfg(test)]
     pub(crate) fn toggle_option(&mut self, option: SearchOption, rendered_text: &str) {
         let prev_offset = self.current_match().map(|range| range.start);
         self.options.toggle(option);
@@ -174,13 +218,33 @@ impl DocumentSearch {
         collect_matches(matcher, self.options, text, limit).0
     }
 
-    fn recompute(&mut self, rendered_text: &str, preserve_near_offset: Option<usize>) {
-        if self.query.trim().is_empty() {
+    /// Toggles one search option flag without running matching yet.
+    pub(crate) fn toggle_option_flag(&mut self, option: SearchOption) {
+        self.options.toggle(option);
+    }
+
+    /// Returns true when `query` and `options` match the last compiled specification.
+    pub(crate) fn matches_spec(&self, query: &str, options: SearchOptions) -> bool {
+        self.compiled_for
+            .as_ref()
+            .is_some_and(|(prev_q, prev_opts)| prev_q == query && *prev_opts == options)
+    }
+
+    /// Updates query/compilation state and returns a background [`SearchJob`] if non-empty
+    /// and valid. Clears matches immediately when empty or on regex syntax error.
+    pub(crate) fn prepare_job(
+        &mut self,
+        query: &str,
+        preserve_near_offset: Option<usize>,
+    ) -> Option<SearchJob> {
+        if query.trim().is_empty() {
             let options = self.options;
             self.clear_query();
             self.options = options;
-            return;
+            return None;
         }
+
+        self.query = query.to_string();
 
         let needs_compile = self
             .compiled_for
@@ -201,28 +265,39 @@ impl DocumentSearch {
                     self.matches.clear();
                     self.matches_truncated = false;
                     self.current_match_index = 0;
-                    return;
+                    return None;
                 }
             }
         }
 
-        if let Some(matcher) = &self.compiled {
-            let (matches, truncated) =
-                collect_matches(matcher, self.options, rendered_text, MAX_MATCHES);
-            self.matches = matches;
-            self.matches_truncated = truncated;
-        } else {
-            self.matches.clear();
-            self.matches_truncated = false;
-        }
+        self.compiled.as_ref().map(|matcher| SearchJob {
+            matcher: matcher.clone(),
+            options: self.options,
+            query: self.query.clone(),
+            preserve_near_offset,
+        })
+    }
 
-        self.current_match_index = match preserve_near_offset {
+    /// Applies match ranges produced by a [`SearchJob`].
+    pub(crate) fn apply_result(&mut self, result: SearchJobResult) {
+        self.matches = result.matches;
+        self.matches_truncated = result.truncated;
+        self.current_match_index = match result.preserve_near_offset {
             Some(offset) if !self.matches.is_empty() => self
                 .matches
                 .partition_point(|range| range.start < offset)
                 .min(self.matches.len() - 1),
             _ => 0,
         };
+    }
+
+    #[cfg(test)]
+    fn recompute(&mut self, rendered_text: &str, preserve_near_offset: Option<usize>) {
+        let query = self.query.clone();
+        if let Some(job) = self.prepare_job(&query, preserve_near_offset) {
+            let result = job.run(rendered_text, None, 0);
+            self.apply_result(result);
+        }
     }
 
     pub(crate) fn next_match(&mut self) -> Option<&Range<usize>> {
