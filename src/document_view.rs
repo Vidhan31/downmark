@@ -43,7 +43,7 @@ use crate::{
     format::{self, Edit},
     images, preview_ext,
     scroll_sync::{ScrollDriver, ScrollSynchronizer, SyncMode},
-    search::DocumentSearch,
+    search::{DocumentSearch, SearchOption},
     search_overlay,
     session::{self, DiskStamp, Recovery},
     settings::Layout,
@@ -665,6 +665,25 @@ impl DocumentView {
         }
     }
 
+    pub(crate) fn toggle_search_option(
+        &mut self,
+        option: SearchOption,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let rendered_text = self.preview.read(cx).rendered_text();
+        self.search.toggle_option(option, rendered_text.as_str());
+        self.update_search_highlights(cx);
+        self.sync_editor_search_ruler(cx);
+        if let Some(target_range) = self.search.current_match().cloned() {
+            self.scroll_to_match(&target_range, cx);
+        }
+        self.search_input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
     fn scroll_to_match(&mut self, target_range: &Range<usize>, cx: &mut Context<'_, Self>) {
         self.set_scroll_driver(ScrollDriver::Preview);
         let rendered_text = self.preview.read(cx).rendered_text();
@@ -768,20 +787,13 @@ impl DocumentView {
                 );
             }
         } else if self.search_open && !self.last_search_ruler_query.trim().is_empty() {
-            let query = self.last_search_ruler_query.trim();
             let editor_text = editor.value();
-            let query_lower = query.to_lowercase();
-            let text_lower = editor_text.to_lowercase();
-            let mut search_start = 0;
-            while let Some(pos) = text_lower[search_start..].find(&query_lower) {
-                let match_start = search_start + pos;
-                let match_end = match_start + query.len();
+            for range in self.search.find_matches_in(editor_text.as_str(), 2000) {
                 decorations.push(
-                    gpui_kit::base::input::OverviewRulerDecoration::new(match_start..match_end)
+                    gpui_kit::base::input::OverviewRulerDecoration::new(range)
                         .with_lane(gpui_kit::base::input::OverviewRulerLane::Full)
                         .with_color(color),
                 );
-                search_start = match_start + query_lower.len().max(1);
             }
         }
         self.search_ruler_decorations.set(decorations, cx);
@@ -974,7 +986,6 @@ impl DocumentView {
         self.dirty = true;
         self.set_scroll_driver(ScrollDriver::Editor);
         self.revision += 1;
-        self.search.invalidate_cache();
         self.schedule_preview(policy, cx);
         self.schedule_analysis(policy, cx);
         cx.notify();
@@ -1657,6 +1668,8 @@ impl DocumentView {
     }
 
     fn render_preview_search_ruler(&self, cx: &App) -> impl IntoElement {
+        const MAX_RULER_MARKS: usize = 500;
+
         let total_matches = self.search.total_matches();
         if total_matches == 0 || self.preview_height <= px(20.) {
             return div().id("preview-overview-ruler-empty").into_any_element();
@@ -1672,9 +1685,13 @@ impl DocumentView {
         let track_width = gpui_kit::base::Scrollbar::width();
         let available = (track_height - px(6.)).max(px(0.));
 
-        let mut marks = Vec::new();
-        for (i, range) in self.search.matches().iter().enumerate() {
-            let is_current = i == current_ix;
+        let matches = self.search.matches();
+        let step = (total_matches / MAX_RULER_MARKS).max(1);
+        let mut marks = Vec::with_capacity(total_matches.min(MAX_RULER_MARKS) + 1);
+        for (i, range) in matches.iter().enumerate() {
+            if i == current_ix || i % step != 0 {
+                continue;
+            }
             #[expect(
                 clippy::cast_precision_loss,
                 clippy::as_conversions,
@@ -1682,18 +1699,35 @@ impl DocumentView {
             )]
             let fraction = (range.start as f32 / total_len as f32).clamp(0.0, 1.0);
             let top = available * fraction;
-            let mark_color = if is_current { current_color } else { color };
-            let mark_height = if is_current { px(6.) } else { px(4.) };
-
             marks.push(
                 div()
                     .absolute()
                     .top(top)
                     .right_0()
                     .w(track_width)
-                    .h(mark_height)
-                    .bg(mark_color)
-                    .opacity(if is_current { 1.0 } else { 0.85 })
+                    .h(px(4.))
+                    .bg(color)
+                    .opacity(0.85)
+                    .rounded(px(1.)),
+            );
+        }
+        if let Some(current_range) = matches.get(current_ix) {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::as_conversions,
+                reason = "Character offset into preview height fraction"
+            )]
+            let fraction = (current_range.start as f32 / total_len as f32).clamp(0.0, 1.0);
+            let top = available * fraction;
+            marks.push(
+                div()
+                    .absolute()
+                    .top(top)
+                    .right_0()
+                    .w(track_width)
+                    .h(px(6.))
+                    .bg(current_color)
+                    .opacity(1.0)
                     .rounded(px(1.)),
             );
         }
@@ -1822,24 +1856,36 @@ impl DocumentView {
             .when(self.search_open, |this| {
                 let match_display = self.search.match_display();
                 let total_matches = self.search.total_matches();
+                let options = self.search.options();
+                let error = self.search.error().map(str::to_string);
                 let doc = cx.weak_entity();
+                let doc_toggle = doc.clone();
                 let doc_prev = doc.clone();
                 let doc_next = doc.clone();
                 let doc_close = doc;
-                this.child(search_overlay::SearchOverlay::new(
-                    &self.search_input,
-                    &match_display,
-                    total_matches,
-                    move |_, cx| {
-                        _ = doc_prev.update(cx, DocumentView::previous_search_match);
-                    },
-                    move |_, cx| {
-                        _ = doc_next.update(cx, DocumentView::next_search_match);
-                    },
-                    move |window, cx| {
-                        _ = doc_close.update(cx, |this, cx| this.close_search(window, cx));
-                    },
-                ))
+                this.child(
+                    search_overlay::SearchOverlay::new(
+                        &self.search_input,
+                        &match_display,
+                        total_matches,
+                        move |_, cx| {
+                            _ = doc_prev.update(cx, DocumentView::previous_search_match);
+                        },
+                        move |_, cx| {
+                            _ = doc_next.update(cx, DocumentView::next_search_match);
+                        },
+                        move |window, cx| {
+                            _ = doc_close.update(cx, |this, cx| this.close_search(window, cx));
+                        },
+                    )
+                    .options(options)
+                    .error(error.as_deref())
+                    .on_toggle_option(move |option, window, cx| {
+                        _ = doc_toggle.update(cx, |this, cx| {
+                            this.toggle_search_option(option, window, cx);
+                        });
+                    }),
+                )
             })
             .when(
                 self.search_open && self.search.total_matches() > 0,
@@ -2429,5 +2475,63 @@ mod tests {
         doc.read_with(cx, |view, cx| {
             assert!(view.editor.read(cx).value().contains("- [x] Task"));
         });
+    }
+
+    #[gpui_kit::test]
+    fn find_bar_toggles_case_whole_word_and_regex_options(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut doc_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                layout: Layout::Split,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let md = "Alpha alpha alphabet 123\nalpha 456";
+                let doc = cx
+                    .new(|cx| DocumentView::new(md.to_string(), None, LineEnding::Lf, window, cx));
+                doc_entity = Some(doc.clone());
+                doc
+            })
+            .unwrap()
+        });
+        cx.update_window(window_handle, |_, window: &mut gpui_kit::Window, cx| {
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.open_search(window, cx);
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value("alpha", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+                assert_eq!(doc.search.total_matches(), 4);
+
+                doc.toggle_search_option(SearchOption::CaseSensitive, window, cx);
+                assert_eq!(doc.search.total_matches(), 3);
+
+                doc.toggle_search_option(SearchOption::WholeWord, window, cx);
+                assert_eq!(doc.search.total_matches(), 2);
+
+                // Switch to regex mode and verify invalid + valid regex rendering without panic.
+                doc.toggle_search_option(SearchOption::WholeWord, window, cx);
+                doc.toggle_search_option(SearchOption::Regex, window, cx);
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value("[unclosed", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+                assert_eq!(doc.search.total_matches(), 0);
+                assert!(doc.search.error().is_some());
+            });
+            window.draw(cx).clear(cx);
+
+            doc_entity.as_ref().unwrap().update(cx, |doc, cx| {
+                doc.search_input.update(cx, |input, cx| {
+                    input.set_value(r"alpha \d+", window, cx);
+                });
+                doc.on_search_query_changed(cx);
+                assert!(doc.search.error().is_none());
+                assert_eq!(doc.search.total_matches(), 1);
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
     }
 }

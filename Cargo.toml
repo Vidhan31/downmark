@@ -113,6 +113,8 @@ gpui-kit = { version = "0.11.0", features = [
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.14" }
 # Same Markdown parser the preview uses; drives scroll-sync block indexing.
 markdown = "1.0.0"
+# Linear-time regex and case-insensitive search in the preview Find bar.
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 # Display width of table cells, so wide characters line up.
 unicode-width = "0.2"
