@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-28
+
+### Added
+- Agent Workflow Hub and Skill Catalog. The home tab now includes a sidebar and category bar to browse agent skills, rules, and Markdown workflows across workspace and global directories, with project filtering.
+- Native filesystem watching. Replaced the 2-second polling loop with OS filesystem notifications for open files, recent files, and agent directories. Rescanning now removes missing files, missing folders, and broken symlinks.
+- Find bar search options. Added toggles for case-sensitive, whole-word, and regular expression matching, with match collection running off the UI thread.
+- Copy active file path shortcut. Added a menu action and `Ctrl+Shift+C` shortcut, or `Cmd+Shift+C` on macOS, to copy the active document's path.
+
+### Changed
+- Upgraded `gpui-kit` to 0.11.0, `resvg` to 0.50, and `fontdb` to 0.24.
+- External files now open in standard layout by default instead of Glance mode.
+- Added a rescan progress spinner to the home bar and updated the About dialog.
+
+### Fixed
+- Find input shortcut interception. Preview shortcuts no longer intercept keystrokes while typing in the Find bar.
+- Click activation on mouse release. Interactive buttons, tabs, and hub rows now trigger on mouse release over the same element instead of on mouse press.
+- Workspace tab icon. Removed the default document icon from workspace tabs.
+
 ## [1.3.0] - 2026-11-16
 
 ### Added
@@ -73,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release of Downmark, a fast, native Markdown editor and viewer built with GPUI.
 
-[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/Vidhan31/downmark/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/Vidhan31/downmark/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/Vidhan31/downmark/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/Vidhan31/downmark/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/Vidhan31/downmark/compare/v1.1.0...v1.2.0
