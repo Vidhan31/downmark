@@ -271,8 +271,10 @@ impl Settings {
     /// a freshly scanned snapshot's `valid_projects`.
     pub(crate) fn prune_missing_with_projects(&mut self, valid_projects: &[PathBuf]) -> bool {
         let prev_projects = self.project_folders.len();
-        self.project_folders
-            .retain(|dir| valid_projects.contains(dir));
+        self.project_folders.retain(|dir| {
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            valid_projects.contains(&canonical)
+        });
         let projects_changed = self.project_folders.len() != prev_projects;
         self.prune_non_project_entries() || projects_changed
     }

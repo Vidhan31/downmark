@@ -55,8 +55,10 @@ pub(crate) struct WatchDirSet {
     pub(crate) file_parents: HashSet<PathBuf>,
     pub(crate) catalog_dirs: HashSet<PathBuf>,
     pub(crate) skill_containers: HashSet<PathBuf>,
+    pub(crate) skill_container_links: HashSet<PathBuf>,
     pub(crate) catalog_ancestors: HashMap<PathBuf, HashSet<PathBuf>>,
     pub(crate) file_ancestors: HashMap<PathBuf, HashSet<PathBuf>>,
+    pub(crate) external_catalog_targets: HashMap<PathBuf, HashSet<PathBuf>>,
     pub(crate) incomplete: bool,
 }
 
@@ -67,6 +69,7 @@ impl WatchDirSet {
             .chain(self.catalog_dirs.iter())
             .chain(self.catalog_ancestors.keys())
             .chain(self.file_ancestors.keys())
+            .chain(self.external_catalog_targets.keys())
     }
 }
 
@@ -90,8 +93,10 @@ struct ActiveWatchFilter {
     file_parents: HashSet<PathBuf>,
     catalog_dirs: HashSet<PathBuf>,
     skill_containers: HashSet<PathBuf>,
+    skill_container_links: HashSet<PathBuf>,
     catalog_ancestors: HashMap<PathBuf, HashSet<PathBuf>>,
     file_ancestors: HashMap<PathBuf, HashSet<PathBuf>>,
+    external_catalog_targets: HashMap<PathBuf, HashSet<PathBuf>>,
 }
 
 /// Watches open documents (via their parent directories) and workspace folders
@@ -194,9 +199,15 @@ impl DiskWatcher {
                 .skill_containers
                 .clone_from(&dir_set.skill_containers);
             filter
+                .skill_container_links
+                .clone_from(&dir_set.skill_container_links);
+            filter
                 .catalog_ancestors
                 .clone_from(&dir_set.catalog_ancestors);
             filter.file_ancestors.clone_from(&dir_set.file_ancestors);
+            filter
+                .external_catalog_targets
+                .clone_from(&dir_set.external_catalog_targets);
         }
 
         let mut outcome = WatchSyncOutcome::default();
@@ -327,6 +338,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                 &root,
                 MAX_PROJECT_WATCH_DEPTH,
                 &mut set.catalog_dirs,
+                &mut set.external_catalog_targets,
                 &mut explored_remaining,
                 &mut set.incomplete,
             );
@@ -335,9 +347,13 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                 if container.is_dir() {
                     let canon_container = canonical_or_owned(&container);
                     set.skill_containers.insert(canon_container.clone());
+                    if canon_container != container {
+                        set.skill_container_links.insert(container);
+                    }
                     walk_skills_container_dirs(
                         &canon_container,
                         &mut set.catalog_dirs,
+                        &mut set.external_catalog_targets,
                         &mut explored_remaining,
                         &mut set.incomplete,
                     );
@@ -357,6 +373,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     &root,
                     MAX_GLOBAL_SKILL_WATCH_DEPTH,
                     &mut set.catalog_dirs,
+                    &mut set.external_catalog_targets,
                     &mut explored_remaining,
                     &mut set.incomplete,
                 );
@@ -366,9 +383,13 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
             if dir.is_dir() {
                 let canon_container = canonical_or_owned(&dir);
                 set.skill_containers.insert(canon_container.clone());
+                if canon_container != dir {
+                    set.skill_container_links.insert(dir);
+                }
                 walk_skills_container_dirs(
                     &canon_container,
                     &mut set.catalog_dirs,
+                    &mut set.external_catalog_targets,
                     &mut explored_remaining,
                     &mut set.incomplete,
                 );
@@ -446,6 +467,7 @@ fn walk_non_noise_dirs(
     root: &Path,
     max_depth: usize,
     out: &mut HashSet<PathBuf>,
+    external_targets: &mut HashMap<PathBuf, HashSet<PathBuf>>,
     explored_remaining: &mut HashMap<PathBuf, usize>,
     incomplete: &mut bool,
 ) {
@@ -475,6 +497,20 @@ fn walk_non_noise_dirs(
                 *incomplete = true;
                 continue;
             };
+            if ft.is_symlink() {
+                let entry_path = entry.path();
+                if is_catalog_file(&entry_path)
+                    && let Ok(canon_target) = entry_path.canonicalize()
+                    && canon_target.is_file()
+                    && let Some(parent) = canon_target.parent()
+                {
+                    external_targets
+                        .entry(parent.to_path_buf())
+                        .or_default()
+                        .insert(canon_target);
+                }
+                continue;
+            }
             if !ft.is_dir() {
                 continue;
             }
@@ -494,6 +530,7 @@ fn walk_non_noise_dirs(
 fn walk_skills_container_dirs(
     container: &Path,
     out: &mut HashSet<PathBuf>,
+    external_targets: &mut HashMap<PathBuf, HashSet<PathBuf>>,
     explored_remaining: &mut HashMap<PathBuf, usize>,
     incomplete: &mut bool,
 ) {
@@ -518,6 +555,7 @@ fn walk_skills_container_dirs(
                 &canon,
                 MAX_SKILL_PACKAGE_DEPTH,
                 out,
+                external_targets,
                 explored_remaining,
                 incomplete,
             );
@@ -601,18 +639,41 @@ fn matches_ancestor_target(path: &Path, ancestors: &HashMap<PathBuf, HashSet<Pat
 }
 
 fn is_catalog_relevant_path(kind: EventKind, path: &Path, filter: &ActiveWatchFilter) -> bool {
-    if path
-        .parent()
-        .is_some_and(|parent| filter.skill_containers.contains(parent))
-    {
-        return matches!(
+    if filter.skill_container_links.contains(path)
+        && matches!(
             kind,
             EventKind::Create(_)
                 | EventKind::Remove(_)
                 | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other)
                 | EventKind::Any
                 | EventKind::Other
-        );
+        )
+    {
+        return true;
+    }
+
+    if path.parent().is_some_and(|parent| {
+        filter
+            .external_catalog_targets
+            .get(parent)
+            .is_some_and(|targets| targets.contains(path))
+    }) {
+        return true;
+    }
+
+    if path
+        .parent()
+        .is_some_and(|parent| filter.skill_containers.contains(parent))
+        && matches!(
+            kind,
+            EventKind::Create(_)
+                | EventKind::Remove(_)
+                | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other)
+                | EventKind::Any
+                | EventKind::Other
+        )
+    {
+        return true;
     }
 
     let inside_catalog = path
@@ -902,21 +963,26 @@ mod tests {
         fs::create_dir_all(&unreadable).unwrap();
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let targets = WatchTargets {
-            open_files: Vec::new(),
-            recent_files: Vec::new(),
-            project_folders: vec![root.clone()],
-            global_watch: GlobalWatch::Skip,
-        };
-        let dirs = collect_watch_dirs(&targets);
+        let actually_denied = matches!(
+            fs::read_dir(&unreadable),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied
+        );
+        if actually_denied {
+            let targets = WatchTargets {
+                open_files: Vec::new(),
+                recent_files: Vec::new(),
+                project_folders: vec![root.clone()],
+                global_watch: GlobalWatch::Skip,
+            };
+            let dirs = collect_watch_dirs(&targets);
+            assert!(dirs.incomplete);
+
+            let (mut watcher, _rx) = DiskWatcher::new();
+            watcher.apply_sync(&targets, &dirs);
+            assert!(watcher.is_degraded());
+        }
+
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(dirs.incomplete);
-
-        let (mut watcher, _rx) = DiskWatcher::new();
-        watcher.apply_sync(&targets, &dirs);
-        assert!(watcher.is_degraded());
-
         let _ = fs::remove_dir_all(&root);
     }
 }

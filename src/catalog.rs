@@ -660,7 +660,7 @@ impl FolderCatalog {
     ) -> Self {
         let mut canonical_projects = Vec::new();
         for p in &project_folders {
-            if p.is_dir() {
+            if crate::settings::path_exists_as_dir_or_unconfirmed(p) {
                 let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
                 if !canonical_projects.contains(&canonical) {
                     canonical_projects.push(canonical);

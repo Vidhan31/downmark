@@ -112,13 +112,20 @@ enum Placement {
     ReplaceActive,
 }
 
+/// Outcome of reading a document's disk state against its known stamp.
+enum DiskReadOutcome {
+    NoChange,
+    Change(DiskChange),
+    Retry,
+}
+
 /// Validated disk-check result paired with the document identity and stamp it was checked against.
 struct CheckedDiskChange {
     id: EntityId,
     expected_path: PathBuf,
     expected_known: Option<DiskStamp>,
     expected_saved_hash: u64,
-    change: DiskChange,
+    outcome: DiskReadOutcome,
 }
 
 #[cfg_attr(test, expect(dead_code, reason = "constructed in live watcher loop"))]
@@ -140,28 +147,33 @@ enum DiskChange {
 }
 
 /// Reads `path` and pairs the loaded contents with a validated `DiskStamp` from
-/// the same read, retrying briefly if the file changes mid-read.
+/// the same read, returning `Retry` when a transient read failure or mid-read
+/// modification prevents a consistent snapshot.
 fn read_validated_disk_change(
     path: &Path,
     known: Option<DiskStamp>,
     saved_hash: u64,
-) -> Option<DiskChange> {
+) -> DiskReadOutcome {
     for _ in 0..2 {
         let stamp_before = DiskStamp::of(path);
         if stamp_before == known {
-            return None;
+            return DiskReadOutcome::NoChange;
         }
         if stamp_before.is_none() {
-            return known.is_some().then_some(DiskChange::Missing);
+            return if known.is_some() {
+                DiskReadOutcome::Change(DiskChange::Missing)
+            } else {
+                DiskReadOutcome::NoChange
+            };
         }
         let Ok(loaded) = document::load(path) else {
-            return None;
+            return DiskReadOutcome::Retry;
         };
         let stamp_after = DiskStamp::of(path);
         if stamp_after != stamp_before {
             continue;
         }
-        return Some(if content_hash(&loaded.text) == saved_hash {
+        return DiskReadOutcome::Change(if content_hash(&loaded.text) == saved_hash {
             DiskChange::Touched(stamp_after)
         } else {
             DiskChange::Changed {
@@ -171,7 +183,7 @@ fn read_validated_disk_change(
             }
         });
     }
-    None
+    DiskReadOutcome::Retry
 }
 
 #[derive(Clone)]
@@ -967,9 +979,9 @@ impl Workspace {
             .background_executor()
             .spawn(async move { FolderCatalog::scan_snapshot(project_folders) });
         cx.spawn_in(window, async move |this, cx| {
-            let snapshot = task.await;
+            let mut snapshot = task.await;
             _ = this.update_in(cx, |this, window, cx| {
-                let followup = matches!(
+                let mut followup = matches!(
                     this.rescan_state,
                     RescanState::InFlight {
                         pending_followup: true
@@ -978,6 +990,24 @@ impl Workspace {
                 this.rescan_state = RescanState::Idle;
 
                 if this.rescan_generation == generation {
+                    // Preserve any configured project root that exists at commit time
+                    // even if it was absent when `scan_snapshot` ran, and schedule a
+                    // follow-up scan so its contents are indexed.
+                    let existing_roots: Vec<PathBuf> = this
+                        .catalog
+                        .read(cx)
+                        .project_folders()
+                        .iter()
+                        .filter(|dir| {
+                            !snapshot.project_folders.contains(*dir)
+                                && crate::settings::path_exists_as_dir_or_unconfirmed(dir)
+                        })
+                        .cloned()
+                        .collect();
+                    if !existing_roots.is_empty() {
+                        snapshot.project_folders.extend(existing_roots);
+                        followup = true;
+                    }
                     AppSettings::update(cx, |settings| {
                         settings.prune_missing_with_projects(&snapshot.project_folders);
                     });
@@ -1078,6 +1108,7 @@ impl Workspace {
             #[cfg(not(test))]
             {
                 let mut resync_tick: u8 = 0;
+                let mut next_poll_at: Option<std::time::Instant> = None;
                 loop {
                     let degraded = this
                         .read_with(cx, |this, _| this.disk_watcher.is_degraded())
@@ -1087,12 +1118,15 @@ impl Workspace {
                             Event(bool),
                             Timer,
                         }
+                        let deadline = *next_poll_at.get_or_insert_with(|| {
+                            std::time::Instant::now() + FALLBACK_WATCH_INTERVAL
+                        });
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
                         let wakeup = smol::future::race(
                             async { DegradedWakeup::Event(watch_rx.recv().await.is_ok()) },
                             async {
-                                cx.background_executor()
-                                    .timer(FALLBACK_WATCH_INTERVAL)
-                                    .await;
+                                cx.background_executor().timer(remaining).await;
                                 DegradedWakeup::Timer
                             },
                         )
@@ -1107,6 +1141,8 @@ impl Workspace {
                                 }
                             }
                             DegradedWakeup::Timer => {
+                                next_poll_at =
+                                    Some(std::time::Instant::now() + FALLBACK_WATCH_INTERVAL);
                                 resync_tick = resync_tick.wrapping_add(1);
                                 let retry_sync = if resync_tick.is_multiple_of(5) {
                                     SyncRetry::Retry
@@ -1127,6 +1163,7 @@ impl Workspace {
                     }
 
                     resync_tick = 0;
+                    next_poll_at = None;
                     if watch_rx.recv().await.is_err() {
                         break;
                     }
@@ -1304,6 +1341,15 @@ impl Workspace {
 
     /// Look for open files other programs changed, moved or deleted.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.check_disk_with_retry(0, window, cx);
+    }
+
+    fn check_disk_with_retry(
+        &mut self,
+        retry_attempt: u8,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
             .tabs
             .iter()
@@ -1325,24 +1371,36 @@ impl Workspace {
             targets
                 .into_iter()
                 .filter_map(|(id, path, known, saved_hash)| {
-                    let change = read_validated_disk_change(&path, known, saved_hash)?;
-                    Some(CheckedDiskChange {
+                    let outcome = read_validated_disk_change(&path, known, saved_hash);
+                    (!matches!(outcome, DiskReadOutcome::NoChange)).then_some(CheckedDiskChange {
                         id,
                         expected_path: path,
                         expected_known: known,
                         expected_saved_hash: saved_hash,
-                        change,
+                        outcome,
                     })
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;
+            let mut needs_retry = false;
             _ = this.update_in(cx, |this, window, cx| {
                 for checked in changes {
-                    this.apply_disk_change(checked, window, cx);
+                    if matches!(checked.outcome, DiskReadOutcome::Retry) {
+                        needs_retry = true;
+                    } else {
+                        this.apply_disk_change(checked, window, cx);
+                    }
                 }
             });
+            if needs_retry && retry_attempt < 2 {
+                let delay = Duration::from_millis(100 * u64::from(retry_attempt + 1));
+                cx.background_executor().timer(delay).await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.check_disk_with_retry(retry_attempt + 1, window, cx);
+                });
+            }
         })
         .detach();
     }
@@ -1358,8 +1416,11 @@ impl Workspace {
             expected_path,
             expected_known,
             expected_saved_hash,
-            change,
+            outcome,
         } = checked;
+        let DiskReadOutcome::Change(change) = outcome else {
+            return;
+        };
         let Some(doc) = self.tab_index(id).and_then(|ix| match &self.tabs[ix] {
             WorkspaceTab::Document(doc) => Some(doc.clone()),
             WorkspaceTab::NewTab(_) => None,
@@ -1385,7 +1446,9 @@ impl Workspace {
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
-                if let Some(missing_path) = doc.read(cx).path().cloned() {
+                if let Some(missing_path) = doc.read(cx).path().cloned()
+                    && !crate::settings::path_exists_as_file_or_unconfirmed(&missing_path)
+                {
                     AppSettings::update(cx, |settings| {
                         settings
                             .recent_files
