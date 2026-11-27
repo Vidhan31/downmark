@@ -125,7 +125,7 @@ serde = { version = "1", features = ["derive"] }
 # Display width of table cells, so wide characters line up.
 unicode-width = "0.2"
 # Mermaid diagrams, parsed, laid out and drawn in pure Rust.
-merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "complete-svg"] }
+merman = { version = "0.10.0", default-features = false, features = ["all-diagrams", "complete-svg"] }
 # Files the system asks Downmark to open arrive on another thread.
 futures = "0.3"
 # Native filesystem watching for open documents and workspace folders.
