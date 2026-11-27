@@ -231,6 +231,48 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        Self::new_inner(
+            files,
+            layout,
+            glance,
+            app_menu_bar,
+            #[cfg(test)]
+            None,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_config_dir(
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
+        glance: GlanceStart,
+        app_menu_bar: Entity<AppMenuBar>,
+        config_dir: impl Into<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        Self::new_inner(
+            files,
+            layout,
+            glance,
+            app_menu_bar,
+            Some(config_dir.into()),
+            window,
+            cx,
+        )
+    }
+
+    fn new_inner(
+        files: Vec<FileTarget>,
+        layout: Option<Layout>,
+        glance: GlanceStart,
+        app_menu_bar: Entity<AppMenuBar>,
+        #[cfg(test)] config_dir: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         let settings = AppSettings::get(cx).clone();
         let headings = cx.new(|cx| CommandState::new(window, cx));
 
@@ -287,10 +329,46 @@ impl Workspace {
             glance_drag_active: false,
             explicit_layout: layout,
             #[cfg(test)]
-            config_dir: None,
+            config_dir,
         };
         this.restore(files, layout, glance, &settings, window, cx);
         this
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn load_session(&self) -> Option<Session> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return Session::load_from(&dir.join("session.json"));
+        }
+        Session::load()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn read_recovery(&self, id: &str) -> Option<session::Recovery> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return session::read_recovery_in(&dir.join("recovery"), id);
+        }
+        session::read_recovery(id)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(clippy::unused_self, reason = "uses test-only config_dir")
+    )]
+    fn orphaned_recoveries(&self, known: &HashSet<String>) -> Vec<(String, session::Recovery)> {
+        #[cfg(test)]
+        if let Some(dir) = &self.config_dir {
+            return session::orphaned_recoveries_in(&dir.join("recovery"), known);
+        }
+        session::orphaned_recoveries(known)
     }
 
     /// Reopen the last session's documents and anything recovered after a
@@ -308,7 +386,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let previous = Session::load();
+        let previous = self.load_session();
         #[cfg_attr(
             test,
             expect(unused_variables, reason = "tests do not use welcome document")
@@ -321,7 +399,8 @@ impl Workspace {
         for (ix, entry) in previous.documents.iter().enumerate() {
             let recovery = entry.recovery.as_deref().and_then(|id| {
                 referenced.insert(id.to_string());
-                session::read_recovery(id).map(|recovery| (id.to_string(), recovery))
+                self.read_recovery(id)
+                    .map(|recovery| (id.to_string(), recovery))
             });
             // Unsaved changes always come back; saved documents only when
             // the session is restored (just the active one without tabs).
@@ -359,7 +438,7 @@ impl Workspace {
             }
         }
 
-        let orphans = session::orphaned_recoveries(&referenced);
+        let orphans = self.orphaned_recoveries(&referenced);
         let recovered = orphans.len() + self.tabs.iter().filter(|tab| tab.is_dirty(cx)).count();
         for (id, recovery) in orphans {
             let doc = Self::restored_document(id, recovery, window, cx);
@@ -576,11 +655,6 @@ impl Workspace {
             (offset.x + dx).min(px(0.))
         };
         self.tabs_scroll_handle.set_offset(point(new_x, offset.y));
-    }
-
-    #[cfg(test)]
-    fn set_config_dir(&mut self, dir: impl Into<PathBuf>) {
-        self.config_dir = Some(dir.into());
     }
 
     fn scroll_tab_into_view(&mut self, ix: usize) {
@@ -2857,15 +2931,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             let initial_tab_count = ws.tabs.len();
             for _ in 0..15 {
                 ws.new_tab(TabActivation::Background, window, cx);
@@ -2888,15 +2962,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             for _ in 0..10 {
                 ws.new_tab(TabActivation::Background, window, cx);
             }
@@ -2925,15 +2999,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             assert_eq!(ws.tabs.len(), 1);
             assert_eq!(ws.active, 0);
 
@@ -2959,15 +3033,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
             ws.new_document(window, cx);
@@ -2990,15 +3064,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             assert!(!AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Split);
 
@@ -3027,15 +3101,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             assert!(AppSettings::get(cx).glance_mode);
             assert_eq!(AppSettings::get(cx).layout, Layout::Preview);
             ws
@@ -3056,15 +3130,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             assert!(AppSettings::get(cx).glance_mode);
 
             ws.set_layout(&SetLayout(Layout::Editor), window, cx);
@@ -3096,15 +3170,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -3147,15 +3221,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Glance,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             let doc = cx.new(|cx| {
                 DocumentView::new(
                     "# Hello\nWorld".to_string(),
@@ -3210,15 +3284,15 @@ mod tests {
                     DocumentView::new(table_md.to_string(), None, LineEnding::Lf, window, cx)
                 });
                 let entity = cx.new(|cx| {
-                    let mut ws = Workspace::new(
+                    let mut ws = Workspace::new_with_config_dir(
                         Vec::new(),
                         None,
                         GlanceStart::Normal,
                         app_menu_bar,
+                        config_dir.path(),
                         window,
                         cx,
                     );
-                    ws.set_config_dir(config_dir.path());
                     ws.tabs[0] = WorkspaceTab::Document(doc);
                     ws
                 });
@@ -3265,15 +3339,15 @@ mod tests {
                     cx,
                 )
             });
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             ws.tabs[0] = WorkspaceTab::Document(doc);
             ws
         });
@@ -3336,15 +3410,15 @@ mod tests {
                     )
                 });
                 let entity = cx.new(|cx| {
-                    let mut ws = Workspace::new(
+                    let mut ws = Workspace::new_with_config_dir(
                         Vec::new(),
                         None,
                         GlanceStart::Normal,
                         AppMenuBar::new(cx),
+                        config_dir.path(),
                         window,
                         cx,
                     );
-                    ws.set_config_dir(config_dir.path());
                     ws.tabs[0] = WorkspaceTab::Document(saved_doc);
                     ws.focus_active(window, cx);
                     ws
@@ -3417,15 +3491,15 @@ mod tests {
             }));
             gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
                 let entity = cx.new(|cx| {
-                    let mut ws = Workspace::new(
+                    let mut ws = Workspace::new_with_config_dir(
                         Vec::new(),
                         None,
                         GlanceStart::Normal,
                         AppMenuBar::new(cx),
+                        config_dir.path(),
                         window,
                         cx,
                     );
-                    ws.set_config_dir(config_dir.path());
                     let unsaved_doc = cx.new(|cx| {
                         DocumentView::new(
                             "# Unsaved\n".to_string(),
@@ -3500,15 +3574,15 @@ mod tests {
             };
             cx.set_global(AppSettings(settings));
             let app_menu_bar = AppMenuBar::new(cx);
-            let mut ws = Workspace::new(
+            let mut ws = Workspace::new_with_config_dir(
                 Vec::new(),
                 None,
                 GlanceStart::Normal,
                 app_menu_bar,
+                config_dir.path(),
                 window,
                 cx,
             );
-            ws.set_config_dir(config_dir.path());
             let doc =
                 cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
             doc_entity = Some(doc.clone());
@@ -3536,5 +3610,109 @@ mod tests {
             );
         });
         let _ = workspace;
+    }
+
+    #[gpui_kit::test]
+    fn restore_reads_session_and_recoveries_from_injected_config_dir(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let populated_dir = TestConfigDir::new("restore_populated");
+        let recovery_dir = populated_dir.path().join("recovery");
+        let session = Session {
+            documents: vec![SessionDocument {
+                path: Some(PathBuf::from("/tmp/session-doc.md")),
+                cursor: 0,
+                recovery: Some("rec-1".to_string()),
+            }],
+            active: 0,
+            window: None,
+        };
+        session.save_to(&populated_dir.path().join("session.json"));
+        session::write_recovery_to(
+            &recovery_dir.join("rec-1.json"),
+            &session::Recovery {
+                path: Some(PathBuf::from("/tmp/session-doc.md")),
+                text: "# Session Recovery\n".to_string(),
+                crlf: false,
+            },
+        )
+        .unwrap();
+        session::write_recovery_to(
+            &recovery_dir.join("orphan-1.json"),
+            &session::Recovery {
+                path: Some(PathBuf::from("/tmp/orphan-doc.md")),
+                text: "# Orphan Recovery\n".to_string(),
+                crlf: false,
+            },
+        )
+        .unwrap();
+
+        cx.update(gpui_kit::init);
+
+        let mut ws_populated = None;
+        cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        populated_dir.path(),
+                        window,
+                        cx,
+                    )
+                });
+                ws_populated = Some(entity.clone());
+                entity
+            })
+            .unwrap();
+        });
+        ws_populated.unwrap().read_with(cx, |ws, cx| {
+            assert_eq!(ws.tabs.len(), 2);
+            assert_eq!(
+                ws.tabs[0].path(cx).cloned(),
+                Some(PathBuf::from("/tmp/session-doc.md"))
+            );
+            assert_eq!(
+                ws.tabs[1].path(cx).cloned(),
+                Some(PathBuf::from("/tmp/orphan-doc.md"))
+            );
+        });
+
+        let empty_dir = TestConfigDir::new("restore_empty");
+        let mut ws_empty = None;
+        cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    Workspace::new_with_config_dir(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        empty_dir.path(),
+                        window,
+                        cx,
+                    )
+                });
+                ws_empty = Some(entity.clone());
+                entity
+            })
+            .unwrap();
+        });
+        ws_empty.unwrap().read_with(cx, |ws, _cx| {
+            assert_eq!(ws.tabs.len(), 1);
+            assert!(matches!(ws.tabs[0], WorkspaceTab::NewTab(_)));
+        });
     }
 }

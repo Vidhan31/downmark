@@ -130,8 +130,12 @@ pub(crate) fn read_recovery_from(path: &Path) -> Option<Recovery> {
     serde_json::from_str(&json).ok()
 }
 
+pub(crate) fn read_recovery_in(dir: &Path, id: &str) -> Option<Recovery> {
+    read_recovery_from(&recovery_path_in(dir, id)?)
+}
+
 pub(crate) fn read_recovery(id: &str) -> Option<Recovery> {
-    read_recovery_from(&recovery_path(id)?)
+    read_recovery_in(&recovery_dir()?, id)
 }
 
 pub(crate) fn remove_recovery(id: &str) {
