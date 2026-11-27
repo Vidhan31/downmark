@@ -11,11 +11,12 @@ use std::{
 };
 
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, Context, Entity, EntityId, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu, MouseButton, MouseDownEvent,
-    MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _, PathPromptOptions, Render,
-    ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, WindowBounds, WindowControlArea,
+    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EntityId,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu,
+    MouseButton, MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
+    PathPromptOptions, Render, ScrollEvent, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowBounds,
+    WindowControlArea,
     assets::IconName,
     base::{GlobalState, TextSelection},
     component::{
@@ -111,6 +112,22 @@ enum Placement {
     ReplaceActive,
 }
 
+/// Validated disk-check result paired with the document identity and stamp it was checked against.
+struct CheckedDiskChange {
+    id: EntityId,
+    expected_path: PathBuf,
+    expected_known: Option<DiskStamp>,
+    expected_saved_hash: u64,
+    change: DiskChange,
+}
+
+#[cfg_attr(test, expect(dead_code, reason = "constructed in live watcher loop"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRetry {
+    Skip,
+    Retry,
+}
+
 /// What the watcher found for one open file.
 enum DiskChange {
     Missing,
@@ -120,6 +137,41 @@ enum DiskChange {
         stamp: Option<DiskStamp>,
     },
     Touched(Option<DiskStamp>),
+}
+
+/// Reads `path` and pairs the loaded contents with a validated `DiskStamp` from
+/// the same read, retrying briefly if the file changes mid-read.
+fn read_validated_disk_change(
+    path: &Path,
+    known: Option<DiskStamp>,
+    saved_hash: u64,
+) -> Option<DiskChange> {
+    for _ in 0..2 {
+        let stamp_before = DiskStamp::of(path);
+        if stamp_before == known {
+            return None;
+        }
+        if stamp_before.is_none() {
+            return known.is_some().then_some(DiskChange::Missing);
+        }
+        let Ok(loaded) = document::load(path) else {
+            return None;
+        };
+        let stamp_after = DiskStamp::of(path);
+        if stamp_after != stamp_before {
+            continue;
+        }
+        return Some(if content_hash(&loaded.text) == saved_hash {
+            DiskChange::Touched(stamp_after)
+        } else {
+            DiskChange::Changed {
+                text: loaded.text,
+                line_ending: loaded.line_ending,
+                stamp: stamp_after,
+            }
+        });
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -179,8 +231,18 @@ impl WorkspaceTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RescanState {
+    #[default]
+    Idle,
+    InFlight {
+        pending_followup: bool,
+    },
+}
+
 pub(crate) struct Workspace {
     focus_handle: FocusHandle,
+    window_handle: AnyWindowHandle,
     tabs_scroll_handle: ScrollHandle,
     tabs: Vec<WorkspaceTab>,
     active: usize,
@@ -194,11 +256,14 @@ pub(crate) struct Workspace {
     discarded: HashSet<EntityId>,
     /// Files changed on disk that are waiting for the user to decide.
     pending_disk_prompt: HashSet<EntityId>,
+    /// Documents whose disk-change check was deferred while a dialog was open.
+    deferred_disk_docs: HashSet<EntityId>,
     last_session: Option<Session>,
     catalog: Entity<FolderCatalog>,
     disk_watcher: DiskWatcher,
     watch_sync_generation: u64,
     rescan_generation: u64,
+    rescan_state: RescanState,
     _watch_task: Task<()>,
     tab_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     _subscriptions: Vec<Subscription>,
@@ -263,38 +328,7 @@ impl Workspace {
         });
 
         let (disk_watcher, watch_rx) = DiskWatcher::new();
-
-        let watch_task = cx.spawn_in(window, async move |this, cx| {
-            #[cfg(not(test))]
-            loop {
-                let degraded = this
-                    .read_with(cx, |this, _| this.disk_watcher.is_degraded())
-                    .unwrap_or(true);
-                if degraded {
-                    cx.background_executor()
-                        .timer(FALLBACK_WATCH_INTERVAL)
-                        .await;
-                    if this.update_in(cx, Self::check_disk).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-
-                if watch_rx.recv().await.is_err() {
-                    break;
-                }
-                cx.background_executor().timer(WATCH_DEBOUNCE).await;
-                while watch_rx.try_recv().is_ok() {}
-                if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
-                    break;
-                }
-            }
-            #[cfg(test)]
-            {
-                let _ = watch_rx;
-                let _ = this.update_in(cx, Self::check_disk);
-            }
-        });
+        let watch_task = Self::spawn_watch_task(watch_rx, window, cx);
 
         let catalog = cx.new(|_| {
             FolderCatalog::new(
@@ -305,6 +339,7 @@ impl Workspace {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
+            window_handle: window.window_handle(),
             tabs_scroll_handle: ScrollHandle::new(),
             tabs: Vec::new(),
             active: 0,
@@ -314,11 +349,13 @@ impl Workspace {
             closing: false,
             discarded: HashSet::new(),
             pending_disk_prompt: HashSet::new(),
+            deferred_disk_docs: HashSet::new(),
             last_session: None,
             catalog,
             disk_watcher,
             watch_sync_generation: 0,
             rescan_generation: 0,
+            rescan_state: RescanState::Idle,
             _watch_task: watch_task,
             tab_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
@@ -913,32 +950,46 @@ impl Workspace {
     }
 
     fn rescan_catalog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let RescanState::InFlight {
+            ref mut pending_followup,
+        } = self.rescan_state
+        {
+            *pending_followup = true;
+            return;
+        }
+        self.rescan_state = RescanState::InFlight {
+            pending_followup: false,
+        };
         self.rescan_generation += 1;
         let generation = self.rescan_generation;
-        let (project_folders, selected_filter) = {
-            let catalog = self.catalog.read(cx);
-            (
-                catalog.project_folders().to_vec(),
-                catalog.selected_project_filter().cloned(),
-            )
-        };
+        let project_folders = self.catalog.read(cx).project_folders().to_vec();
         let task = cx
             .background_executor()
-            .spawn(async move { FolderCatalog::scan_snapshot(project_folders, selected_filter) });
+            .spawn(async move { FolderCatalog::scan_snapshot(project_folders) });
         cx.spawn_in(window, async move |this, cx| {
             let snapshot = task.await;
-            _ = this.update_in(cx, |this, _window, cx| {
-                if this.rescan_generation != generation {
-                    return;
+            _ = this.update_in(cx, |this, window, cx| {
+                let followup = matches!(
+                    this.rescan_state,
+                    RescanState::InFlight {
+                        pending_followup: true
+                    }
+                );
+                this.rescan_state = RescanState::Idle;
+
+                if this.rescan_generation == generation {
+                    AppSettings::update(cx, |settings| {
+                        settings.prune_missing_with_projects(&snapshot.project_folders);
+                    });
+                    this.catalog.update(cx, |catalog, cx| {
+                        catalog.apply_snapshot(snapshot);
+                        cx.notify();
+                    });
+                    this.sync_disk_watcher(cx);
                 }
-                AppSettings::update(cx, |settings| {
-                    settings.prune_missing();
-                });
-                this.catalog.update(cx, |catalog, cx| {
-                    catalog.apply_snapshot(snapshot);
-                    cx.notify();
-                });
-                this.sync_disk_watcher(cx);
+                if followup {
+                    this.rescan_catalog(window, cx);
+                }
             });
         })
         .detach();
@@ -970,11 +1021,31 @@ impl Workspace {
         });
         cx.spawn(async move |this, cx| {
             let (targets, dirs) = task.await;
-            _ = this.update(cx, |this, _| {
-                if this.watch_sync_generation == generation {
-                    this.disk_watcher.apply_sync(&targets, &dirs);
-                }
-            });
+            let outcome = this
+                .update(cx, |this, _| {
+                    (this.watch_sync_generation == generation).then(|| {
+                        (
+                            this.window_handle,
+                            this.disk_watcher.apply_sync(&targets, &dirs),
+                        )
+                    })
+                })
+                .ok()
+                .flatten();
+            if let Some((window_handle, outcome)) = outcome
+                && (outcome.added_file_parents || outcome.added_catalog_dirs)
+            {
+                _ = window_handle.update(cx, |_, window, cx| {
+                    _ = this.update(cx, |this, cx| {
+                        if outcome.added_file_parents {
+                            this.check_disk(window, cx);
+                        }
+                        if outcome.added_catalog_dirs {
+                            this.rescan_catalog(window, cx);
+                        }
+                    });
+                });
+            }
         })
         .detach();
     }
@@ -991,6 +1062,121 @@ impl Workspace {
         self.apply_watch_dispatch(dispatch, window, cx);
     }
 
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::needless_pass_by_value,
+            reason = "receiver is moved into the live watcher loop"
+        )
+    )]
+    fn spawn_watch_task(
+        watch_rx: smol::channel::Receiver<()>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            #[cfg(not(test))]
+            {
+                let mut resync_tick: u8 = 0;
+                loop {
+                    let degraded = this
+                        .read_with(cx, |this, _| this.disk_watcher.is_degraded())
+                        .unwrap_or(true);
+                    if degraded {
+                        enum DegradedWakeup {
+                            Event(bool),
+                            Timer,
+                        }
+                        let wakeup = smol::future::race(
+                            async { DegradedWakeup::Event(watch_rx.recv().await.is_ok()) },
+                            async {
+                                cx.background_executor()
+                                    .timer(FALLBACK_WATCH_INTERVAL)
+                                    .await;
+                                DegradedWakeup::Timer
+                            },
+                        )
+                        .await;
+                        match wakeup {
+                            DegradedWakeup::Event(false) => break,
+                            DegradedWakeup::Event(true) => {
+                                cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                                while watch_rx.try_recv().is_ok() {}
+                                if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
+                                    break;
+                                }
+                            }
+                            DegradedWakeup::Timer => {
+                                resync_tick = resync_tick.wrapping_add(1);
+                                let retry_sync = if resync_tick.is_multiple_of(5) {
+                                    SyncRetry::Retry
+                                } else {
+                                    SyncRetry::Skip
+                                };
+                                if this
+                                    .update_in(cx, |this, window, cx| {
+                                        this.poll_degraded_targets(retry_sync, window, cx);
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    resync_tick = 0;
+                    if watch_rx.recv().await.is_err() {
+                        break;
+                    }
+                    cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                    while watch_rx.try_recv().is_ok() {}
+                    if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
+                        break;
+                    }
+                }
+            }
+            #[cfg(test)]
+            {
+                let _ = watch_rx;
+                let _ = this.update_in(cx, Self::check_disk);
+            }
+        })
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "degraded fallback polling runs in live watcher loop"
+        )
+    )]
+    fn poll_degraded_targets(
+        &mut self,
+        retry_sync: SyncRetry,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.check_disk(window, cx);
+        let uncovered_recent_pruned = {
+            let watcher = &self.disk_watcher;
+            let mut pruned = false;
+            AppSettings::update(cx, |settings| {
+                let prev = settings.recent_files.len();
+                settings.recent_files.retain(|path| {
+                    watcher.covers_file_parent(path)
+                        || crate::settings::path_exists_as_file_or_unconfirmed(path)
+                });
+                pruned = settings.recent_files.len() != prev;
+            });
+            pruned
+        };
+        if retry_sync == SyncRetry::Retry || uncovered_recent_pruned {
+            self.sync_disk_watcher(cx);
+        }
+    }
+
     fn apply_watch_dispatch(
         &mut self,
         dispatch: WatchDispatch,
@@ -1003,11 +1189,18 @@ impl Workspace {
         if dispatch.open_files {
             self.check_disk(window, cx);
         }
-        if dispatch.recent_files && !dispatch.catalog {
+        if dispatch.recent_files {
+            let mut changed = false;
             AppSettings::update(cx, |settings| {
-                settings.recent_files.retain(|path| path.is_file());
+                let prev = settings.recent_files.len();
+                settings
+                    .recent_files
+                    .retain(|path| crate::settings::path_exists_as_file_or_unconfirmed(path));
+                changed = settings.recent_files.len() != prev;
             });
-            self.sync_disk_watcher(cx);
+            if changed && !dispatch.catalog {
+                self.sync_disk_watcher(cx);
+            }
         }
         if dispatch.catalog {
             self.rescan_catalog(window, cx);
@@ -1132,34 +1325,22 @@ impl Workspace {
             targets
                 .into_iter()
                 .filter_map(|(id, path, known, saved_hash)| {
-                    let stamp = DiskStamp::of(&path);
-                    if stamp == known {
-                        return None;
-                    }
-                    let change = match stamp {
-                        None if known.is_some() => DiskChange::Missing,
-                        None => return None,
-                        Some(_) => match document::load(&path) {
-                            Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
-                                DiskChange::Touched(stamp)
-                            }
-                            Ok(loaded) => DiskChange::Changed {
-                                text: loaded.text,
-                                line_ending: loaded.line_ending,
-                                stamp,
-                            },
-                            Err(_) => return None,
-                        },
-                    };
-                    Some((id, change))
+                    let change = read_validated_disk_change(&path, known, saved_hash)?;
+                    Some(CheckedDiskChange {
+                        id,
+                        expected_path: path,
+                        expected_known: known,
+                        expected_saved_hash: saved_hash,
+                        change,
+                    })
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;
             _ = this.update_in(cx, |this, window, cx| {
-                for (id, change) in changes {
-                    this.apply_disk_change(id, change, window, cx);
+                for checked in changes {
+                    this.apply_disk_change(checked, window, cx);
                 }
             });
         })
@@ -1168,18 +1349,39 @@ impl Workspace {
 
     fn apply_disk_change(
         &mut self,
-        id: EntityId,
-        change: DiskChange,
+        checked: CheckedDiskChange,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let CheckedDiskChange {
+            id,
+            expected_path,
+            expected_known,
+            expected_saved_hash,
+            change,
+        } = checked;
         let Some(doc) = self.tab_index(id).and_then(|ix| match &self.tabs[ix] {
             WorkspaceTab::Document(doc) => Some(doc.clone()),
             WorkspaceTab::NewTab(_) => None,
         }) else {
             return;
         };
-        let name = doc.read(cx).name();
+        let (current_path, current_known, current_saved_hash, name) = {
+            let doc_ref = doc.read(cx);
+            (
+                doc_ref.path().cloned(),
+                doc_ref.disk_stamp(),
+                doc_ref.saved_hash(),
+                doc_ref.name(),
+            )
+        };
+        if current_path.as_ref() != Some(&expected_path)
+            || current_known != expected_known
+            || current_saved_hash != expected_saved_hash
+        {
+            self.deferred_disk_docs.insert(id);
+            return;
+        }
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
@@ -1205,63 +1407,84 @@ impl Workspace {
                 stamp,
             } => {
                 if !doc.read(cx).is_dirty() {
-                    doc.update(cx, |doc, cx| doc.reload(text, line_ending, window, cx));
+                    doc.update(cx, |doc, cx| {
+                        doc.reload(text, line_ending, stamp, window, cx);
+                    });
                     return;
                 }
                 if window.has_active_dialog(cx) {
-                    // Ask once the current dialog is answered.
+                    // Defer and retry once the blocking dialog closes.
+                    self.deferred_disk_docs.insert(id);
                     return;
                 }
-                doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
-                self.pending_disk_prompt.insert(id);
-                if let Some(ix) = self.tab_index(id) {
-                    self.activate(ix, window, cx);
-                }
-                let workspace = cx.weak_entity();
-                let text = Arc::new(text);
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let (keep, reload) = (workspace.clone(), workspace.clone());
-                    let (reload_doc, text) = (doc.clone(), Arc::clone(&text));
-                    alert
-                        .title(format!("“{name}” changed on disk"))
-                        .description(
-                            "Another program saved this file while you have unsaved changes here.",
-                        )
-                        .footer(
-                            DialogFooter::new()
-                                .justify_end()
-                                .child(
-                                    Button::new("reload")
-                                        .label("Use the file on disk")
-                                        .outline()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let text = text.as_ref().clone();
-                                            reload_doc.update(cx, |doc, cx| {
-                                                doc.reload(text, line_ending, window, cx);
-                                            });
-                                            _ = reload.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("keep")
-                                        .label("Keep my changes")
-                                        .primary()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            _ = keep.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                });
+                self.prompt_disk_conflict(id, doc, name, text, line_ending, stamp, window, cx);
             }
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Disk conflict dialog needs document identity, loaded content, and GPUI context"
+    )]
+    fn prompt_disk_conflict(
+        &mut self,
+        id: EntityId,
+        doc: Entity<DocumentView>,
+        name: String,
+        text: String,
+        line_ending: LineEnding,
+        stamp: Option<DiskStamp>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+        self.pending_disk_prompt.insert(id);
+        if let Some(ix) = self.tab_index(id) {
+            self.activate(ix, window, cx);
+        }
+        let workspace = cx.weak_entity();
+        let text = Arc::new(text);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (keep, reload) = (workspace.clone(), workspace.clone());
+            let (reload_doc, text) = (doc.clone(), Arc::clone(&text));
+            alert
+                .title(format!("“{name}” changed on disk"))
+                .description("Another program saved this file while you have unsaved changes here.")
+                .footer(
+                    DialogFooter::new()
+                        .justify_end()
+                        .child(
+                            Button::new("reload")
+                                .label("Use the file on disk")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let text = text.as_ref().clone();
+                                    reload_doc.update(cx, |doc, cx| {
+                                        doc.reload(text, line_ending, stamp, window, cx);
+                                    });
+                                    _ = reload.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.focus_active(window, cx);
+                                        this.check_disk(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("keep")
+                                .label("Keep my changes")
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    _ = keep.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.focus_active(window, cx);
+                                        this.check_disk(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
     }
 
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -2527,6 +2750,16 @@ impl Render for Workspace {
     )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.update_window_title(window, cx);
+        if (!self.deferred_disk_docs.is_empty() || !self.pending_disk_prompt.is_empty())
+            && !window.has_active_dialog(cx)
+        {
+            self.pending_disk_prompt.clear();
+            self.deferred_disk_docs.clear();
+            cx.spawn_in(window, async move |this, cx| {
+                _ = this.update_in(cx, Self::check_disk);
+            })
+            .detach();
+        }
         // Keyboard commands need a focused element inside the workspace; if
         // focus was lost (e.g. its element left the layout), take it back.
         if window.focused(cx).is_none() {
@@ -3605,6 +3838,80 @@ mod tests {
         workspace.read_with(cx, |ws, cx| {
             let doc = ws.active_document().expect("active document");
             assert!(doc.read(cx).is_dirty());
+            assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn watch_dispatch_prunes_recent_files_even_when_catalog_also_true(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "downmark_ws_recent_and_catalog_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let gone = root.join("gone.md");
+        std::fs::write(&gone, "# Gone\n").unwrap();
+        let canon_gone = gone.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                recent_files: vec![canon_gone.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::remove_file(&canon_gone).unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: false,
+                        recent_files: true,
+                        catalog: true,
+                    },
+                    window,
+                    cx,
+                );
+                // Immediately supersede the catalog rescan before it completes.
+                ws.rescan_generation += 1;
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |_ws, cx| {
             assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
         });
 

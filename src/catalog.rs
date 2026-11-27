@@ -267,11 +267,33 @@ pub(crate) fn is_noise_or_hidden_dir(name: &str) -> bool {
 
 pub(crate) use crate::document::is_markdown_file_name;
 
+/// Dot-prefixed rule filenames tracked by both `scan_project` and the catalog watcher.
+const SPECIAL_RULE_FILENAMES: &[&str] = &[".cursorrules", ".copilot-instructions.md"];
+
+/// Project-relative skill container directories scanned and watched for skill packages.
+pub(crate) const PROJECT_SKILL_CONTAINER_RELS: &[&str] = &[
+    ".agents/skills",
+    ".claude/skills",
+    ".cursor/skills",
+    ".gemini/skills",
+    ".config/opencode/skills",
+    "skills",
+];
+
 /// Returns `true` if `path` has a filename tracked by the Home hub catalog.
 pub(crate) fn is_catalog_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|name| is_markdown_file_name(name) || name == ".cursorrules")
+        .is_some_and(|name| is_markdown_file_name(name) || SPECIAL_RULE_FILENAMES.contains(&name))
+}
+
+/// Global AI agent directories to watch, split into existing directories and
+/// missing targets whose nearest existing ancestor should be watched instead.
+#[derive(Debug, Default)]
+pub(crate) struct GlobalWatchDirs {
+    pub(crate) instruction_dirs: Vec<PathBuf>,
+    pub(crate) skill_containers: Vec<PathBuf>,
+    pub(crate) missing_targets: Vec<PathBuf>,
 }
 
 /// Resolves an agent path template relative to `home` (or as an absolute `/...` path).
@@ -285,11 +307,12 @@ fn resolve_agent_path(path_spec: &str, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Collects existing global AI agent directories to watch for changes.
-pub(crate) fn global_watch_dirs() -> Vec<PathBuf> {
+/// Collects global AI agent directories to watch for changes.
+pub(crate) fn global_watch_dirs() -> GlobalWatchDirs {
     let home = user_home_dir();
-    let mut seen = HashSet::new();
-    let mut dirs = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    let mut seen_missing = HashSet::new();
+    let mut result = GlobalWatchDirs::default();
 
     for agent in PREDEFINED_AGENTS {
         for &inst_path in agent.instruction_paths {
@@ -302,23 +325,30 @@ pub(crate) fn global_watch_dirs() -> Vec<PathBuf> {
                     .filter(|parent| home.as_deref() != Some(*parent))
                     .map(Path::to_path_buf)
             };
-            if let Some(dir) = candidate
-                && dir.is_dir()
-                && seen.insert(dir.clone())
-            {
-                dirs.push(dir);
+            if let Some(dir) = candidate {
+                if dir.is_dir() {
+                    if seen_dirs.insert(dir.clone()) {
+                        result.instruction_dirs.push(dir);
+                    }
+                } else if seen_missing.insert(dir.clone()) {
+                    result.missing_targets.push(dir);
+                }
             }
         }
 
         for &skill_rel in agent.skill_paths.iter().chain(agent.fallback_skills) {
             let full = resolve_agent_path(skill_rel, home.as_deref());
-            if full.is_dir() && seen.insert(full.clone()) {
-                dirs.push(full);
+            if full.is_dir() {
+                if seen_dirs.insert(full.clone()) {
+                    result.skill_containers.push(full);
+                }
+            } else if seen_missing.insert(full.clone()) {
+                result.missing_targets.push(full);
             }
         }
     }
 
-    dirs
+    result
 }
 
 #[inline]
@@ -590,7 +620,6 @@ pub(crate) fn scan_instruction_file(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CatalogSnapshot {
     pub(crate) project_folders: Vec<PathBuf>,
-    pub(crate) selected_project_filter: Option<PathBuf>,
     pub(crate) project_instructions: Vec<InstructionEntry>,
     pub(crate) project_skills: Vec<SkillEntry>,
     pub(crate) project_docs: Vec<ProjectDocEntry>,
@@ -845,24 +874,13 @@ impl FolderCatalog {
 
     /// Rescans both project scope and global AI agent scope, pruning missing folders.
     pub(crate) fn rescan(&mut self) {
-        let snapshot = Self::scan_snapshot(
-            self.project_folders.clone(),
-            self.selected_project_filter.clone(),
-        );
+        let snapshot = Self::scan_snapshot(self.project_folders.clone());
         self.apply_snapshot(snapshot);
     }
 
     /// Scans global and project scopes off the UI thread, pruning missing folders.
-    pub(crate) fn scan_snapshot(
-        mut project_folders: Vec<PathBuf>,
-        mut selected_project_filter: Option<PathBuf>,
-    ) -> CatalogSnapshot {
-        project_folders.retain(|dir| dir.is_dir());
-        if let Some(ref filter) = selected_project_filter
-            && (!filter.is_dir() || !project_folders.contains(filter))
-        {
-            selected_project_filter = None;
-        }
+    pub(crate) fn scan_snapshot(mut project_folders: Vec<PathBuf>) -> CatalogSnapshot {
+        project_folders.retain(|dir| crate::settings::path_exists_as_dir_or_unconfirmed(dir));
 
         let (global_instructions, global_skills) = Self::scan_global();
         let (project_instructions, project_skills, project_docs, groups) =
@@ -871,7 +889,6 @@ impl FolderCatalog {
 
         CatalogSnapshot {
             project_folders,
-            selected_project_filter,
             project_instructions,
             project_skills,
             project_docs,
@@ -887,7 +904,10 @@ impl FolderCatalog {
     pub(crate) fn apply_snapshot(&mut self, snapshot: CatalogSnapshot) {
         self.project_folders = snapshot.project_folders;
         self.folders = self.project_folders.clone();
-        self.selected_project_filter = snapshot.selected_project_filter;
+        self.selected_project_filter = self
+            .selected_project_filter
+            .take()
+            .filter(|filter| self.project_folders.contains(filter));
         self.project_instructions = snapshot.project_instructions;
         self.project_skills = snapshot.project_skills;
         self.project_docs = snapshot.project_docs;
@@ -995,8 +1015,6 @@ impl FolderCatalog {
             "AGENT.md",
             "CLAUDE.md",
             "GEMINI.md",
-            ".cursorrules",
-            ".copilot-instructions.md",
             "copilot-instructions.md",
             ".agents/AGENTS.md",
             ".claude/CLAUDE.md",
@@ -1006,12 +1024,12 @@ impl FolderCatalog {
         ];
 
         let candidate_skill_containers = [
-            (".agents/skills", ".agents"),
-            (".claude/skills", ".claude"),
-            (".cursor/skills", ".cursor"),
-            (".gemini/skills", ".gemini"),
-            (".config/opencode/skills", "opencode"),
-            ("skills", "skills"),
+            (PROJECT_SKILL_CONTAINER_RELS[0], ".agents"),
+            (PROJECT_SKILL_CONTAINER_RELS[1], ".claude"),
+            (PROJECT_SKILL_CONTAINER_RELS[2], ".cursor"),
+            (PROJECT_SKILL_CONTAINER_RELS[3], ".gemini"),
+            (PROJECT_SKILL_CONTAINER_RELS[4], "opencode"),
+            (PROJECT_SKILL_CONTAINER_RELS[5], "skills"),
         ];
 
         for project in project_folders {
@@ -1028,7 +1046,10 @@ impl FolderCatalog {
             let mut seen_inst = HashSet::new();
 
             // 1. Project Instruction Files
-            for rel in &candidate_rel_instructions {
+            for &rel in SPECIAL_RULE_FILENAMES
+                .iter()
+                .chain(candidate_rel_instructions.iter())
+            {
                 let path = project.join(rel);
                 if path.is_file()
                     && let Ok(c) = path.canonicalize()
@@ -1797,6 +1818,43 @@ mod tests {
         assert_eq!(catalog.selected_project_filter(), None);
         assert_eq!(catalog.project_docs().len(), 1);
         assert_eq!(catalog.project_docs()[0].file.file_name, "README.md");
+
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn test_is_catalog_file_matches_special_dot_rules() {
+        assert!(is_catalog_file(Path::new("/tmp/proj/.cursorrules")));
+        assert!(is_catalog_file(Path::new(
+            "/tmp/proj/.copilot-instructions.md"
+        )));
+        assert!(is_catalog_file(Path::new("/tmp/proj/AGENTS.md")));
+        assert!(!is_catalog_file(Path::new("/tmp/proj/.gitignore")));
+        assert!(!is_catalog_file(Path::new("/tmp/proj/main.rs")));
+    }
+
+    #[test]
+    fn test_apply_snapshot_preserves_current_filter_when_still_present() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base_dir = std::env::temp_dir().join(format!(
+            "downmark_test_snapshot_filter_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir);
+        let proj_a = base_dir.join("proj_a");
+        let proj_b = base_dir.join("proj_b");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+
+        let mut catalog =
+            FolderCatalog::new(vec![proj_a.clone(), proj_b.clone()], Some(proj_a.clone()));
+        let snapshot = FolderCatalog::scan_snapshot(vec![proj_a, proj_b.clone()]);
+        // Simulate user switching filter while background scan was in flight.
+        catalog.set_selected_project_filter(Some(proj_b.clone()));
+        catalog.apply_snapshot(snapshot);
+        assert_eq!(catalog.selected_project_filter(), Some(&proj_b));
 
         let _ = fs::remove_dir_all(&base_dir);
     }
