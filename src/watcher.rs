@@ -382,6 +382,10 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     );
                 }
             }
+            register_missing_ancestor(&root, &mut set.catalog_ancestors);
+            if project != &root {
+                register_missing_ancestor(project, &mut set.catalog_ancestors);
+            }
         } else {
             register_missing_ancestor(project, &mut set.catalog_ancestors);
         }
@@ -437,7 +441,12 @@ fn insert_parent_dir(
     if let Some(parent) = file_path.parent()
         && parent.is_dir()
     {
-        out.insert(canonical_or_owned(parent));
+        let canon_parent = canonical_or_owned(parent);
+        out.insert(canon_parent.clone());
+        register_missing_ancestor(&canon_parent, ancestors);
+        if parent != canon_parent {
+            register_missing_ancestor(parent, ancestors);
+        }
         found = true;
     }
     if let Ok(canonical_file) = file_path.canonicalize()
@@ -445,6 +454,7 @@ fn insert_parent_dir(
         && parent.is_dir()
     {
         out.insert(parent.to_path_buf());
+        register_missing_ancestor(parent, ancestors);
         found = true;
     }
     if !found && let Some(parent) = file_path.parent() {
@@ -488,21 +498,64 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn normalize_lexical(path: &Path) -> PathBuf {
+fn resolve_dangling_target(base_dir: &Path, raw_target: &Path) -> PathBuf {
+    resolve_dangling_target_inner(base_dir, raw_target, 16)
+}
+
+fn resolve_dangling_target_inner(
+    base_dir: &Path,
+    raw_target: &Path,
+    remaining_hops: usize,
+) -> PathBuf {
     use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in path.components() {
+
+    let mut cur = if raw_target.is_absolute() {
+        PathBuf::new()
+    } else {
+        canonical_or_owned(base_dir)
+    };
+    let mut resolve_existing = true;
+
+    for comp in raw_target.components() {
         match comp {
+            Component::Prefix(prefix) => {
+                cur.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                cur.push(Component::RootDir.as_os_str());
+            }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    out.push(comp.as_os_str());
+                if !cur.pop() {
+                    cur.push(comp.as_os_str());
+                    resolve_existing = false;
+                } else if resolve_existing {
+                    cur = canonical_or_owned(&cur);
                 }
             }
-            _ => out.push(comp.as_os_str()),
+            Component::Normal(part) => {
+                cur.push(part);
+                if resolve_existing {
+                    if let Ok(canon) = cur.canonicalize() {
+                        cur = canon;
+                    } else if remaining_hops > 0
+                        && let Ok(link_target) = std::fs::read_link(&cur)
+                    {
+                        let link_base = cur.parent().unwrap_or(base_dir);
+                        cur = resolve_dangling_target_inner(
+                            link_base,
+                            &link_target,
+                            remaining_hops - 1,
+                        );
+                        resolve_existing = cur.exists();
+                    } else {
+                        resolve_existing = false;
+                    }
+                }
+            }
         }
     }
-    out
+    cur
 }
 
 fn walk_non_noise_dirs(
@@ -550,11 +603,7 @@ fn walk_non_noise_dirs(
                                 .insert(canon_target);
                         }
                     } else if let Ok(raw_target) = std::fs::read_link(&entry_path) {
-                        let dest = if raw_target.is_absolute() {
-                            raw_target
-                        } else {
-                            normalize_lexical(&dir.join(raw_target))
-                        };
+                        let dest = resolve_dangling_target(&dir, &raw_target);
                         register_missing_ancestor(&dest, catalog_ancestors);
                     }
                 }
@@ -620,7 +669,8 @@ fn walk_skills_container_dirs(
 fn is_dir_invalidation_event(kind: EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+        EventKind::Create(CreateKind::Folder | CreateKind::Any | CreateKind::Other)
+            | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
             | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other)
             | EventKind::Any
             | EventKind::Other
@@ -1151,6 +1201,48 @@ mod tests {
             }
         }
         assert!(saw_edit, "expected edit notification after re-registration");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_with_symlink_and_parent_dir_resolves_target_ancestor() {
+        let root = unique_temp_dir("dangling_sym_dotdot");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        let external = root.join("external");
+        let actual_dir = external.join("actual_dir");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&actual_dir).unwrap();
+
+        std::os::unix::fs::symlink("../external/actual_dir", proj.join("sym_dir")).unwrap();
+        std::os::unix::fs::symlink("sym_dir/../missing_sub/ghost.md", proj.join("dangling.md"))
+            .unwrap();
+
+        let targets = WatchTargets {
+            open_files: Vec::new(),
+            recent_files: Vec::new(),
+            project_folders: vec![proj.clone()],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+        let canon_external = external.canonicalize().unwrap();
+        let canon_proj = proj.canonicalize().unwrap();
+
+        assert!(
+            dirs.catalog_ancestors.get(&canon_external).is_some_and(
+                |targets| targets.contains(&canon_external.join("missing_sub/ghost.md"))
+            ),
+            "expected symlink + .. to resolve into external/missing_sub/ghost.md"
+        );
+        assert!(
+            !dirs
+                .catalog_ancestors
+                .get(&canon_proj)
+                .is_some_and(|targets| targets.contains(&canon_proj.join("missing_sub/ghost.md"))),
+            "must not resolve symlink + .. lexically under proj/"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

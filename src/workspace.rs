@@ -161,7 +161,11 @@ fn read_validated_disk_change(
         }
         if stamp_before.is_none() {
             return if known.is_some() {
-                DiskReadOutcome::Change(DiskChange::Missing)
+                if crate::settings::path_exists_as_file_or_unconfirmed(path) {
+                    DiskReadOutcome::Retry
+                } else {
+                    DiskReadOutcome::Change(DiskChange::Missing)
+                }
             } else {
                 DiskReadOutcome::NoChange
             };
@@ -1443,11 +1447,15 @@ impl Workspace {
             || current_saved_hash != expected_saved_hash
         {
             self.deferred_disk_docs.insert(id);
+            cx.notify();
             return;
         }
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
+                if crate::settings::path_exists_as_file_or_unconfirmed(&expected_path) {
+                    return;
+                }
                 if let Some(missing_path) = doc.read(cx).path().cloned()
                     && !crate::settings::path_exists_as_file_or_unconfirmed(&missing_path)
                 {
@@ -3983,6 +3991,180 @@ mod tests {
             assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
         });
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn stale_disk_change_schedules_render_and_retries(cx: &mut gpui_kit::TestAppContext) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "downmark_ws_deferred_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let file_path = root.join("live.md");
+        std::fs::write(&file_path, "# Before\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::write(&canon_file, "# Retried\n").unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let doc = ws.active_document().expect("active document");
+                let id = doc.entity_id();
+                let saved_hash = doc.read(cx).saved_hash();
+                // Pass a mismatched expected_known so apply_disk_change defers it as stale.
+                ws.apply_disk_change(
+                    CheckedDiskChange {
+                        id,
+                        expected_path: canon_file.clone(),
+                        expected_known: None,
+                        expected_saved_hash: saved_hash,
+                        outcome: DiskReadOutcome::Change(DiskChange::Touched(None)),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(ws.deferred_disk_docs.contains(&id));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            assert!(
+                ws.deferred_disk_docs.is_empty(),
+                "expected render to drain deferred_disk_docs"
+            );
+            let doc = ws.active_document().expect("active document");
+            assert_eq!(doc.read(cx).editor().read(cx).value(), "# Retried\n");
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    fn unconfirmed_metadata_error_does_not_mark_open_doc_missing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_perm_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+
+        let file_path = locked.join("live.md");
+        std::fs::write(&file_path, "# Live\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                recent_files: vec![canon_file.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = matches!(
+            std::fs::metadata(&canon_file),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied
+        );
+        if denied {
+            cx.update_window(window_handle, |_, window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    ws.apply_watch_dispatch(
+                        WatchDispatch {
+                            open_files: true,
+                            recent_files: true,
+                            catalog: false,
+                            resync_watches: false,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+
+            workspace.read_with(cx, |ws, cx| {
+                let doc = ws.active_document().expect("active document");
+                assert!(
+                    !doc.read(cx).is_dirty(),
+                    "permission denied must not mark open document missing"
+                );
+                assert_eq!(AppSettings::get(cx).recent_files, vec![canon_file.clone()]);
+            });
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }
