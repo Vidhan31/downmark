@@ -61,6 +61,7 @@ mod smart_edit;
 mod table_overlay;
 mod themes;
 mod typst_world;
+mod watcher;
 mod workspace;
 
 use std::{path::PathBuf, sync::Arc};

@@ -57,20 +57,29 @@ use crate::{
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     settings_dialog,
     themes::{self, AppSettings},
+    watcher::{self, DiskWatcher, GlobalWatch, WatchDispatch, WatchTargets},
 };
 
 /// Shown when Downmark starts for the first time.
 const WELCOME: &str = include_str!("welcome.md");
-/// How often open files and the file sidebar are checked for changes made
-/// by other programs.
+/// Debounce delay to coalesce rapid bursts of filesystem notifications.
 #[cfg_attr(
     test,
     expect(
         dead_code,
-        reason = "periodic timer only loops in live runtime rather than test executor"
+        reason = "debounce timer only loops in live runtime rather than test executor"
     )
 )]
-const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Fallback polling interval used only when the OS filesystem watcher is unavailable or degraded.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "fallback polling timer only loops in live runtime rather than test executor"
+    )
+)]
+const FALLBACK_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 const WINDOW_CONTROL_WIDTH_PX: f32 = 34.;
 const TITLE_BAR_MENU_AND_GAP_WIDTH_PX: f32 = 36.;
 const NEW_TAB_BUTTON_WIDTH_PX: f32 = 32.;
@@ -187,6 +196,9 @@ pub(crate) struct Workspace {
     pending_disk_prompt: HashSet<EntityId>,
     last_session: Option<Session>,
     catalog: Entity<FolderCatalog>,
+    disk_watcher: DiskWatcher,
+    watch_sync_generation: u64,
+    rescan_generation: u64,
     _watch_task: Task<()>,
     tab_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     _subscriptions: Vec<Subscription>,
@@ -250,16 +262,38 @@ impl Workspace {
                 .unwrap_or(true)
         });
 
+        let (disk_watcher, watch_rx) = DiskWatcher::new();
+
         let watch_task = cx.spawn_in(window, async move |this, cx| {
             #[cfg(not(test))]
             loop {
-                cx.background_executor().timer(WATCH_INTERVAL).await;
-                if this.update_in(cx, Self::check_disk).is_err() {
+                let degraded = this
+                    .read_with(cx, |this, _| this.disk_watcher.is_degraded())
+                    .unwrap_or(true);
+                if degraded {
+                    cx.background_executor()
+                        .timer(FALLBACK_WATCH_INTERVAL)
+                        .await;
+                    if this.update_in(cx, Self::check_disk).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                if watch_rx.recv().await.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                while watch_rx.try_recv().is_ok() {}
+                if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
                     break;
                 }
             }
             #[cfg(test)]
-            let _ = this.update_in(cx, Self::check_disk);
+            {
+                let _ = watch_rx;
+                let _ = this.update_in(cx, Self::check_disk);
+            }
         });
 
         let catalog = cx.new(|_| {
@@ -282,6 +316,9 @@ impl Workspace {
             pending_disk_prompt: HashSet::new(),
             last_session: None,
             catalog,
+            disk_watcher,
+            watch_sync_generation: 0,
+            rescan_generation: 0,
             _watch_task: watch_task,
             tab_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
@@ -290,6 +327,7 @@ impl Workspace {
             explicit_layout: layout,
         };
         this.restore(files, layout, glance, &settings, window, cx);
+        this.sync_disk_watcher(cx);
         this
     }
 
@@ -529,6 +567,7 @@ impl Workspace {
         }
         self.activate(self.active, window, cx);
         self.on_document_closed(window, cx);
+        self.sync_disk_watcher(cx);
     }
 
     /// Put `tab` in place of the active tab.
@@ -553,6 +592,7 @@ impl Workspace {
         }
         self.activate(position, window, cx);
         self.on_document_closed(window, cx);
+        self.sync_disk_watcher(cx);
     }
 
     /// Prune unreferenced diagram caches and trim allocator arenas when documents close.
@@ -705,11 +745,13 @@ impl Workspace {
                     if let Some(target) = target {
                         this.reveal_target(&doc, target, window, cx);
                     }
+                    this.sync_disk_watcher(cx);
                 }
                 Err(err) => {
                     AppSettings::update(cx, |settings| {
                         settings.recent_files.retain(|recent| recent != &path);
                     });
+                    this.sync_disk_watcher(cx);
                     this.notify_error(
                         format!("Couldn’t open “{}”. {err}", display_name(Some(&path))),
                         window,
@@ -806,10 +848,12 @@ impl Workspace {
                                 settings.tracked_folders.push(path.clone());
                             }
                         });
+                        this.rescan_generation += 1;
                         this.catalog.update(cx, |catalog, cx| {
                             catalog.add_project_folder(path);
                             cx.notify();
                         });
+                        this.sync_disk_watcher(cx);
                     }
                 }
             });
@@ -837,10 +881,12 @@ impl Workspace {
                 settings.selected_project_filter = None;
             }
         });
+        self.rescan_generation += 1;
         self.catalog.update(cx, |catalog, cx| {
             catalog.remove_project_folder(&path);
             cx.notify();
         });
+        self.sync_disk_watcher(cx);
     }
 
     #[expect(dead_code, reason = "Maintained for programmatic folder removal")]
@@ -858,21 +904,114 @@ impl Workspace {
                 settings.active_project = settings.recent_projects.first().cloned();
             }
         });
+        self.rescan_generation += 1;
         self.catalog.update(cx, |catalog, cx| {
             catalog.remove_folder(&path);
             cx.notify();
         });
+        self.sync_disk_watcher(cx);
     }
 
     fn rescan_catalog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let catalog = self.catalog.clone();
-        cx.spawn_in(window, async move |_this, cx| {
-            catalog.update(cx, |catalog, cx| {
-                catalog.rescan();
-                cx.notify();
+        self.rescan_generation += 1;
+        let generation = self.rescan_generation;
+        let (project_folders, selected_filter) = {
+            let catalog = self.catalog.read(cx);
+            (
+                catalog.project_folders().to_vec(),
+                catalog.selected_project_filter().cloned(),
+            )
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { FolderCatalog::scan_snapshot(project_folders, selected_filter) });
+        cx.spawn_in(window, async move |this, cx| {
+            let snapshot = task.await;
+            _ = this.update_in(cx, |this, _window, cx| {
+                if this.rescan_generation != generation {
+                    return;
+                }
+                AppSettings::update(cx, |settings| {
+                    settings.prune_missing();
+                });
+                this.catalog.update(cx, |catalog, cx| {
+                    catalog.apply_snapshot(snapshot);
+                    cx.notify();
+                });
+                this.sync_disk_watcher(cx);
             });
         })
         .detach();
+    }
+
+    fn sync_disk_watcher(&mut self, cx: &mut Context<'_, Self>) {
+        let open_files = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path(cx).cloned())
+            .collect();
+        let recent_files = AppSettings::get(cx).recent_files.clone();
+        let project_folders = self.catalog.read(cx).project_folders().to_vec();
+        let targets = WatchTargets {
+            open_files,
+            recent_files,
+            project_folders,
+            global_watch: if cfg!(test) {
+                GlobalWatch::Skip
+            } else {
+                GlobalWatch::Include
+            },
+        };
+        self.watch_sync_generation += 1;
+        let generation = self.watch_sync_generation;
+        let task = cx.background_executor().spawn(async move {
+            let dirs = watcher::collect_watch_dirs(&targets);
+            (targets, dirs)
+        });
+        cx.spawn(async move |this, cx| {
+            let (targets, dirs) = task.await;
+            _ = this.update(cx, |this, _| {
+                if this.watch_sync_generation == generation {
+                    this.disk_watcher.apply_sync(&targets, &dirs);
+                }
+            });
+        })
+        .detach();
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "watch wakeup handler runs in live watcher loop; tests call apply_watch_dispatch directly"
+        )
+    )]
+    fn handle_watch_wakeup(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let dispatch = self.disk_watcher.drain_dispatch();
+        self.apply_watch_dispatch(dispatch, window, cx);
+    }
+
+    fn apply_watch_dispatch(
+        &mut self,
+        dispatch: WatchDispatch,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !dispatch.any() {
+            return;
+        }
+        if dispatch.open_files {
+            self.check_disk(window, cx);
+        }
+        if dispatch.recent_files && !dispatch.catalog {
+            AppSettings::update(cx, |settings| {
+                settings.recent_files.retain(|path| path.is_file());
+            });
+            self.sync_disk_watcher(cx);
+        }
+        if dispatch.catalog {
+            self.rescan_catalog(window, cx);
+        }
     }
 
     #[expect(clippy::unused_self, reason = "Workspace notification method")]
@@ -1044,6 +1183,14 @@ impl Workspace {
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
+                if let Some(missing_path) = doc.read(cx).path().cloned() {
+                    AppSettings::update(cx, |settings| {
+                        settings
+                            .recent_files
+                            .retain(|recent| recent != &missing_path);
+                    });
+                    self.sync_disk_watcher(cx);
+                }
                 doc.update(cx, DocumentView::mark_missing);
                 window.push_notification(
                     Notification::warning(format!(
@@ -1588,6 +1735,7 @@ impl Workspace {
         match doc.update(cx, |doc, cx| doc.write_to(path, cx)) {
             Ok(()) => {
                 self.save_session(window, cx);
+                self.sync_disk_watcher(cx);
                 true
             }
             Err(err) => {
@@ -3294,5 +3442,172 @@ mod tests {
         cx.update(|window, cx| {
             assert!(!TextSelection::has_selection(window, cx));
         });
+    }
+
+    #[gpui_kit::test]
+    fn rescan_catalog_clears_missing_recent_and_scanned_entries(cx: &mut gpui_kit::TestAppContext) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_rescan_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let keep_doc = proj.join("README.md");
+        let stale_doc = proj.join("stale.md");
+        let recent_deleted = root.join("gone.md");
+        std::fs::write(&keep_doc, "# Keep\n").unwrap();
+        std::fs::write(&stale_doc, "# Stale\n").unwrap();
+        std::fs::write(&recent_deleted, "# Gone\n").unwrap();
+
+        let canon_keep = keep_doc.canonicalize().unwrap();
+        let canon_gone = recent_deleted.canonicalize().unwrap();
+        let canon_proj = proj.canonicalize().unwrap();
+
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                project_folders: vec![canon_proj.clone()],
+                selected_project_filter: Some(canon_proj.clone()),
+                recent_files: vec![canon_keep.clone(), canon_gone.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            )
+        });
+
+        workspace.read_with(cx_window, |ws, cx| {
+            assert_eq!(ws.catalog.read(cx).project_docs().len(), 2);
+            assert_eq!(AppSettings::get(cx).recent_files.len(), 2);
+        });
+
+        std::fs::remove_file(&stale_doc).unwrap();
+        std::fs::remove_file(&recent_deleted).unwrap();
+
+        cx_window.update(|window, cx| {
+            workspace.update(cx, |ws, cx| ws.rescan_catalog(window, cx));
+        });
+        cx_window.run_until_parked();
+
+        workspace.read_with(cx_window, |ws, cx| {
+            let docs = ws.catalog.read(cx).project_docs();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].file.file_name, "README.md");
+            assert_eq!(AppSettings::get(cx).recent_files, vec![canon_keep]);
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn watch_dispatch_reloads_clean_open_file_and_prunes_missing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_watch_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let file_path = root.join("live.md");
+        std::fs::write(&file_path, "# Before\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::write(&canon_file, "# After external edit\n").unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: true,
+                        recent_files: false,
+                        catalog: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            let doc = ws.active_document().expect("active document");
+            assert_eq!(
+                doc.read(cx).editor().read(cx).value(),
+                "# After external edit\n"
+            );
+            assert!(!doc.read(cx).is_dirty());
+        });
+
+        std::fs::remove_file(&canon_file).unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: true,
+                        recent_files: true,
+                        catalog: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            let doc = ws.active_document().expect("active document");
+            assert!(doc.read(cx).is_dirty());
+            assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

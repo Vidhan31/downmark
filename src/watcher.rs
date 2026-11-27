@@ -1,0 +1,557 @@
+//! Filesystem watching for open documents, recent files, and workspace folders.
+
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
+};
+
+use crate::catalog::{is_catalog_file, is_noise_or_hidden_dir};
+
+const MAX_PROJECT_WATCH_DEPTH: usize = 8;
+const MAX_GLOBAL_SKILL_WATCH_DEPTH: usize = 5;
+const MAX_QUEUED_PATHS: usize = 512;
+
+/// Whether global AI agent folders should be included in filesystem watching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum GlobalWatch {
+    #[default]
+    Include,
+    Skip,
+}
+
+/// Paths the workspace wants to monitor for external disk changes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WatchTargets {
+    pub(crate) open_files: Vec<PathBuf>,
+    pub(crate) recent_files: Vec<PathBuf>,
+    pub(crate) project_folders: Vec<PathBuf>,
+    pub(crate) global_watch: GlobalWatch,
+}
+
+/// Classified summary of filesystem changes drained after debouncing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WatchDispatch {
+    pub(crate) open_files: bool,
+    pub(crate) recent_files: bool,
+    pub(crate) catalog: bool,
+}
+
+impl WatchDispatch {
+    pub(crate) fn any(self) -> bool {
+        self.open_files || self.recent_files || self.catalog
+    }
+}
+
+/// Directory sets derived from [`WatchTargets`] for non-recursive OS watches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WatchDirSet {
+    pub(crate) file_parents: HashSet<PathBuf>,
+    pub(crate) catalog_dirs: HashSet<PathBuf>,
+}
+
+impl WatchDirSet {
+    fn all_dirs(&self) -> impl Iterator<Item = &PathBuf> {
+        self.file_parents.iter().chain(self.catalog_dirs.iter())
+    }
+}
+
+#[derive(Debug, Default)]
+struct RawWatchState {
+    events: Vec<(EventKind, Vec<PathBuf>)>,
+    needs_rescan: bool,
+}
+
+#[derive(Debug, Default)]
+struct ActiveWatchFilter {
+    open_files: HashSet<PathBuf>,
+    recent_files: HashSet<PathBuf>,
+    file_parents: HashSet<PathBuf>,
+    catalog_dirs: HashSet<PathBuf>,
+}
+
+/// Watches open documents (via their parent directories) and workspace folders
+/// using the platform's native filesystem notification backend.
+#[derive(Debug)]
+pub(crate) struct DiskWatcher {
+    watcher: Option<RecommendedWatcher>,
+    watched_dirs: HashSet<PathBuf>,
+    filter: Arc<Mutex<ActiveWatchFilter>>,
+    pending: Arc<Mutex<RawWatchState>>,
+    wakeup_tx: smol::channel::Sender<()>,
+    degraded: bool,
+}
+
+impl DiskWatcher {
+    /// Creates a new watcher and returns `(watcher, wakeup_rx)`.
+    ///
+    /// If initializing the OS watcher fails (for example, due to system watch limits),
+    /// the returned `DiskWatcher` enters degraded mode (`is_degraded() == true`) so
+    /// the caller can fall back to polling.
+    pub(crate) fn new() -> (Self, smol::channel::Receiver<()>) {
+        let (tx, rx) = smol::channel::bounded(1);
+        let pending = Arc::new(Mutex::new(RawWatchState::default()));
+        let filter = Arc::new(Mutex::new(ActiveWatchFilter::default()));
+
+        let pending_cb = Arc::clone(&pending);
+        let cb_tx = tx.clone();
+        let watcher = RecommendedWatcher::new(
+            move |res: notify::Result<Event>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Access(_)) {
+                        return;
+                    }
+                    let mut state = pending_cb.lock().expect("watch state lock poisoned");
+                    if event.need_rescan() || state.events.len() >= MAX_QUEUED_PATHS {
+                        state.needs_rescan = true;
+                    } else {
+                        state.events.push((event.kind, event.paths));
+                    }
+                    drop(state);
+                    let _ = cb_tx.try_send(());
+                } else {
+                    let mut state = pending_cb.lock().expect("watch state lock poisoned");
+                    state.needs_rescan = true;
+                    drop(state);
+                    let _ = cb_tx.try_send(());
+                }
+            },
+            Config::default().with_follow_symlinks(false),
+        );
+
+        let (watcher, degraded) = match watcher {
+            Ok(w) => (Some(w), false),
+            Err(_) => (None, true),
+        };
+
+        (
+            Self {
+                watcher,
+                watched_dirs: HashSet::new(),
+                filter,
+                pending,
+                wakeup_tx: tx,
+                degraded,
+            },
+            rx,
+        )
+    }
+
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Updates watched directories and path filters using precomputed [`WatchDirSet`].
+    pub(crate) fn apply_sync(&mut self, targets: &WatchTargets, dir_set: &WatchDirSet) {
+        {
+            let mut filter = self.filter.lock().expect("watch filter lock poisoned");
+            filter.open_files = expand_path_variants(&targets.open_files);
+            filter.recent_files = expand_path_variants(&targets.recent_files);
+            filter.file_parents.clone_from(&dir_set.file_parents);
+            filter.catalog_dirs.clone_from(&dir_set.catalog_dirs);
+        }
+
+        let Some(watcher) = self.watcher.as_mut() else {
+            self.degraded = true;
+            return;
+        };
+
+        let desired: HashSet<PathBuf> = dir_set.all_dirs().cloned().collect();
+
+        let to_remove: Vec<PathBuf> = self
+            .watched_dirs
+            .iter()
+            .filter(|dir| !desired.contains(*dir))
+            .cloned()
+            .collect();
+        for dir in to_remove {
+            let _ = watcher.unwatch(&dir);
+            self.watched_dirs.remove(&dir);
+        }
+
+        let mut watch_error = false;
+        for dir in desired {
+            if self.watched_dirs.contains(&dir) {
+                continue;
+            }
+            if watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                self.watched_dirs.insert(dir);
+            } else {
+                watch_error = true;
+            }
+        }
+        let was_degraded = self.degraded;
+        self.degraded = watch_error;
+        if !was_degraded && self.degraded {
+            let _ = self.wakeup_tx.try_send(());
+        }
+    }
+
+    /// Drains all queued OS events and classifies which subsystems need updating.
+    pub(crate) fn drain_dispatch(&self) -> WatchDispatch {
+        let (events, needs_rescan) = {
+            let mut state = self.pending.lock().expect("watch state lock poisoned");
+            let events = std::mem::take(&mut state.events);
+            let needs_rescan = std::mem::take(&mut state.needs_rescan);
+            (events, needs_rescan)
+        };
+
+        let filter = self.filter.lock().expect("watch filter lock poisoned");
+        if needs_rescan {
+            return WatchDispatch {
+                open_files: !filter.open_files.is_empty(),
+                recent_files: !filter.recent_files.is_empty(),
+                catalog: !filter.catalog_dirs.is_empty(),
+            };
+        }
+
+        let mut dispatch = WatchDispatch::default();
+        for (kind, paths) in events {
+            let step = classify_event(kind, &paths, &filter);
+            dispatch.open_files |= step.open_files;
+            dispatch.recent_files |= step.recent_files;
+            dispatch.catalog |= step.catalog;
+            if dispatch.open_files && dispatch.recent_files && dispatch.catalog {
+                break;
+            }
+        }
+        dispatch
+    }
+}
+
+/// Computes all directories that should be watched non-recursively for `targets`.
+pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
+    let mut set = WatchDirSet::default();
+
+    for path in targets.open_files.iter().chain(targets.recent_files.iter()) {
+        insert_parent_dir(&mut set.file_parents, path);
+    }
+
+    for project in &targets.project_folders {
+        if project.is_dir() {
+            let root = canonical_or_owned(project);
+            walk_non_noise_dirs(&root, MAX_PROJECT_WATCH_DEPTH, &mut set.catalog_dirs);
+        }
+    }
+
+    if targets.global_watch == GlobalWatch::Include {
+        for dir in crate::catalog::global_watch_dirs() {
+            if dir.is_dir() {
+                let root = canonical_or_owned(&dir);
+                walk_non_noise_dirs(&root, MAX_GLOBAL_SKILL_WATCH_DEPTH, &mut set.catalog_dirs);
+            }
+        }
+    }
+
+    set
+}
+
+fn insert_parent_dir(out: &mut HashSet<PathBuf>, file_path: &Path) {
+    if let Some(parent) = file_path.parent()
+        && parent.is_dir()
+    {
+        out.insert(canonical_or_owned(parent));
+    }
+    if let Ok(canonical_file) = file_path.canonicalize()
+        && let Some(parent) = canonical_file.parent()
+        && parent.is_dir()
+    {
+        out.insert(parent.to_path_buf());
+    }
+}
+
+fn expand_path_variants(paths: &[PathBuf]) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    for path in paths {
+        out.insert(path.clone());
+        if let Ok(canonical) = path.canonicalize() {
+            out.insert(canonical);
+        } else if let Some(parent) = path.parent()
+            && let Some(name) = path.file_name()
+            && let Ok(canon_parent) = parent.canonicalize()
+        {
+            out.insert(canon_parent.join(name));
+        }
+    }
+    out
+}
+
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn walk_non_noise_dirs(root: &Path, max_depth: usize, out: &mut HashSet<PathBuf>) {
+    let mut stack = vec![(root.to_path_buf(), 0_usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if !out.insert(dir.clone()) {
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if is_noise_or_hidden_dir(&name) {
+                continue;
+            }
+            stack.push((dir.join(name), depth + 1));
+        }
+    }
+}
+
+fn classify_event(kind: EventKind, paths: &[PathBuf], filter: &ActiveWatchFilter) -> WatchDispatch {
+    let mut dispatch = WatchDispatch::default();
+
+    if paths.is_empty() {
+        if matches!(kind, EventKind::Any | EventKind::Other) {
+            dispatch.open_files = !filter.open_files.is_empty();
+            dispatch.recent_files = !filter.recent_files.is_empty();
+            dispatch.catalog = !filter.catalog_dirs.is_empty();
+        }
+        return dispatch;
+    }
+
+    let is_dir_or_generic_event = matches!(
+        kind,
+        EventKind::Create(CreateKind::Folder | CreateKind::Any | CreateKind::Other)
+            | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other)
+            | EventKind::Any
+            | EventKind::Other
+    );
+
+    for path in paths {
+        if filter.open_files.contains(path) {
+            dispatch.open_files = true;
+        }
+        if filter.recent_files.contains(path) {
+            dispatch.recent_files = true;
+        }
+
+        if is_dir_or_generic_event {
+            if filter.file_parents.contains(path) {
+                dispatch.open_files = !filter.open_files.is_empty();
+                dispatch.recent_files = !filter.recent_files.is_empty();
+            }
+            if filter.catalog_dirs.contains(path) {
+                dispatch.catalog = true;
+            }
+        }
+
+        if !dispatch.catalog && is_catalog_relevant_path(kind, path, filter) {
+            dispatch.catalog = true;
+        }
+    }
+
+    dispatch
+}
+
+fn is_catalog_relevant_path(kind: EventKind, path: &Path, filter: &ActiveWatchFilter) -> bool {
+    let inside_catalog = path
+        .parent()
+        .is_some_and(|parent| filter.catalog_dirs.contains(parent))
+        || filter.catalog_dirs.contains(path);
+    if !inside_catalog {
+        return false;
+    }
+
+    if is_catalog_file(path) {
+        return true;
+    }
+
+    let is_noise = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_noise_or_hidden_dir);
+    if is_noise {
+        return false;
+    }
+
+    match kind {
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => true,
+        EventKind::Create(CreateKind::Any | CreateKind::Other)
+        | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any | ModifyKind::Other)
+        | EventKind::Remove(RemoveKind::Any | RemoveKind::Other)
+        | EventKind::Any
+        | EventKind::Other => path.is_dir() || filter.catalog_dirs.contains(path),
+        EventKind::Create(CreateKind::File)
+        | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_))
+        | EventKind::Remove(RemoveKind::File)
+        | EventKind::Access(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, thread, time::Duration};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!(
+            "downmark_watcher_{label}_{}_{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn collect_watch_dirs_skips_noise_and_keeps_agent_dirs() {
+        let root = unique_temp_dir("collect");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs/guides")).unwrap();
+        fs::create_dir_all(root.join(".agents/skills/my-skill")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join(".git/objects")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+
+        let open_dir = unique_temp_dir("open_parent");
+        fs::create_dir_all(&open_dir).unwrap();
+        let open_file = open_dir.join("note.md");
+        fs::write(&open_file, "# Note\n").unwrap();
+
+        let targets = WatchTargets {
+            open_files: vec![open_file],
+            recent_files: Vec::new(),
+            project_folders: vec![root.clone()],
+            global_watch: GlobalWatch::Skip,
+        };
+
+        let dirs = collect_watch_dirs(&targets);
+        let canon_root = root.canonicalize().unwrap();
+        let canon_open_dir = open_dir.canonicalize().unwrap();
+
+        assert!(dirs.file_parents.contains(&canon_open_dir));
+        assert!(dirs.catalog_dirs.contains(&canon_root));
+        assert!(dirs.catalog_dirs.contains(&canon_root.join("docs/guides")));
+        assert!(
+            dirs.catalog_dirs
+                .contains(&canon_root.join(".agents/skills/my-skill"))
+        );
+        assert!(!dirs.catalog_dirs.contains(&canon_root.join("target")));
+        assert!(!dirs.catalog_dirs.contains(&canon_root.join("target/debug")));
+        assert!(!dirs.catalog_dirs.contains(&canon_root.join(".git")));
+        assert!(!dirs.catalog_dirs.contains(&canon_root.join("node_modules")));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&open_dir);
+    }
+
+    #[test]
+    fn watcher_detects_open_file_edits_and_ignores_non_markdown_project_files() {
+        let root = unique_temp_dir("events");
+        let _ = fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        let open_dir = root.join("open");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::create_dir_all(&open_dir).unwrap();
+
+        let open_file = open_dir.join("note.txt");
+        fs::write(&open_file, "initial").unwrap();
+        let rs_file = proj.join("src/main.rs");
+        fs::write(&rs_file, "fn main() {}").unwrap();
+
+        let (mut watcher, rx) = DiskWatcher::new();
+        assert!(!watcher.is_degraded());
+
+        let targets = WatchTargets {
+            open_files: vec![open_file.clone()],
+            recent_files: Vec::new(),
+            project_folders: vec![proj.clone()],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+        watcher.apply_sync(&targets, &dirs);
+
+        // Give OS watcher a moment to register inotify/kqueue/FSEvents watches.
+        thread::sleep(Duration::from_millis(50));
+
+        // Modifying a non-markdown source file inside project should not trigger catalog rescan.
+        fs::write(&rs_file, "fn main() { println!(\"hi\"); }").unwrap();
+        thread::sleep(Duration::from_millis(120));
+        while rx.try_recv().is_ok() {}
+        let rs_dispatch = watcher.drain_dispatch();
+        assert!(!rs_dispatch.catalog);
+        assert!(!rs_dispatch.open_files);
+
+        // External write to open file should trigger open_files dispatch.
+        fs::write(&open_file, "updated").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_open = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            if watcher.drain_dispatch().open_files {
+                saw_open = true;
+                break;
+            }
+        }
+        assert!(saw_open, "expected open_files change notification");
+
+        // Creating a markdown file in project should trigger catalog dispatch.
+        let md_file = proj.join("README.md");
+        fs::write(&md_file, "# Hello\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_catalog = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            if watcher.drain_dispatch().catalog {
+                saw_catalog = true;
+                break;
+            }
+        }
+        assert!(saw_catalog, "expected catalog change notification");
+
+        // Atomic rename replacement over open file and deletion of markdown file should both notify.
+        let tmp_swap = open_dir.join(".note.txt.tmp");
+        fs::write(&tmp_swap, "atomic replace").unwrap();
+        fs::rename(&tmp_swap, &open_file).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_atomic_open = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            if watcher.drain_dispatch().open_files {
+                saw_atomic_open = true;
+                break;
+            }
+        }
+        assert!(
+            saw_atomic_open,
+            "expected atomic rename open_files notification"
+        );
+
+        fs::remove_file(&md_file).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_remove = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            if watcher.drain_dispatch().catalog {
+                saw_remove = true;
+                break;
+            }
+        }
+        assert!(saw_remove, "expected markdown removal catalog notification");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}

@@ -221,19 +221,7 @@ impl Settings {
         settings.layout = Layout::Preview;
         settings.glance_mode = false;
         settings.recent_files.truncate(RECENT_LIMIT);
-        settings.tracked_folders.retain(|dir| dir.is_dir());
-        settings.project_folders.retain(|dir| dir.is_dir());
-        settings.recent_projects.retain(|dir| dir.is_dir());
-        if let Some(ref filter) = settings.selected_project_filter
-            && (!filter.is_dir() || !settings.project_folders.contains(filter))
-        {
-            settings.selected_project_filter = None;
-        }
-        if let Some(ref active) = settings.active_project
-            && !active.is_dir()
-        {
-            settings.active_project = None;
-        }
+        settings.prune_missing();
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
         settings.image_folder = if folder.is_empty() || folder.contains("..") {
             "assets".to_string()
@@ -263,6 +251,40 @@ impl Settings {
         self.recent_files.retain(|recent| recent != &path);
         self.recent_files.insert(0, path);
         self.recent_files.truncate(RECENT_LIMIT);
+    }
+
+    /// Remove file and folder entries that no longer exist on disk.
+    ///
+    /// Returns `true` if any stored entry was removed or cleared.
+    pub(crate) fn prune_missing(&mut self) -> bool {
+        let prev_recent = self.recent_files.len();
+        let prev_tracked = self.tracked_folders.len();
+        let prev_projects = self.project_folders.len();
+        let prev_recent_projects = self.recent_projects.len();
+        let prev_filter = self.selected_project_filter.clone();
+        let prev_active = self.active_project.clone();
+
+        self.recent_files.retain(|path| path.is_file());
+        self.tracked_folders.retain(|dir| dir.is_dir());
+        self.project_folders.retain(|dir| dir.is_dir());
+        self.recent_projects.retain(|dir| dir.is_dir());
+        if let Some(ref filter) = self.selected_project_filter
+            && (!filter.is_dir() || !self.project_folders.contains(filter))
+        {
+            self.selected_project_filter = None;
+        }
+        if let Some(ref active) = self.active_project
+            && !active.is_dir()
+        {
+            self.active_project = None;
+        }
+
+        self.recent_files.len() != prev_recent
+            || self.tracked_folders.len() != prev_tracked
+            || self.project_folders.len() != prev_projects
+            || self.recent_projects.len() != prev_recent_projects
+            || self.selected_project_filter != prev_filter
+            || self.active_project != prev_active
     }
 }
 
@@ -379,5 +401,45 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.font_family.as_deref(), Some("Inter"));
         assert_eq!(settings.mono_font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn prune_missing_removes_deleted_files_and_folders() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "downmark_settings_prune_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let existing_file = proj.join("keep.md");
+        std::fs::write(&existing_file, "# Keep\n").unwrap();
+        let missing_file = proj.join("deleted.md");
+        let missing_dir = dir.join("deleted_proj");
+
+        let mut settings = Settings {
+            recent_files: vec![existing_file.clone(), missing_file],
+            tracked_folders: vec![proj.clone(), missing_dir.clone()],
+            project_folders: vec![proj.clone(), missing_dir.clone()],
+            recent_projects: vec![proj.clone(), missing_dir.clone()],
+            selected_project_filter: Some(missing_dir.clone()),
+            active_project: Some(missing_dir),
+            ..Settings::default()
+        };
+
+        assert!(settings.prune_missing());
+        assert_eq!(settings.recent_files, vec![existing_file]);
+        assert_eq!(settings.tracked_folders, vec![proj.clone()]);
+        assert_eq!(settings.project_folders, vec![proj.clone()]);
+        assert_eq!(settings.recent_projects, vec![proj]);
+        assert_eq!(settings.selected_project_filter, None);
+        assert_eq!(settings.active_project, None);
+        assert!(!settings.prune_missing());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
