@@ -830,7 +830,6 @@ mod tests {
         };
         let dirs = collect_watch_dirs(&targets);
         let canon_proj = proj.canonicalize().unwrap();
-        let canon_ext = external_skill.canonicalize().unwrap();
 
         assert!(!dirs.catalog_dirs.contains(&canon_proj.join("build")));
         assert!(dirs.catalog_dirs.contains(&canon_proj.join("skills/build")));
@@ -839,7 +838,10 @@ mod tests {
                 .contains(&canon_proj.join("skills/build/refs"))
         );
         #[cfg(unix)]
-        assert!(dirs.catalog_dirs.contains(&canon_ext));
+        {
+            let canon_ext = external_skill.canonicalize().unwrap();
+            assert!(dirs.catalog_dirs.contains(&canon_ext));
+        }
 
         // Removing a non-Markdown skill symlink in skills/ must classify as catalog change.
         let mut filter = ActiveWatchFilter::default();
