@@ -31,6 +31,7 @@ actions!(
         About,
         InstallShellCommand,
         OpenMarkdownGuide,
+        ReportIssue,
         ToggleScrollSync,
         ToggleSoftWrap,
         ToggleLineNumbers,

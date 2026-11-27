@@ -14,7 +14,7 @@ on:
         default: true
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
@@ -231,16 +231,16 @@ jobs:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all -- --check
+      - run: cargo nextest run --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo check --locked --no-default-features --all-targets
-      - run: cargo nextest run --locked
 
   windows:
     name: Windows (clippy, build, nextest, MSIX)
     runs-on: windows-latest
     needs: [detect-changes]
     if: toJSON(inputs.run_windows) != 'false' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.rust == 'true')
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # aws-lc-sys (TLS for remote images) needs NASM on x86_64 Windows
       # unless it may use its prebuilt objects.
@@ -259,10 +259,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --features gpui-kit/test-support
       - run: cargo nextest run --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - if: github.event_name == 'workflow_dispatch'
+        run: cargo build --locked --features gpui-kit/test-support
       - name: Test MSIX packaging
+        if: github.event_name == 'workflow_dispatch'
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           & packaging/windows/build-msix.ps1 `
@@ -288,8 +290,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: github.event_name == 'workflow_dispatch'
+        run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - if: github.event_name == 'workflow_dispatch'
         run: cargo build --locked
-      - if: github.event_name == 'workflow_dispatch'
-        run: cargo test --locked

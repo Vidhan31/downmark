@@ -76,14 +76,15 @@ use gpui_kit::{
 
 use crate::{
     actions::{
-        About, InstallShellCommand, OpenMarkdownGuide, OpenSettings, Quit, SetAppearance, SetTheme,
-        ToggleGlanceMode,
+        About, InstallShellCommand, OpenMarkdownGuide, OpenSettings, Quit, ReportIssue,
+        SetAppearance, SetTheme, ToggleGlanceMode,
     },
     settings::{Layout, Settings},
     workspace::{GlanceStart, Workspace},
 };
 
 const MARKDOWN_GUIDE_URL: &str = "https://commonmark.org/help/";
+const ISSUES_URL: &str = "https://github.com/Vidhan31/downmark/issues";
 const DEFAULT_WINDOW_WIDTH: f32 = 860.;
 const DEFAULT_WINDOW_HEIGHT: f32 = 720.;
 
@@ -171,6 +172,7 @@ fn main() {
 
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &OpenMarkdownGuide, cx: &mut App| cx.open_url(MARKDOWN_GUIDE_URL));
+        cx.on_action(|_: &ReportIssue, cx: &mut App| cx.open_url(ISSUES_URL));
         cx.on_action(|action: &SetAppearance, cx: &mut App| {
             let appearance = action.0;
             themes::AppSettings::update(cx, |settings| settings.appearance = appearance);

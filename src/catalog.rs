@@ -846,6 +846,7 @@ pub(crate) struct FolderCatalog {
     groups: Vec<ScannedFolderGroup>,
     sorted_modified_cache: Vec<WorkspaceFileEntry>,
     all_files_cache: Vec<WorkspaceFileEntry>,
+    is_rescanning: bool,
 }
 
 impl FolderCatalog {
@@ -891,6 +892,7 @@ impl FolderCatalog {
             groups: Vec::new(),
             sorted_modified_cache: Vec::new(),
             all_files_cache: Vec::new(),
+            is_rescanning: false,
         };
         catalog.rescan();
         catalog
@@ -911,6 +913,18 @@ impl FolderCatalog {
 
     pub(crate) fn selected_project_filter(&self) -> Option<&PathBuf> {
         self.selected_project_filter.as_ref()
+    }
+
+    pub(crate) fn is_rescanning(&self) -> bool {
+        self.is_rescanning
+    }
+
+    pub(crate) fn begin_rescan(&mut self) {
+        self.is_rescanning = true;
+    }
+
+    pub(crate) fn finish_rescan(&mut self) {
+        self.is_rescanning = false;
     }
 
     #[expect(dead_code, reason = "Legacy compatibility accessor")]

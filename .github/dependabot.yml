@@ -25,19 +25,10 @@ updates:
       prefix: chore
       include: scope
     groups:
-      cargo-minor-patch:
+      cargo-dependencies:
         applies-to: version-updates
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
-      cargo-major:
-        applies-to: version-updates
-        patterns:
-          - "*"
-        update-types:
-          - "major"
       cargo-security:
         applies-to: security-updates
         patterns:

@@ -1089,6 +1089,10 @@ impl Workspace {
         };
         self.rescan_generation += 1;
         let generation = self.rescan_generation;
+        self.catalog.update(cx, |catalog, cx| {
+            catalog.begin_rescan();
+            cx.notify();
+        });
         let project_folders = self.catalog.read(cx).project_folders().to_vec();
         let task = cx
             .background_executor()
@@ -1135,6 +1139,9 @@ impl Workspace {
                     });
                     this.catalog.update(cx, |catalog, cx| {
                         catalog.apply_snapshot(snapshot);
+                        if !followup {
+                            catalog.finish_rescan();
+                        }
                         cx.notify();
                     });
                     if !new_warnings.is_empty() {
@@ -1142,6 +1149,11 @@ impl Workspace {
                             .push_notification(Notification::warning(new_warnings.join("\n")), cx);
                     }
                     this.sync_disk_watcher(cx);
+                } else if !followup {
+                    this.catalog.update(cx, |catalog, cx| {
+                        catalog.finish_rescan();
+                        cx.notify();
+                    });
                 }
                 if followup {
                     this.rescan_catalog(window, cx);
@@ -2732,7 +2744,7 @@ impl Workspace {
                             .gap_1p5()
                             .items_center()
                             .rounded_md()
-                            .text_sm()
+                            .text_xs()
                             .relative()
                             .overflow_hidden()
                             .when(active, |this| {
@@ -2764,14 +2776,7 @@ impl Workspace {
                                     },
                                 ))
                             })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(tab_name.clone()),
-                            )
+                            .child(div().flex_1().min_w_0().truncate().child(tab_name.clone()))
                             .child(
                                 div()
                                     .id(("workspace-tab-close", tab_id))
