@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    App, AppContext as _, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement, Styled as _,
+    Subscription, Window,
     assets::IconName,
     component::{
         ActiveTheme as _, Icon, Sizable as _,
@@ -39,7 +40,7 @@ const SKILLS_SIDEBAR_MIN_WIDTH_PX: f32 = 210.;
 const SKILLS_SIDEBAR_MAX_WIDTH_PX: f32 = 400.;
 
 /// Events emitted by the Home page to be handled by the workspace.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NewTabEvent {
     OpenFile(PathBuf),
     OpenFileInNewTab(PathBuf),
@@ -199,6 +200,63 @@ impl NewTabView {
         }
     }
 
+    fn emit_open_file_for_click(event: &ClickEvent, path: PathBuf, cx: &mut Context<'_, Self>) {
+        let modifiers = event.modifiers();
+        if modifiers.control || modifiers.platform {
+            cx.emit(NewTabEvent::OpenFileInNewTab(path));
+        } else {
+            cx.emit(NewTabEvent::OpenFile(path));
+        }
+    }
+
+    /// Binds left-click (respecting Ctrl/Cmd to open in a new tab) and middle-click
+    /// handlers to a row or item so actions fire only after press and release on the same element.
+    fn with_open_file_clicks<E: StatefulInteractiveElement>(
+        element: E,
+        path: PathBuf,
+        cx: &Context<'_, Self>,
+    ) -> E {
+        let path_middle = path.clone();
+        element
+            .on_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                Self::emit_open_file_for_click(event, path.clone(), cx);
+            }))
+            .on_aux_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.emit(NewTabEvent::OpenFileInNewTab(path_middle.clone()));
+                }
+            }))
+    }
+
+    /// Wraps an "Open" button with left-click (respecting Ctrl/Cmd to open in a new tab)
+    /// and middle-click handlers that wait for release on the button and stop propagation
+    /// to any enclosing clickable row.
+    fn render_open_file_button(
+        button: Button,
+        wrap_id: impl Into<ElementId>,
+        path: PathBuf,
+        cx: &Context<'_, Self>,
+    ) -> impl IntoElement {
+        let path_left = path.clone();
+        let path_middle = path;
+        div()
+            .id(wrap_id)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
+            .on_aux_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    cx.emit(NewTabEvent::OpenFileInNewTab(path_middle.clone()));
+                }
+            }))
+            .child(
+                button.on_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    Self::emit_open_file_for_click(event, path_left.clone(), cx);
+                })),
+            )
+    }
+
     /// Renders the floating workspace switcher popover anchored to the top toolbar.
     #[expect(
         clippy::too_many_lines,
@@ -221,6 +279,7 @@ impl NewTabView {
             .child(
                 div()
                     .id("project-popover-backdrop")
+                    .debug_selector(|| "project-popover-backdrop".to_string())
                     .absolute()
                     .inset_0()
                     .occlude()
@@ -299,6 +358,7 @@ impl NewTabView {
                                 let is_active = selected_project_filter.is_none();
                                 h_flex()
                                     .id("popover-filter-all")
+                                    .debug_selector(|| "popover-filter-all".to_string())
                                     .role(gpui_kit::Role::Button)
                                     .aria_label("View all workspaces")
                                     .items_center()
@@ -311,13 +371,10 @@ impl NewTabView {
                                         s.bg(theme.list_active).text_color(theme.foreground)
                                     })
                                     .when(!is_active, |s| s.hover(|h| h.bg(theme.list_hover)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.show_project_manager = false;
-                                            cx.emit(NewTabEvent::SelectProjectFilter(None));
-                                        }),
-                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_project_manager = false;
+                                        cx.emit(NewTabEvent::SelectProjectFilter(None));
+                                    }))
                                     .child(
                                         h_flex()
                                             .items_center()
@@ -361,9 +418,12 @@ impl NewTabView {
                                 let path_str = path.to_string_lossy().replace(&home_dir, "~");
                                 let click_path = path.clone();
                                 let remove_path = path.clone();
+                                let item_selector = format!("popover-item-{name}");
+                                let rm_selector = format!("popover-rm-{name}");
 
                                 h_flex()
                                     .id(SharedString::from(format!("popover-item-{name}")))
+                                    .debug_selector(move || item_selector)
                                     .role(gpui_kit::Role::Button)
                                     .aria_label(format!("Select workspace {name}"))
                                     .items_center()
@@ -376,15 +436,12 @@ impl NewTabView {
                                         s.bg(theme.list_active).text_color(theme.foreground)
                                     })
                                     .when(!is_active, |s| s.hover(|h| h.bg(theme.list_hover)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.show_project_manager = false;
-                                            cx.emit(NewTabEvent::SelectProjectFilter(Some(
-                                                click_path.clone(),
-                                            )));
-                                        }),
-                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.show_project_manager = false;
+                                        cx.emit(NewTabEvent::SelectProjectFilter(Some(
+                                            click_path.clone(),
+                                        )));
+                                    }))
                                     .child(
                                         h_flex()
                                             .items_center()
@@ -436,6 +493,7 @@ impl NewTabView {
                                                     .id(SharedString::from(format!(
                                                         "popover-rm-{name}"
                                                     )))
+                                                    .debug_selector(move || rm_selector)
                                                     .role(gpui_kit::Role::Button)
                                                     .aria_label(format!("Remove workspace {name}"))
                                                     .size(px(18.))
@@ -451,17 +509,19 @@ impl NewTabView {
                                                             .size(px(11.))
                                                             .text_color(theme.muted_foreground),
                                                     )
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |_this, _, _, cx| {
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |_this, _, _, cx| {
                                                             cx.stop_propagation();
                                                             cx.emit(
                                                                 NewTabEvent::RemoveProjectFolder(
                                                                     remove_path.clone(),
                                                                 ),
                                                             );
-                                                        }),
-                                                    ),
+                                                        },
+                                                    )),
                                             ),
                                     )
                             })),
@@ -576,6 +636,7 @@ impl NewTabView {
 
         h_flex()
             .id(SharedString::from(format!("skill-item-{idx}")))
+            .debug_selector(move || format!("skill-item-{idx}"))
             .role(gpui_kit::Role::ListItem)
             .aria_selected(is_selected)
             .aria_label(format!("Skill: {name} ({source})"))
@@ -593,19 +654,15 @@ impl NewTabView {
                 s.text_color(theme.sidebar_foreground)
                     .hover(|h| h.bg(theme.sidebar_accent.opacity(0.55)))
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.selected_item_index = idx;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(move |_this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.selected_item_index = idx;
+                cx.notify();
+            }))
+            .on_aux_click(cx.listener(move |_this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
                     cx.emit(NewTabEvent::OpenFileInNewTab(full_path.clone()));
-                }),
-            )
+                }
+            }))
             .child(
                 div()
                     .flex_1()
@@ -797,21 +854,17 @@ impl NewTabView {
                             ),
                     )
                     .child({
-                        let p = full_path.clone();
-                        let p_middle = full_path.clone();
-                        Button::new("open-skill-md-btn")
+                        let button = Button::new("open-skill-md-btn")
+                            .debug_selector(|| "open-skill-md-btn".to_string())
                             .primary()
                             .icon(Icon::new(IconName::FileText))
-                            .child("Open SKILL.md")
-                            .on_click(cx.listener(move |_this, _, _, cx| {
-                                cx.emit(NewTabEvent::OpenFile(p.clone()));
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Middle,
-                                cx.listener(move |_this, _, _, cx| {
-                                    cx.emit(NewTabEvent::OpenFileInNewTab(p_middle.clone()));
-                                }),
-                            )
+                            .child("Open SKILL.md");
+                        Self::render_open_file_button(
+                            button,
+                            "open-skill-md-btn-wrap",
+                            full_path.clone(),
+                            cx,
+                        )
                     }),
             )
             .when(!description.is_empty(), |pane| {
@@ -903,164 +956,117 @@ impl NewTabView {
                                     ),
                             )
                             .child({
-                                let p = full_path;
-                                let p_middle = p.clone();
                                 let size = skill.skill_file.formatted_size();
                                 let mod_str = skill.skill_file.formatted_modified();
-                                h_flex()
-                                    .id("skill-entrypoint-row")
-                                    .role(gpui_kit::Role::ListItem)
-                                    .items_center()
-                                    .h_9()
-                                    .px_3()
-                                    .border_b_1()
-                                    .border_color(theme.border.opacity(0.4))
-                                    .cursor_pointer()
-                                    .hover(|h| h.bg(theme.list_hover))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |_this,
-                                                  event: &gpui_kit::MouseDownEvent,
-                                                  _,
-                                                  cx| {
-                                                if event.modifiers.control
-                                                    || event.modifiers.platform
-                                                {
-                                                    cx.emit(NewTabEvent::OpenFileInNewTab(
-                                                        p.clone(),
-                                                    ));
-                                                } else {
-                                                    cx.emit(NewTabEvent::OpenFile(p.clone()));
-                                                }
-                                            },
-                                        ),
-                                    )
-                                    .on_mouse_up(
-                                        MouseButton::Middle,
-                                        cx.listener(move |_this, _, _, cx| {
-                                            cx.emit(NewTabEvent::OpenFileInNewTab(
-                                                p_middle.clone(),
-                                            ));
-                                        }),
-                                    )
-                                    .child(
-                                        h_flex().items_center().flex_1().min_w_0().child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(theme.foreground)
-                                                .child("SKILL.md"),
-                                        ),
-                                    )
-                                    .child(
+                                Self::with_open_file_clicks(
+                                    h_flex()
+                                        .id("skill-entrypoint-row")
+                                        .debug_selector(|| "skill-entrypoint-row".to_string())
+                                        .role(gpui_kit::Role::ListItem)
+                                        .items_center()
+                                        .h_9()
+                                        .px_3()
+                                        .border_b_1()
+                                        .border_color(theme.border.opacity(0.4))
+                                        .cursor_pointer()
+                                        .hover(|h| h.bg(theme.list_hover)),
+                                    full_path,
+                                    cx,
+                                )
+                                .child(
+                                    h_flex().items_center().flex_1().min_w_0().child(
                                         div()
-                                            .w(px(160.))
-                                            .flex_none()
-                                            .text_xs()
+                                            .text_sm()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.primary)
-                                            .child("Entrypoint"),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(110.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(mod_str),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(80.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(size),
-                                    )
+                                            .text_color(theme.foreground)
+                                            .child("SKILL.md"),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(160.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.primary)
+                                        .child("Entrypoint"),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(110.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(mod_str),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(80.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(size),
+                                )
                             })
                             .children(companions.into_iter().enumerate().map(|(ix, comp)| {
                                 let p = comp.full_path.clone();
-                                let p_middle = p.clone();
                                 let rel = comp.relative_path.clone();
                                 let name = comp.file_name.clone();
                                 let size = comp.formatted_size();
                                 let mod_str = comp.formatted_modified();
-                                h_flex()
-                                    .id(SharedString::from(format!("comp-row-{ix}")))
-                                    .role(gpui_kit::Role::ListItem)
-                                    .items_center()
-                                    .h_9()
-                                    .px_3()
-                                    .border_b_1()
-                                    .border_color(theme.border.opacity(0.4))
-                                    .cursor_pointer()
-                                    .hover(|h| h.bg(theme.list_hover))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |_this,
-                                                  event: &gpui_kit::MouseDownEvent,
-                                                  _,
-                                                  cx| {
-                                                if event.modifiers.control
-                                                    || event.modifiers.platform
-                                                {
-                                                    cx.emit(NewTabEvent::OpenFileInNewTab(
-                                                        p.clone(),
-                                                    ));
-                                                } else {
-                                                    cx.emit(NewTabEvent::OpenFile(p.clone()));
-                                                }
-                                            },
-                                        ),
-                                    )
-                                    .on_mouse_up(
-                                        MouseButton::Middle,
-                                        cx.listener(move |_this, _, _, cx| {
-                                            cx.emit(NewTabEvent::OpenFileInNewTab(
-                                                p_middle.clone(),
-                                            ));
-                                        }),
-                                    )
-                                    .child(
-                                        h_flex().items_center().flex_1().min_w_0().child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.foreground)
-                                                .truncate()
-                                                .child(name),
-                                        ),
-                                    )
-                                    .child(
+                                Self::with_open_file_clicks(
+                                    h_flex()
+                                        .id(SharedString::from(format!("comp-row-{ix}")))
+                                        .debug_selector(move || format!("comp-row-{ix}"))
+                                        .role(gpui_kit::Role::ListItem)
+                                        .items_center()
+                                        .h_9()
+                                        .px_3()
+                                        .border_b_1()
+                                        .border_color(theme.border.opacity(0.4))
+                                        .cursor_pointer()
+                                        .hover(|h| h.bg(theme.list_hover)),
+                                    p,
+                                    cx,
+                                )
+                                .child(
+                                    h_flex().items_center().flex_1().min_w_0().child(
                                         div()
-                                            .w(px(160.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
+                                            .text_sm()
+                                            .text_color(theme.foreground)
                                             .truncate()
-                                            .child(if rel.is_empty() {
-                                                "Companion doc".to_string()
-                                            } else {
-                                                rel
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(110.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(mod_str),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(80.))
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(size),
-                                    )
+                                            .child(name),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(160.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .truncate()
+                                        .child(if rel.is_empty() {
+                                            "Companion doc".to_string()
+                                        } else {
+                                            rel
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(110.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(mod_str),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(80.))
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(size),
+                                )
                             })),
                     ),
             )
@@ -1208,7 +1214,6 @@ impl NewTabView {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let full_path = rule.file.full_path.clone();
-        let full_path_middle = full_path.clone();
         let name = rule.name.clone();
         let source = rule.agent_source.clone();
         let size_str = rule.file.formatted_size();
@@ -1222,109 +1227,98 @@ impl NewTabView {
             rule.file.relative_path.clone()
         };
 
-        h_flex()
-            .id(SharedString::from(format!("rule-row-{idx}")))
-            .role(gpui_kit::Role::ListItem)
-            .aria_label(format!("Rule: {name} ({source})"))
-            .items_center()
-            .h_9()
-            .px_4()
-            .border_b_1()
-            .border_color(theme.border.opacity(0.4))
-            .cursor_pointer()
-            .hover(|h| h.bg(theme.list_hover))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, event: &gpui_kit::MouseDownEvent, _, cx| {
-                    if event.modifiers.control || event.modifiers.platform {
-                        cx.emit(NewTabEvent::OpenFileInNewTab(full_path.clone()));
+        Self::with_open_file_clicks(
+            h_flex()
+                .id(SharedString::from(format!("rule-row-{idx}")))
+                .debug_selector(move || format!("rule-row-{idx}"))
+                .role(gpui_kit::Role::ListItem)
+                .aria_label(format!("Rule: {name} ({source})"))
+                .items_center()
+                .h_9()
+                .px_4()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.4))
+                .cursor_pointer()
+                .hover(|h| h.bg(theme.list_hover)),
+            full_path,
+            cx,
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .w(px(220.))
+                .flex_none()
+                .child(
+                    Icon::new(if is_global {
+                        IconName::Bot
                     } else {
-                        cx.emit(NewTabEvent::OpenFile(full_path.clone()));
-                    }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(move |_this, _, _, cx| {
-                    cx.emit(NewTabEvent::OpenFileInNewTab(full_path_middle.clone()));
-                }),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .w(px(220.))
-                    .flex_none()
-                    .child(
-                        Icon::new(if is_global {
-                            IconName::Bot
-                        } else {
-                            IconName::FolderOpen
-                        })
-                        .size(px(14.))
-                        .text_color(theme.primary),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .truncate()
-                            .child(source),
-                    ),
-            )
-            .child(
-                h_flex().items_center().w(px(160.)).flex_none().child(
+                        IconName::FolderOpen
+                    })
+                    .size(px(14.))
+                    .text_color(theme.primary),
+                )
+                .child(
                     div()
                         .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.foreground)
-                        .child(name),
+                        .truncate()
+                        .child(source),
                 ),
-            )
-            .child(
+        )
+        .child(
+            h_flex().items_center().w(px(160.)).flex_none().child(
                 div()
-                    .flex_1()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(path_display),
-            )
-            .child(
-                div()
-                    .w(px(110.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(mod_str),
-            )
-            .child(
-                div()
-                    .w(px(80.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(size_str),
-            )
-            .child({
-                let p = rule.file.full_path.clone();
-                let p_middle = p.clone();
-                div().w(px(70.)).flex_none().flex().justify_end().child(
-                    Button::new(SharedString::from(format!("open-rule-btn-{idx}")))
-                        .ghost()
-                        .small()
-                        .child("Open")
-                        .on_click(cx.listener(move |_this, _, _, cx| {
-                            cx.emit(NewTabEvent::OpenFile(p.clone()));
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Middle,
-                            cx.listener(move |_this, _, _, cx| {
-                                cx.emit(NewTabEvent::OpenFileInNewTab(p_middle.clone()));
-                            }),
-                        ),
-                )
-            })
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(name),
+            ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .child(path_display),
+        )
+        .child(
+            div()
+                .w(px(110.))
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(mod_str),
+        )
+        .child(
+            div()
+                .w(px(80.))
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(size_str),
+        )
+        .child({
+            let p = rule.file.full_path.clone();
+            let button = Button::new(SharedString::from(format!("open-rule-btn-{idx}")))
+                .debug_selector(move || format!("open-rule-btn-{idx}"))
+                .ghost()
+                .small()
+                .child("Open");
+            div()
+                .w(px(70.))
+                .flex_none()
+                .flex()
+                .justify_end()
+                .child(Self::render_open_file_button(
+                    button,
+                    SharedString::from(format!("open-rule-btn-wrap-{idx}")),
+                    p,
+                    cx,
+                ))
+        })
     }
 
     /// Renders a dense, responsive row for the Project Documentation table.
@@ -1339,7 +1333,6 @@ impl NewTabView {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let full_path = doc.file.full_path.clone();
-        let full_path_middle = full_path.clone();
         let name = doc.file.file_name.clone();
         let rel_path = doc.file.relative_path.clone();
         let size_str = doc.file.formatted_size();
@@ -1349,113 +1342,102 @@ impl NewTabView {
             || name.eq_ignore_ascii_case("CHANGELOG.md")
             || name.eq_ignore_ascii_case("CONTRIBUTING.md");
 
-        h_flex()
-            .id(SharedString::from(format!("doc-row-{idx}")))
-            .role(gpui_kit::Role::ListItem)
-            .aria_label(format!("Doc: {name}"))
-            .items_center()
-            .h_9()
-            .px_4()
-            .border_b_1()
-            .border_color(theme.border.opacity(0.4))
-            .cursor_pointer()
-            .hover(|h| h.bg(theme.list_hover))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, event: &gpui_kit::MouseDownEvent, _, cx| {
-                    if event.modifiers.control || event.modifiers.platform {
-                        cx.emit(NewTabEvent::OpenFileInNewTab(full_path.clone()));
+        Self::with_open_file_clicks(
+            h_flex()
+                .id(SharedString::from(format!("doc-row-{idx}")))
+                .debug_selector(move || format!("doc-row-{idx}"))
+                .role(gpui_kit::Role::ListItem)
+                .aria_label(format!("Doc: {name}"))
+                .items_center()
+                .h_9()
+                .px_4()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.4))
+                .cursor_pointer()
+                .hover(|h| h.bg(theme.list_hover)),
+            full_path,
+            cx,
+        )
+        .child(
+            h_flex().items_center().w(px(280.)).flex_none().child(
+                div()
+                    .text_xs()
+                    .font_weight(if is_priority {
+                        FontWeight::SEMIBOLD
                     } else {
-                        cx.emit(NewTabEvent::OpenFile(full_path.clone()));
-                    }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(move |_this, _, _, cx| {
-                    cx.emit(NewTabEvent::OpenFileInNewTab(full_path_middle.clone()));
-                }),
-            )
-            .child(
-                h_flex().items_center().w(px(280.)).flex_none().child(
-                    div()
-                        .text_xs()
-                        .font_weight(if is_priority {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::MEDIUM
-                        })
-                        .text_color(theme.foreground)
-                        .truncate()
-                        .child(name),
-                ),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .items_center()
-                    .gap_1p5()
-                    .truncate()
-                    .when_some(doc.project_name.as_ref(), |row, proj| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.primary)
-                                .flex_none()
-                                .child(proj.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground.opacity(0.6))
-                                .flex_none()
-                                .child("·"),
-                        )
+                        FontWeight::MEDIUM
                     })
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(name),
+            ),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .items_center()
+                .gap_1p5()
+                .truncate()
+                .when_some(doc.project_name.as_ref(), |row, proj| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.primary)
+                            .flex_none()
+                            .child(proj.clone()),
+                    )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(rel_path),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(110.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(mod_str),
-            )
-            .child(
-                div()
-                    .w(px(80.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(size_str),
-            )
-            .child({
-                let p = doc.file.full_path.clone();
-                let p_middle = p.clone();
-                div().w(px(60.)).flex_none().flex().justify_end().child(
-                    Button::new(SharedString::from(format!("open-doc-btn-{idx}")))
-                        .ghost()
-                        .small()
-                        .child("Open")
-                        .on_click(cx.listener(move |_this, _, _, cx| {
-                            cx.emit(NewTabEvent::OpenFile(p.clone()));
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Middle,
-                            cx.listener(move |_this, _, _, cx| {
-                                cx.emit(NewTabEvent::OpenFileInNewTab(p_middle.clone()));
-                            }),
-                        ),
-                )
-            })
+                            .text_color(theme.muted_foreground.opacity(0.6))
+                            .flex_none()
+                            .child("·"),
+                    )
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(rel_path),
+                ),
+        )
+        .child(
+            div()
+                .w(px(110.))
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(mod_str),
+        )
+        .child(
+            div()
+                .w(px(80.))
+                .flex_none()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(size_str),
+        )
+        .child({
+            let p = doc.file.full_path.clone();
+            let button = Button::new(SharedString::from(format!("open-doc-btn-{idx}")))
+                .debug_selector(move || format!("open-doc-btn-{idx}"))
+                .ghost()
+                .small()
+                .child("Open");
+            div()
+                .w(px(60.))
+                .flex_none()
+                .flex()
+                .justify_end()
+                .child(Self::render_open_file_button(
+                    button,
+                    SharedString::from(format!("open-doc-btn-wrap-{idx}")),
+                    p,
+                    cx,
+                ))
+        })
     }
 
     /// Renders the Project Documentation table view.
@@ -1976,5 +1958,465 @@ mod tests {
         view.read_with(visual_cx, |this, _| {
             assert_eq!(this.active_tab, HubTab::GlobalRules);
         });
+    }
+
+    type RecordedEvents = std::rc::Rc<std::cell::RefCell<Vec<NewTabEvent>>>;
+
+    fn open_test_hub(
+        cx: &mut gpui_kit::TestAppContext,
+        initial_tab: HubTab,
+    ) -> (
+        Entity<NewTabView>,
+        &mut gpui_kit::VisualTestContext,
+        RecordedEvents,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+
+        let events: RecordedEvents = Rc::new(RefCell::new(Vec::new()));
+        let events_sub = Rc::clone(&events);
+
+        let (view, visual_cx) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let mut cat = FolderCatalog::new(Vec::new(), None);
+            let proj = PathBuf::from("/tmp/downmark-test-proj");
+            cat.project_folders = vec![proj.clone()];
+
+            let mut skill_a = sample_skill("alpha", "Claude Code");
+            skill_a.is_global = false;
+            skill_a.companion_files.push(ScannedMarkdownFile {
+                relative_path: "references/guide.md".to_string(),
+                full_path: PathBuf::from("/tmp/alpha/references/guide.md"),
+                file_name: "guide.md".to_string(),
+                file_size: 64,
+                modified: None,
+            });
+            let mut skill_b = sample_skill("beta", "Claude Code");
+            skill_b.is_global = false;
+            cat.project_skills = vec![skill_a, skill_b];
+
+            cat.project_instructions = vec![InstructionEntry {
+                name: "AGENTS.md".to_string(),
+                agent_source: "TestProj".to_string(),
+                file: ScannedMarkdownFile {
+                    relative_path: "AGENTS.md".to_string(),
+                    full_path: PathBuf::from("/tmp/downmark-test-proj/AGENTS.md"),
+                    file_name: "AGENTS.md".to_string(),
+                    file_size: 42,
+                    modified: None,
+                },
+                is_global: false,
+                project_name: Some("TestProj".to_string()),
+                project_path: Some(proj.clone()),
+            }];
+
+            cat.project_docs = vec![ProjectDocEntry {
+                file: ScannedMarkdownFile {
+                    relative_path: "README.md".to_string(),
+                    full_path: PathBuf::from("/tmp/downmark-test-proj/README.md"),
+                    file_name: "README.md".to_string(),
+                    file_size: 99,
+                    modified: None,
+                },
+                project_name: Some("TestProj".to_string()),
+                project_path: Some(proj),
+            }];
+
+            let catalog = cx.new(|_| cat);
+            let mut view = NewTabView::new(catalog, window, cx);
+            view.active_tab = initial_tab;
+            view
+        });
+        visual_cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event: &NewTabEvent, _| {
+                events_sub.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        visual_cx.run_until_parked();
+        (view, visual_cx, events)
+    }
+
+    #[gpui_kit::test]
+    fn skill_sidebar_item_requires_full_click(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::Modifiers;
+
+        let (view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectSkills);
+        let skill0 = visual_cx
+            .debug_bounds("skill-item-0")
+            .expect("skill-item-0 bounds");
+        let skill1 = visual_cx
+            .debug_bounds("skill-item-1")
+            .expect("skill-item-1 bounds");
+
+        visual_cx.simulate_mouse_move(skill1.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(skill1.center(), MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert_eq!(
+                this.selected_item_index, 0,
+                "pressing mouse down on skill-item-1 must not select it before mouse up"
+            );
+        });
+        visual_cx.simulate_mouse_move(
+            skill0.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(skill0.center(), MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert_eq!(this.selected_item_index, 0);
+        });
+
+        visual_cx.simulate_mouse_move(skill1.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(skill1.center(), MouseButton::Left, Modifiers::default());
+        visual_cx.simulate_mouse_up(skill1.center(), MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert_eq!(this.selected_item_index, 1, "full click selects skill 1");
+        });
+
+        // Middle-click must require matching mousedown + mouseup on the same item.
+        visual_cx.simulate_mouse_move(skill1.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(skill1.center(), MouseButton::Middle, Modifiers::default());
+        visual_cx.simulate_mouse_move(
+            skill0.center(),
+            Some(MouseButton::Middle),
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(skill0.center(), MouseButton::Middle, Modifiers::default());
+        assert!(events.borrow().is_empty());
+
+        visual_cx.simulate_mouse_move(skill0.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(skill0.center(), MouseButton::Middle, Modifiers::default());
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_up(skill0.center(), MouseButton::Middle, Modifiers::default());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                "/tmp/alpha/SKILL.md"
+            ))]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn skill_detail_rows_and_button_require_full_click(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::Modifiers;
+
+        let (_view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectSkills);
+        let entrypoint = visual_cx
+            .debug_bounds("skill-entrypoint-row")
+            .expect("skill-entrypoint-row bounds");
+        let comp0 = visual_cx
+            .debug_bounds("comp-row-0")
+            .expect("comp-row-0 bounds");
+        let open_skill_btn = visual_cx
+            .debug_bounds("open-skill-md-btn")
+            .expect("open-skill-md-btn bounds");
+
+        visual_cx.simulate_mouse_move(entrypoint.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(entrypoint.center(), MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_move(
+            comp0.center(),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(comp0.center(), MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+
+        visual_cx.simulate_mouse_move(entrypoint.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(entrypoint.center(), MouseButton::Left, Modifiers::default());
+        visual_cx.simulate_mouse_up(entrypoint.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFile(PathBuf::from("/tmp/alpha/SKILL.md"))]
+        );
+        events.borrow_mut().clear();
+
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        visual_cx.simulate_mouse_move(comp0.center(), None, ctrl);
+        visual_cx.simulate_mouse_down(comp0.center(), MouseButton::Left, ctrl);
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_up(comp0.center(), MouseButton::Left, ctrl);
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                "/tmp/alpha/references/guide.md"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        // Open SKILL.md button middle-click requires matching mousedown + mouseup on the button.
+        visual_cx.simulate_mouse_move(entrypoint.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(
+            entrypoint.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_move(
+            open_skill_btn.center(),
+            Some(MouseButton::Middle),
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(
+            open_skill_btn.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_down(
+            open_skill_btn.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(
+            open_skill_btn.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                "/tmp/alpha/SKILL.md"
+            ))]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn rules_and_docs_rows_and_buttons_require_full_click(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{Modifiers, point, px};
+
+        let (view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectRules);
+        let rule_row = visual_cx
+            .debug_bounds("rule-row-0")
+            .expect("rule-row-0 bounds");
+        let open_rule_btn = visual_cx
+            .debug_bounds("open-rule-btn-0")
+            .expect("open-rule-btn-0 bounds");
+        let rule_row_left = point(rule_row.left() + px(24.), rule_row.center().y);
+
+        visual_cx.simulate_mouse_move(rule_row_left, None, Modifiers::default());
+        visual_cx.simulate_mouse_down(rule_row_left, MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_up(rule_row_left, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFile(PathBuf::from(
+                "/tmp/downmark-test-proj/AGENTS.md"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        // Clicking nested Open button emits OpenFile once without triggering parent row.
+        visual_cx.simulate_mouse_move(open_rule_btn.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(
+            open_rule_btn.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(
+            open_rule_btn.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFile(PathBuf::from(
+                "/tmp/downmark-test-proj/AGENTS.md"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        visual_cx.simulate_mouse_down(
+            open_rule_btn.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(
+            open_rule_btn.center(),
+            MouseButton::Middle,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                "/tmp/downmark-test-proj/AGENTS.md"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        // Docs row and nested Open button.
+        view.update(visual_cx, |this, cx| {
+            this.active_tab = HubTab::ProjectDocs;
+            cx.notify();
+        });
+        visual_cx.run_until_parked();
+
+        let doc_row = visual_cx
+            .debug_bounds("doc-row-0")
+            .expect("doc-row-0 bounds");
+        let open_doc_btn = visual_cx
+            .debug_bounds("open-doc-btn-0")
+            .expect("open-doc-btn-0 bounds");
+        let doc_row_left = point(doc_row.left() + px(24.), doc_row.center().y);
+
+        visual_cx.simulate_mouse_move(doc_row_left, None, Modifiers::default());
+        visual_cx.simulate_mouse_down(doc_row_left, MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_up(doc_row_left, MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFile(PathBuf::from(
+                "/tmp/downmark-test-proj/README.md"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        visual_cx.simulate_mouse_move(open_doc_btn.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(
+            open_doc_btn.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(
+            open_doc_btn.center(),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::OpenFile(PathBuf::from(
+                "/tmp/downmark-test-proj/README.md"
+            ))]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn workspace_popover_items_require_full_click_and_backdrop_dismisses_on_press(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{Modifiers, point, px};
+
+        let (view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectSkills);
+        view.update(visual_cx, |this, cx| {
+            this.show_project_manager = true;
+            cx.notify();
+        });
+        visual_cx.run_until_parked();
+
+        let filter_all = visual_cx
+            .debug_bounds("popover-filter-all")
+            .expect("popover-filter-all bounds");
+        let popover_item = visual_cx
+            .debug_bounds("popover-item-downmark-test-proj")
+            .expect("popover-item bounds");
+        let popover_rm = visual_cx
+            .debug_bounds("popover-rm-downmark-test-proj")
+            .expect("popover-rm bounds");
+        let popover_item_left = point(popover_item.left() + px(24.), popover_item.center().y);
+
+        // Press down on remove button does not remove; dragging onto row cancels both.
+        visual_cx.simulate_mouse_move(popover_rm.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(popover_rm.center(), MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+        visual_cx.simulate_mouse_move(
+            popover_item_left,
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        visual_cx.simulate_mouse_up(popover_item_left, MouseButton::Left, Modifiers::default());
+        assert!(events.borrow().is_empty());
+
+        // Full click on remove button emits only RemoveProjectFolder.
+        visual_cx.simulate_mouse_move(popover_rm.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(popover_rm.center(), MouseButton::Left, Modifiers::default());
+        visual_cx.simulate_mouse_up(popover_rm.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::RemoveProjectFolder(PathBuf::from(
+                "/tmp/downmark-test-proj"
+            ))]
+        );
+        events.borrow_mut().clear();
+
+        // Popover item waits for mouseup.
+        visual_cx.simulate_mouse_move(popover_item_left, None, Modifiers::default());
+        visual_cx.simulate_mouse_down(popover_item_left, MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert!(this.show_project_manager);
+        });
+        visual_cx.simulate_mouse_up(popover_item_left, MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert!(!this.show_project_manager);
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::SelectProjectFilter(Some(PathBuf::from(
+                "/tmp/downmark-test-proj"
+            )))]
+        );
+        events.borrow_mut().clear();
+
+        // Filter-all item waits for mouseup; backdrop dismisses on press.
+        view.update(visual_cx, |this, cx| {
+            this.show_project_manager = true;
+            cx.notify();
+        });
+        visual_cx.run_until_parked();
+
+        visual_cx.simulate_mouse_move(filter_all.center(), None, Modifiers::default());
+        visual_cx.simulate_mouse_down(filter_all.center(), MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert!(this.show_project_manager);
+        });
+        visual_cx.simulate_mouse_up(filter_all.center(), MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert!(!this.show_project_manager);
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[NewTabEvent::SelectProjectFilter(None)]
+        );
+
+        view.update(visual_cx, |this, cx| {
+            this.show_project_manager = true;
+            cx.notify();
+        });
+        visual_cx.run_until_parked();
+        let backdrop = visual_cx
+            .debug_bounds("project-popover-backdrop")
+            .expect("backdrop bounds");
+        let outside_card = point(backdrop.right() - px(20.), backdrop.bottom() - px(20.));
+        visual_cx.simulate_mouse_move(outside_card, None, Modifiers::default());
+        visual_cx.simulate_mouse_down(outside_card, MouseButton::Left, Modifiers::default());
+        view.read_with(visual_cx, |this, _| {
+            assert!(!this.show_project_manager);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn open_button_modifier_click_emits_single_open_in_new_tab_event(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::Modifiers;
+
+        let (_view, visual_cx, events) = open_test_hub(cx, HubTab::ProjectDocs);
+        let open_doc_btn = visual_cx
+            .debug_bounds("open-doc-btn-0")
+            .expect("open-doc-btn-0 bounds");
+
+        for modifiers in [Modifiers::control(), Modifiers::command()] {
+            events.borrow_mut().clear();
+            visual_cx.simulate_mouse_move(open_doc_btn.center(), None, modifiers);
+            visual_cx.simulate_mouse_down(open_doc_btn.center(), MouseButton::Left, modifiers);
+            visual_cx.simulate_mouse_up(open_doc_btn.center(), MouseButton::Left, modifiers);
+            assert_eq!(
+                events.borrow().as_slice(),
+                &[NewTabEvent::OpenFileInNewTab(PathBuf::from(
+                    "/tmp/downmark-test-proj/README.md"
+                ))]
+            );
+        }
     }
 }
