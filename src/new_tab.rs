@@ -433,8 +433,8 @@ impl NewTabView {
                 v_flex()
                     .id("project-popover-card")
                     .absolute()
-                    .top(px(42.))
-                    .left(px(76.))
+                    .top(px(40.))
+                    .right_4()
                     .w(px(320.))
                     .max_h(px(380.))
                     .rounded(theme.radius_lg)
@@ -1276,8 +1276,13 @@ impl NewTabView {
         let sort = self.rules_sort;
         let scroll_handle = &self.table_scroll_handle;
         if rules.is_empty() {
+            let empty_icon = if is_global {
+                IconName::ShieldCheck
+            } else {
+                IconName::ScrollText
+            };
             if empty_kind == EmptyStateKind::NoFilterMatches {
-                return Self::render_no_filter_matches_state(IconName::Bot, cx);
+                return Self::render_no_filter_matches_state(empty_icon, cx);
             }
             let (title, msg) = if is_global {
                 (
@@ -1295,7 +1300,7 @@ impl NewTabView {
                     "Add AGENTS.md, CLAUDE.md, or .cursorrules to your project.",
                 )
             };
-            return Self::render_empty_state(IconName::Bot, title, msg, cx);
+            return Self::render_empty_state(empty_icon, title, msg, cx);
         }
 
         let header_cell = |id: &'static str, label: String, col: RulesSortColumn| {
@@ -1447,15 +1452,13 @@ impl NewTabView {
                 .gap_2()
                 .w(px(220.))
                 .flex_none()
-                .child(
-                    Icon::new(if is_global {
-                        IconName::Bot
-                    } else {
-                        IconName::FolderOpen
-                    })
-                    .size(px(14.))
-                    .text_color(theme.primary),
-                )
+                .when(!is_global, |row| {
+                    row.child(
+                        Icon::new(IconName::FolderOpen)
+                            .size(px(14.))
+                            .text_color(theme.primary),
+                    )
+                })
                 .child(
                     div()
                         .text_xs()
@@ -1888,189 +1891,142 @@ impl Render for NewTabView {
                     _ => {}
                 }
             }))
-            // Unified Top Chrome: Window Sub-Toolbar + Native Underline Category Strip
+            // Unified Top Chrome: Scrollable Category Tabs + Right-aligned Controls
             .child(
-                v_flex()
+                TabBar::new("hub-category-tabs")
+                    .underline()
                     .w_full()
                     .bg(theme.title_bar)
-                    .child(
+                    .px_2p5()
+                    .selected_index(self.active_tab.index())
+                    .last_empty_space(div())
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        if let Some(tab) = HubTab::from_index(*ix)
+                            && this.active_tab != tab
+                        {
+                            this.active_tab = tab;
+                            this.selected_item_index = 0;
+                            cx.notify();
+                        }
+                    }))
+                    .child(Self::build_category_tab(
+                        "Project Skills",
+                        filtered_hub.project_skills.len(),
+                        IconName::Sparkles,
+                        SelectionState::from_eq(&self.active_tab, &HubTab::ProjectSkills),
+                        cx,
+                    ))
+                    .child(Self::build_category_tab(
+                        "Project Rules",
+                        filtered_hub.project_instructions.len(),
+                        IconName::ScrollText,
+                        SelectionState::from_eq(&self.active_tab, &HubTab::ProjectRules),
+                        cx,
+                    ))
+                    .child(Self::build_category_tab(
+                        "Project Docs",
+                        filtered_hub.project_docs.len(),
+                        IconName::BookOpen,
+                        SelectionState::from_eq(&self.active_tab, &HubTab::ProjectDocs),
+                        cx,
+                    ))
+                    .child(Self::build_category_tab(
+                        "Global Skills",
+                        filtered_hub.global_skills.len(),
+                        IconName::Sparkles,
+                        SelectionState::from_eq(&self.active_tab, &HubTab::GlobalSkills),
+                        cx,
+                    ))
+                    .child(Self::build_category_tab(
+                        "Global Rules",
+                        filtered_hub.global_instructions.len(),
+                        IconName::ShieldCheck,
+                        SelectionState::from_eq(&self.active_tab, &HubTab::GlobalRules),
+                        cx,
+                    ))
+                    .suffix(
                         h_flex()
-                            .w_full()
-                            .h(px(42.))
-                            .px_4()
-                            .justify_between()
                             .items_center()
-                            .gap_3()
+                            .gap_2()
+                            .py_1()
+                            .pl_2()
+                            .flex_none()
                             .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2p5()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Home"),
-                                    )
-                                    .child(div().h_3p5().w_px().bg(theme.border))
-                                    .when(total_projects > 0, |header| {
-                                        let (label, is_filtered) =
-                                            if let Some(ref filter) = selected_project_filter {
-                                                (
-                                                    filter
-                                                        .file_name()
-                                                        .and_then(|n| n.to_str())
-                                                        .unwrap_or("Project")
-                                                        .to_string(),
-                                                    true,
-                                                )
-                                            } else {
-                                                (format!("All Projects ({total_projects})"), false)
-                                            };
-
-                                        header.child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    Button::new("workspace-picker-btn")
-                                                        .ghost()
-                                                        .small()
-                                                        .icon(Icon::new(IconName::FolderOpen))
-                                                        .child(label)
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.show_project_manager =
-                                                                !this.show_project_manager;
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                                .when(is_filtered, |row| {
-                                                    row.child(
-                                                        Button::new("clear-project-filter-btn")
-                                                            .ghost()
-                                                            .small()
-                                                            .compact()
-                                                            .icon(Icon::new(IconName::Close))
-                                                            .tooltip("Show all workspaces")
-                                                            .on_click(cx.listener(
-                                                                |_this, _, _, cx| {
-                                                                    cx.emit(
-                                                                        NewTabEvent::SelectProjectFilter(
-                                                                            None,
-                                                                        ),
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                }),
+                                div().w(px(190.)).child(
+                                    Input::new(&self.filter_input)
+                                        .small()
+                                        .prefix(
+                                            Icon::new(IconName::Search)
+                                                .xsmall()
+                                                .text_color(theme.muted_foreground),
                                         )
-                                    })
-                                    .when(total_projects == 0, |header| {
-                                        header.child(
-                                            Button::new("empty-add-project-btn")
-                                                .ghost()
-                                                .small()
-                                                .icon(Icon::new(IconName::Plus))
-                                                .child("Add Project Folder")
-                                                .on_click(cx.listener(|_this, _, _, cx| {
-                                                    cx.emit(NewTabEvent::PromptChooseFolder);
-                                                })),
-                                        )
-                                    }),
+                                        .cleanable(true),
+                                ),
                             )
+                            .when(total_projects > 0, |controls| {
+                                let label = if let Some(ref filter) = selected_project_filter {
+                                    filter
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("Project")
+                                        .to_string()
+                                } else {
+                                    format!("All Projects ({total_projects})")
+                                };
+
+                                controls.child(
+                                    Button::new("workspace-picker-btn")
+                                        .outline()
+                                        .small()
+                                        .icon(Icon::new(IconName::FolderOpen))
+                                        .dropdown_caret(true)
+                                        .child(label)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.show_project_manager =
+                                                !this.show_project_manager;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(total_projects == 0, |controls| {
+                                controls.child(
+                                    Button::new("empty-add-project-btn")
+                                        .outline()
+                                        .small()
+                                        .icon(Icon::new(IconName::Plus))
+                                        .child("Add Project Folder")
+                                        .on_click(cx.listener(|_this, _, _, cx| {
+                                            cx.emit(NewTabEvent::PromptChooseFolder);
+                                        })),
+                                )
+                            })
+                            .child(div().h_3p5().w_px().bg(theme.border))
                             .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div().w(px(220.)).child(
-                                            Input::new(&self.filter_input)
-                                                .small()
-                                                .prefix(
-                                                    Icon::new(IconName::Search)
-                                                        .xsmall()
-                                                        .text_color(theme.muted_foreground),
-                                                )
-                                                .cleanable(true),
-                                        ),
-                                    )
-                                    .child(div().h_3p5().w_px().bg(theme.border))
-                                    .child(
-                                        Button::new("new-tab-open-file-btn")
-                                            .accessibility_label("Open Markdown file")
-                                            .ghost()
-                                            .small()
-                                            .icon(Icon::new(IconName::FileText))
-                                            .child("Open File")
-                                            .on_click(cx.listener(|_this, _, _, cx| {
-                                                cx.emit(NewTabEvent::PromptOpenFile);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("new-tab-rescan-btn")
-                                            .accessibility_label("Rescan paths")
-                                            .ghost()
-                                            .small()
-                                            .compact()
-                                            .icon(Icon::new(IconName::RotateCw))
-                                            .tooltip("Rescan workspaces and global paths")
-                                            .on_click(cx.listener(|_this, _, _, cx| {
-                                                cx.emit(NewTabEvent::Rescan);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        TabBar::new("hub-category-tabs")
-                            .underline()
-                            .w_full()
-                            .px_2p5()
-                            .selected_index(self.active_tab.index())
-                            .last_empty_space(div())
-                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                if let Some(tab) = HubTab::from_index(*ix)
-                                    && this.active_tab != tab
-                                {
-                                    this.active_tab = tab;
-                                    this.selected_item_index = 0;
-                                    cx.notify();
-                                }
-                            }))
-                            .child(Self::build_category_tab(
-                                "Project Skills",
-                                filtered_hub.project_skills.len(),
-                                IconName::Sparkles,
-                                SelectionState::from_eq(&self.active_tab, &HubTab::ProjectSkills),
-                                cx,
-                            ))
-                            .child(Self::build_category_tab(
-                                "Project Rules",
-                                filtered_hub.project_instructions.len(),
-                                IconName::Bot,
-                                SelectionState::from_eq(&self.active_tab, &HubTab::ProjectRules),
-                                cx,
-                            ))
-                            .child(Self::build_category_tab(
-                                "Project Docs",
-                                filtered_hub.project_docs.len(),
-                                IconName::BookOpen,
-                                SelectionState::from_eq(&self.active_tab, &HubTab::ProjectDocs),
-                                cx,
-                            ))
-                            .child(Self::build_category_tab(
-                                "Global Skills",
-                                filtered_hub.global_skills.len(),
-                                IconName::Sparkles,
-                                SelectionState::from_eq(&self.active_tab, &HubTab::GlobalSkills),
-                                cx,
-                            ))
-                            .child(Self::build_category_tab(
-                                "Global Rules",
-                                filtered_hub.global_instructions.len(),
-                                IconName::Bot,
-                                SelectionState::from_eq(&self.active_tab, &HubTab::GlobalRules),
-                                cx,
-                            )),
+                                Button::new("new-tab-open-file-btn")
+                                    .accessibility_label("Open Markdown file")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(IconName::FileText))
+                                    .child("Open File")
+                                    .on_click(cx.listener(|_this, _, _, cx| {
+                                        cx.emit(NewTabEvent::PromptOpenFile);
+                                    })),
+                            )
+                            .child({
+                                let is_rescanning = self.catalog.read(cx).is_rescanning();
+                                Button::new("new-tab-rescan-btn")
+                                    .accessibility_label("Rescan paths")
+                                    .ghost()
+                                    .small()
+                                    .compact()
+                                    .icon(Icon::new(IconName::RotateCw))
+                                    .loading_icon(IconName::RotateCw)
+                                    .loading(is_rescanning)
+                                    .tooltip("Rescan workspaces and global paths")
+                                    .on_click(cx.listener(|_this, _, _, cx| {
+                                        cx.emit(NewTabEvent::Rescan);
+                                    }))
+                            }),
                     ),
             )
             // Edge-to-edge Main Content Area (Master-Detail or Dense Table)

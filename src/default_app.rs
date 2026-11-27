@@ -191,30 +191,34 @@ mod platform {
 
     /// Downmark.app's bundle identifier; none when running outside the app.
     fn bundle_id() -> Option<String> {
-        // SAFETY: both return borrowed references (or null) that stay valid
-        // for the life of the process; the string is retained before use.
-        unsafe {
-            let bundle = CFBundleGetMainBundle();
-            if bundle.is_null() {
-                return None;
-            }
-            let id = CFBundleGetIdentifier(bundle);
-            (!id.is_null()).then(|| CFString::wrap_under_get_rule(id).to_string())
+        // SAFETY: `CFBundleGetMainBundle` returns a borrowed reference (or null)
+        // that stays valid for the life of the process.
+        let bundle = unsafe { CFBundleGetMainBundle() };
+        if bundle.is_null() {
+            return None;
         }
+        // SAFETY: `bundle` is non-null and valid; `CFBundleGetIdentifier` returns
+        // a borrowed `CFStringRef` (or null) owned by the main bundle.
+        let id = unsafe { CFBundleGetIdentifier(bundle) };
+        (!id.is_null()).then(|| {
+            // SAFETY: `id` is a valid non-null `CFStringRef` following the Get rule.
+            unsafe { CFString::wrap_under_get_rule(id) }.to_string()
+        })
     }
 
     pub(super) fn is_default() -> Option<bool> {
         let id = bundle_id()?;
         let content_type = CFString::new(MARKDOWN_TYPE);
-        // SAFETY: the content type outlives the call; a non-null result is
-        // owned by us (the Copy rule) and released by CFString's Drop.
+        // SAFETY: `content_type` outlives the call; `LSCopyDefaultRoleHandlerForContentType`
+        // returns an owned `CFStringRef` (Copy rule) or null.
         let handler = unsafe {
-            let handler = LSCopyDefaultRoleHandlerForContentType(
-                content_type.as_concrete_TypeRef(),
-                ALL_ROLES,
-            );
-            (!handler.is_null()).then(|| CFString::wrap_under_create_rule(handler).to_string())
+            LSCopyDefaultRoleHandlerForContentType(content_type.as_concrete_TypeRef(), ALL_ROLES)
         };
+        let handler = (!handler.is_null()).then(|| {
+            // SAFETY: `handler` is non-null and owned by us (Create/Copy rule), so
+            // `CFString::wrap_under_create_rule` takes ownership and releases it on Drop.
+            unsafe { CFString::wrap_under_create_rule(handler) }.to_string()
+        });
         Some(handler.is_some_and(|handler| handler.eq_ignore_ascii_case(&id)))
     }
 

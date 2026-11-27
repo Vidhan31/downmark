@@ -3,7 +3,8 @@
 use std::{cell::Cell, path::PathBuf, rc::Rc};
 
 use gpui_kit::{
-    App, ParentElement as _, Styled as _, Window,
+    App, InteractiveElement as _, ParentElement as _, StatefulInteractiveElement as _, Styled as _,
+    Window,
     component::{
         ActiveTheme as _, WindowExt as _,
         button::{Button, ButtonVariants as _},
@@ -31,14 +32,17 @@ pub(crate) fn open_about(window: &mut Window, cx: &mut App) {
                         env!("CARGO_PKG_VERSION"),
                         ". A fast, native Markdown viewer built with GPUI Kit."
                     ))
+                    .child(div().text_xs().text_color(muted).child("By Vidhan Raut"))
                     .child(
                         div()
+                            .id("about-github-url")
                             .text_xs()
-                            .text_color(muted)
-                            .child(if cfg!(feature = "mimalloc") {
-                                "Memory allocator: mimalloc v0.1"
-                            } else {
-                                "Memory allocator: System Default"
+                            .text_color(cx.theme().link)
+                            .cursor_pointer()
+                            .hover(gpui_kit::Styled::underline)
+                            .child("https://github.com/Vidhan31/downmark")
+                            .on_click(|_, _, cx| {
+                                cx.open_url("https://github.com/Vidhan31/downmark");
                             }),
                     )
                     .child(

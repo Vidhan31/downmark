@@ -240,7 +240,7 @@ jobs:
     runs-on: windows-latest
     needs: [detect-changes]
     if: toJSON(inputs.run_windows) != 'false' && (github.event_name != 'pull_request' || needs.detect-changes.outputs.rust == 'true')
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # aws-lc-sys (TLS for remote images) needs NASM on x86_64 Windows
       # unless it may use its prebuilt objects.
