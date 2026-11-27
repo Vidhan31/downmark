@@ -38,11 +38,12 @@ use gpui_kit::{
 
 use crate::{
     actions::{
-        About, ActivateTab, CloseDocument, CloseWindow, FindInPreview, FollowLink, GoToHeading,
-        InstallShellCommand, NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings, PreviousTab,
-        Quit, RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance, ToggleGlanceMode,
-        ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession, ToggleScrollSync, ToggleSoftWrap,
-        ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+        About, ActivateTab, CloseDocument, CloseWindow, CopyFilePath, FindInPreview, FollowLink,
+        GoToHeading, InstallShellCommand, NewFile, NewTab, NextTab, Open, OpenRecent, OpenSettings,
+        PreviousTab, Quit, RevealInFolder, Save, SaveAs, SetLayout, ToggleAppearance,
+        ToggleGlanceMode, ToggleLineNumbers, TogglePaneFocus, ToggleRestoreSession,
+        ToggleScrollSync, ToggleSoftWrap, ToggleTabs, ViewDiagram, ViewTable, WORKSPACE_CONTEXT,
+        ZoomIn, ZoomOut, ZoomReset,
     },
     analysis::{Analysis, content_hash},
     catalog::FolderCatalog,
@@ -1579,6 +1580,32 @@ impl Workspace {
         }
     }
 
+    fn copy_file_path(
+        &mut self,
+        _: &CopyFilePath,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        struct CopyFilePathNotice;
+
+        let Some(path) = self.active_tab().path(cx) else {
+            return;
+        };
+        let full_path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            full_path.to_string_lossy().into_owned(),
+        ));
+        if window
+            .root::<gpui_kit::base::Root>()
+            .is_some_and(|root| root.is_some())
+        {
+            window.push_notification(
+                Notification::success("Copied file path to clipboard.").id::<CopyFilePathNotice>(),
+                cx,
+            );
+        }
+    }
+
     fn on_drop_paths(
         &mut self,
         paths: &ExternalPaths,
@@ -2362,6 +2389,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::reveal_in_folder))
+            .on_action(cx.listener(Self::copy_file_path))
             .on_action(cx.listener(Self::close_document))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::quit))
@@ -3211,5 +3239,233 @@ mod tests {
         cx.update(|window, cx| {
             assert!(!TextSelection::has_selection(window, cx));
         });
+    }
+
+    #[gpui_kit::test]
+    fn copy_file_path_shortcut_copies_saved_tab_path(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let saved_path = std::env::temp_dir().join("downmark-copy-path-test.md");
+        let expected_path = std::path::absolute(&saved_path)
+            .unwrap_or_else(|_| saved_path.clone())
+            .to_string_lossy()
+            .into_owned();
+
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let saved_doc = cx.new(|cx| {
+                    DocumentView::new(
+                        "# Saved\n".to_string(),
+                        Some(saved_path.clone()),
+                        LineEnding::Lf,
+                        window,
+                        cx,
+                    )
+                });
+                let entity = cx.new(|cx| {
+                    let mut ws = Workspace::new(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        window,
+                        cx,
+                    );
+                    ws.tabs[0] = WorkspaceTab::Document(saved_doc);
+                    ws.focus_active(window, cx);
+                    ws
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke.clone(), cx);
+            assert!(
+                handled,
+                "shortcut must be handled on saved tab in Editor mode"
+            );
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected_path.clone())
+            );
+            assert_eq!(window.notifications(cx).len(), 1);
+
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| {
+                ws.set_layout(&SetLayout(Layout::Preview), window, cx);
+            });
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke, cx);
+            assert!(
+                handled,
+                "shortcut must be handled on saved tab in Preview mode"
+            );
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected_path)
+            );
+            assert_eq!(
+                window.notifications(cx).len(),
+                1,
+                "repeated copies must update the existing toast instead of stacking duplicates"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn copy_file_path_shortcut_ignores_unsaved_and_home_tabs(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            cx.set_global(AppSettings(crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            }));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let entity = cx.new(|cx| {
+                    let mut ws = Workspace::new(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        AppMenuBar::new(cx),
+                        window,
+                        cx,
+                    );
+                    let unsaved_doc = cx.new(|cx| {
+                        DocumentView::new(
+                            "# Unsaved\n".to_string(),
+                            None,
+                            LineEnding::Lf,
+                            window,
+                            cx,
+                        )
+                    });
+                    ws.add_tab(
+                        WorkspaceTab::Document(unsaved_doc),
+                        TabActivation::Background,
+                        window,
+                        cx,
+                    );
+                    ws
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-shift-c"
+        } else {
+            "ctrl-shift-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx.update_window(window_handle, |_, window, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| ws.activate(0, window, cx));
+            window.draw(cx).clear(cx);
+            window.dispatch_keystroke(keystroke.clone(), cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "Home tab must not overwrite clipboard"
+            );
+            assert!(window.notifications(cx).is_empty());
+
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("sentinel".to_string()));
+            workspace.update(cx, |ws, cx| ws.activate(1, window, cx));
+            window.draw(cx).clear(cx);
+            window.dispatch_keystroke(keystroke, cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "Unsaved tab must not overwrite clipboard"
+            );
+            assert!(window.notifications(cx).is_empty());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn code_block_shortcut_inserts_fence_after_rebind(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::bind_keys(cx);
+        });
+        let mut doc_entity = None;
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                layout: Layout::Editor,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            let mut ws = Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            );
+            let doc =
+                cx.new(|cx| DocumentView::new(String::new(), None, LineEnding::Lf, window, cx));
+            doc_entity = Some(doc.clone());
+            ws.tabs[0] = WorkspaceTab::Document(doc);
+            ws.focus_active(window, cx);
+            ws
+        });
+
+        let shortcut = if cfg!(target_os = "macos") {
+            "cmd-alt-c"
+        } else {
+            "ctrl-alt-c"
+        };
+        let keystroke = gpui_kit::Keystroke::parse(shortcut).unwrap();
+
+        cx_window.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let handled = window.dispatch_keystroke(keystroke, cx);
+            assert!(handled, "secondary-alt-c must trigger CodeBlock");
+        });
+        doc_entity.unwrap().read_with(cx, |doc, cx| {
+            assert!(
+                doc.editor().read(cx).value().contains("```"),
+                "CodeBlock shortcut must insert a fenced code block"
+            );
+        });
+        let _ = workspace;
     }
 }

@@ -15,11 +15,11 @@ use gpui_kit::{
 
 use crate::{
     actions::{
-        About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, FindInPreview, GoToHeading,
-        Heading, InlineCode, InsertLink, InstallShellCommand, Italic, NewFile, NewTab,
-        NumberedList, Open, OpenMarkdownGuide, OpenRecent, OpenSettings, Quit, Quote,
-        RevealInFolder, Save, SaveAs, SetAppearance, SetLayout, SetTheme, Strikethrough, TaskList,
-        TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap,
+        About, Bold, BulletList, CloseDocument, CloseWindow, CodeBlock, CopyFilePath,
+        FindInPreview, GoToHeading, Heading, InlineCode, InsertLink, InstallShellCommand, Italic,
+        NewFile, NewTab, NumberedList, Open, OpenMarkdownGuide, OpenRecent, OpenSettings, Quit,
+        Quote, RevealInFolder, Save, SaveAs, SetAppearance, SetLayout, SetTheme, Strikethrough,
+        TaskList, TidyTable, ToggleGlanceMode, ToggleLineNumbers, ToggleScrollSync, ToggleSoftWrap,
         ToggleTabs, ZoomIn, ZoomOut, ZoomReset,
     },
     default_app,
@@ -116,6 +116,7 @@ pub(crate) fn build(cx: &App) -> Vec<Menu> {
             },
             RevealInFolder,
         ),
+        MenuItem::action("Copy file path", CopyFilePath),
         MenuItem::separator(),
         MenuItem::action("Close", CloseDocument),
         MenuItem::action("Close window", CloseWindow),
