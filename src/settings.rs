@@ -292,11 +292,14 @@ impl Settings {
             .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
         self.recent_projects
             .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
-        if let Some(ref filter) = self.selected_project_filter
-            && (!path_exists_as_dir_or_unconfirmed(filter)
-                || !self.project_folders.contains(filter))
-        {
-            self.selected_project_filter = None;
+        if let Some(ref filter) = self.selected_project_filter {
+            let filter_canon = filter.canonicalize().unwrap_or_else(|_| filter.clone());
+            let in_projects = self.project_folders.iter().any(|dir| {
+                dir == filter || dir.canonicalize().unwrap_or_else(|_| dir.clone()) == filter_canon
+            });
+            if !path_exists_as_dir_or_unconfirmed(filter) || !in_projects {
+                self.selected_project_filter = None;
+            }
         }
         if let Some(ref active) = self.active_project
             && !path_exists_as_dir_or_unconfirmed(active)
@@ -532,5 +535,36 @@ mod tests {
         assert_eq!(settings.project_folders, vec![inner_dir.clone()]);
         assert_eq!(settings.selected_project_filter, Some(inner_dir.clone()));
         assert_eq!(settings.active_project, Some(inner_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_missing_with_projects_keeps_canonical_selected_project_filter_for_symlink() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "downmark_settings_symlink_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("real_proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let symlink = dir.join("link_proj");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let canon_target = target.canonicalize().unwrap();
+
+        let mut settings = Settings {
+            project_folders: vec![symlink.clone()],
+            selected_project_filter: Some(canon_target.clone()),
+            ..Settings::default()
+        };
+
+        let changed = settings.prune_missing_with_projects(std::slice::from_ref(&canon_target));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!changed);
+        assert_eq!(settings.project_folders, vec![symlink]);
+        assert_eq!(settings.selected_project_filter, Some(canon_target));
     }
 }

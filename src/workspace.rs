@@ -1226,6 +1226,7 @@ impl Workspace {
         if dispatch.open_files {
             self.check_disk(window, cx);
         }
+        let mut resync_watches = dispatch.resync_watches;
         if dispatch.recent_files {
             let mut changed = false;
             AppSettings::update(cx, |settings| {
@@ -1235,9 +1236,10 @@ impl Workspace {
                     .retain(|path| crate::settings::path_exists_as_file_or_unconfirmed(path));
                 changed = settings.recent_files.len() != prev;
             });
-            if changed && !dispatch.catalog {
-                self.sync_disk_watcher(cx);
-            }
+            resync_watches |= changed;
+        }
+        if resync_watches && !dispatch.catalog {
+            self.sync_disk_watcher(cx);
         }
         if dispatch.catalog {
             self.rescan_catalog(window, cx);
@@ -3863,6 +3865,7 @@ mod tests {
                         open_files: true,
                         recent_files: false,
                         catalog: false,
+                        resync_watches: false,
                     },
                     window,
                     cx,
@@ -3889,6 +3892,7 @@ mod tests {
                         open_files: true,
                         recent_files: true,
                         catalog: false,
+                        resync_watches: false,
                     },
                     window,
                     cx,
@@ -3963,6 +3967,7 @@ mod tests {
                         open_files: false,
                         recent_files: true,
                         catalog: true,
+                        resync_watches: false,
                     },
                     window,
                     cx,

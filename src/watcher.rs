@@ -36,16 +36,21 @@ pub(crate) struct WatchTargets {
 }
 
 /// Classified summary of filesystem changes drained after debouncing.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Four independent dispatch flags for watcher subsystems"
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct WatchDispatch {
     pub(crate) open_files: bool,
     pub(crate) recent_files: bool,
     pub(crate) catalog: bool,
+    pub(crate) resync_watches: bool,
 }
 
 impl WatchDispatch {
     pub(crate) fn any(self) -> bool {
-        self.open_files || self.recent_files || self.catalog
+        self.open_files || self.recent_files || self.catalog || self.resync_watches
     }
 }
 
@@ -270,25 +275,35 @@ impl DiskWatcher {
                 open_files: !filter.open_files.is_empty(),
                 recent_files: !filter.recent_files.is_empty(),
                 catalog: !filter.catalog_dirs.is_empty() || !filter.catalog_ancestors.is_empty(),
+                resync_watches: true,
             };
         }
 
+        let mut invalidated_any = false;
         for (kind, paths) in &events {
             if is_dir_invalidation_event(*kind) {
                 for path in paths {
-                    self.invalidate_watched_dir(path);
+                    invalidated_any |= self.invalidate_watched_dir(path);
                 }
             }
         }
 
         let filter = self.filter.lock().expect("watch filter lock poisoned");
-        let mut dispatch = WatchDispatch::default();
+        let mut dispatch = WatchDispatch {
+            resync_watches: invalidated_any,
+            ..Default::default()
+        };
         for (kind, paths) in events {
             let step = classify_event(kind, &paths, &filter);
             dispatch.open_files |= step.open_files;
             dispatch.recent_files |= step.recent_files;
             dispatch.catalog |= step.catalog;
-            if dispatch.open_files && dispatch.recent_files && dispatch.catalog {
+            dispatch.resync_watches |= step.resync_watches;
+            if dispatch.open_files
+                && dispatch.recent_files
+                && dispatch.catalog
+                && dispatch.resync_watches
+            {
                 break;
             }
         }
@@ -305,20 +320,26 @@ impl DiskWatcher {
         }
     }
 
-    fn invalidate_watched_dir(&mut self, path: &Path) {
-        let removed_direct = self.watched_dirs.remove(path);
-        let canon = (!removed_direct).then(|| canonical_or_owned(path));
-        let removed_canon = canon.as_ref().is_some_and(|c| self.watched_dirs.remove(c));
-        if (removed_direct || removed_canon)
-            && let Some(watcher) = self.watcher.as_mut()
-        {
-            if removed_direct {
-                let _ = watcher.unwatch(path);
-            }
-            if removed_canon && let Some(c) = canon {
-                let _ = watcher.unwatch(&c);
+    fn invalidate_watched_dir(&mut self, path: &Path) -> bool {
+        let canon = canonical_or_owned(path);
+        let invalidated: Vec<PathBuf> = self
+            .watched_dirs
+            .iter()
+            .filter(|dir| {
+                *dir == path || dir.starts_with(path) || *dir == &canon || dir.starts_with(&canon)
+            })
+            .cloned()
+            .collect();
+        if invalidated.is_empty() {
+            return false;
+        }
+        for dir in &invalidated {
+            self.watched_dirs.remove(dir);
+            if let Some(watcher) = self.watcher.as_mut() {
+                let _ = watcher.unwatch(dir);
             }
         }
+        true
     }
 }
 
@@ -339,6 +360,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                 MAX_PROJECT_WATCH_DEPTH,
                 &mut set.catalog_dirs,
                 &mut set.external_catalog_targets,
+                &mut set.catalog_ancestors,
                 &mut explored_remaining,
                 &mut set.incomplete,
             );
@@ -354,6 +376,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                         &canon_container,
                         &mut set.catalog_dirs,
                         &mut set.external_catalog_targets,
+                        &mut set.catalog_ancestors,
                         &mut explored_remaining,
                         &mut set.incomplete,
                     );
@@ -374,6 +397,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     MAX_GLOBAL_SKILL_WATCH_DEPTH,
                     &mut set.catalog_dirs,
                     &mut set.external_catalog_targets,
+                    &mut set.catalog_ancestors,
                     &mut explored_remaining,
                     &mut set.incomplete,
                 );
@@ -390,6 +414,7 @@ pub(crate) fn collect_watch_dirs(targets: &WatchTargets) -> WatchDirSet {
                     &canon_container,
                     &mut set.catalog_dirs,
                     &mut set.external_catalog_targets,
+                    &mut set.catalog_ancestors,
                     &mut explored_remaining,
                     &mut set.incomplete,
                 );
@@ -463,11 +488,29 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            _ => out.push(comp.as_os_str()),
+        }
+    }
+    out
+}
+
 fn walk_non_noise_dirs(
     root: &Path,
     max_depth: usize,
     out: &mut HashSet<PathBuf>,
     external_targets: &mut HashMap<PathBuf, HashSet<PathBuf>>,
+    catalog_ancestors: &mut HashMap<PathBuf, HashSet<PathBuf>>,
     explored_remaining: &mut HashMap<PathBuf, usize>,
     incomplete: &mut bool,
 ) {
@@ -481,9 +524,6 @@ fn walk_non_noise_dirs(
         }
         explored_remaining.insert(dir.clone(), remaining);
         out.insert(dir.clone());
-        if depth >= max_depth {
-            continue;
-        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             *incomplete = true;
             continue;
@@ -499,16 +539,28 @@ fn walk_non_noise_dirs(
             };
             if ft.is_symlink() {
                 let entry_path = entry.path();
-                if is_catalog_file(&entry_path)
-                    && let Ok(canon_target) = entry_path.canonicalize()
-                    && canon_target.is_file()
-                    && let Some(parent) = canon_target.parent()
-                {
-                    external_targets
-                        .entry(parent.to_path_buf())
-                        .or_default()
-                        .insert(canon_target);
+                if is_catalog_file(&entry_path) {
+                    if let Ok(canon_target) = entry_path.canonicalize() {
+                        if canon_target.is_file()
+                            && let Some(parent) = canon_target.parent()
+                        {
+                            external_targets
+                                .entry(parent.to_path_buf())
+                                .or_default()
+                                .insert(canon_target);
+                        }
+                    } else if let Ok(raw_target) = std::fs::read_link(&entry_path) {
+                        let dest = if raw_target.is_absolute() {
+                            raw_target
+                        } else {
+                            normalize_lexical(&dir.join(raw_target))
+                        };
+                        register_missing_ancestor(&dest, catalog_ancestors);
+                    }
                 }
+                continue;
+            }
+            if depth >= max_depth {
                 continue;
             }
             if !ft.is_dir() {
@@ -531,6 +583,7 @@ fn walk_skills_container_dirs(
     container: &Path,
     out: &mut HashSet<PathBuf>,
     external_targets: &mut HashMap<PathBuf, HashSet<PathBuf>>,
+    catalog_ancestors: &mut HashMap<PathBuf, HashSet<PathBuf>>,
     explored_remaining: &mut HashMap<PathBuf, usize>,
     incomplete: &mut bool,
 ) {
@@ -556,6 +609,7 @@ fn walk_skills_container_dirs(
                 MAX_SKILL_PACKAGE_DEPTH,
                 out,
                 external_targets,
+                catalog_ancestors,
                 explored_remaining,
                 incomplete,
             );
@@ -616,6 +670,7 @@ fn classify_event(kind: EventKind, paths: &[PathBuf], filter: &ActiveWatchFilter
         if matches_ancestor_target(path, &filter.file_ancestors) {
             dispatch.open_files = !filter.open_files.is_empty();
             dispatch.recent_files = !filter.recent_files.is_empty();
+            dispatch.resync_watches = true;
         }
 
         if !dispatch.catalog && is_catalog_relevant_path(kind, path, filter) {
@@ -983,6 +1038,120 @@ mod tests {
         }
 
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_watch_dirs_records_file_symlink_at_max_depth_and_dangling_symlink_target() {
+        let root = unique_temp_dir("symlink_depth_dangling");
+        let _ = fs::remove_dir_all(&root);
+
+        // Build a nested directory at depth == MAX_PROJECT_WATCH_DEPTH (8).
+        let mut deep = root.join("proj");
+        for i in 1..=MAX_PROJECT_WATCH_DEPTH {
+            deep = deep.join(format!("d{i}"));
+        }
+        let beyond = deep.join("beyond");
+        fs::create_dir_all(&beyond).unwrap();
+
+        let ext_dir = root.join("external");
+        fs::create_dir_all(&ext_dir).unwrap();
+        let ext_file = ext_dir.join("note.md");
+        fs::write(&ext_file, "# External\n").unwrap();
+
+        // File symlink at depth == MAX_PROJECT_WATCH_DEPTH should be recorded; `beyond` should not.
+        std::os::unix::fs::symlink(&ext_file, deep.join("linked.md")).unwrap();
+
+        // Dangling catalog symlink at project root pointing into `missing_sub/ghost.md`.
+        let ghost_target = ext_dir.join("missing_sub/ghost.md");
+        std::os::unix::fs::symlink(&ghost_target, root.join("proj/dangling.md")).unwrap();
+
+        let targets = WatchTargets {
+            open_files: Vec::new(),
+            recent_files: Vec::new(),
+            project_folders: vec![root.join("proj")],
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+
+        let canon_ext_dir = ext_dir.canonicalize().unwrap();
+        let canon_ext_file = ext_file.canonicalize().unwrap();
+        assert!(
+            dirs.external_catalog_targets
+                .get(&canon_ext_dir)
+                .is_some_and(|targets| targets.contains(&canon_ext_file))
+        );
+        assert!(!dirs.catalog_dirs.contains(&beyond.canonicalize().unwrap()));
+        assert!(
+            dirs.catalog_ancestors.get(&canon_ext_dir).is_some_and(
+                |targets| targets.contains(&canon_ext_dir.join("missing_sub/ghost.md"))
+            )
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleted_and_recreated_watched_dir_invalidates_and_reregisters() {
+        let root = unique_temp_dir("reregister");
+        let _ = fs::remove_dir_all(&root);
+        let open_dir = root.join("open");
+        fs::create_dir_all(&open_dir).unwrap();
+        let open_file = open_dir.join("note.md");
+        fs::write(&open_file, "v1").unwrap();
+
+        let (mut watcher, rx) = DiskWatcher::new();
+        assert!(!watcher.is_degraded());
+
+        let targets = WatchTargets {
+            open_files: vec![open_file.clone()],
+            recent_files: Vec::new(),
+            project_folders: Vec::new(),
+            global_watch: GlobalWatch::Skip,
+        };
+        let dirs = collect_watch_dirs(&targets);
+        watcher.apply_sync(&targets, &dirs);
+        thread::sleep(Duration::from_millis(50));
+
+        // Delete and immediately recreate the watched directory before drain_dispatch runs.
+        fs::remove_dir_all(&open_dir).unwrap();
+        fs::create_dir_all(&open_dir).unwrap();
+        fs::write(&open_file, "v2").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_resync = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            let dispatch = watcher.drain_dispatch();
+            if dispatch.resync_watches {
+                saw_resync = true;
+                break;
+            }
+        }
+        assert!(saw_resync, "expected resync_watches after dir replacement");
+
+        // Re-syncing must re-register the replacement directory's new inode watch.
+        let dirs = collect_watch_dirs(&targets);
+        let outcome = watcher.apply_sync(&targets, &dirs);
+        assert!(outcome.added_file_parents);
+        thread::sleep(Duration::from_millis(50));
+
+        // Edits in the replacement directory must now be observed.
+        fs::write(&open_file, "v3").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_edit = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(40));
+            while rx.try_recv().is_ok() {}
+            if watcher.drain_dispatch().open_files {
+                saw_edit = true;
+                break;
+            }
+        }
+        assert!(saw_edit, "expected edit notification after re-registration");
+
         let _ = fs::remove_dir_all(&root);
     }
 }
