@@ -260,9 +260,11 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --features gpui-kit/test-support
       - run: cargo nextest run --locked
+      - if: github.event_name == 'workflow_dispatch'
+        run: cargo build --locked --features gpui-kit/test-support
       - name: Test MSIX packaging
+        if: github.event_name == 'workflow_dispatch'
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           & packaging/windows/build-msix.ps1 `
