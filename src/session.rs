@@ -55,6 +55,9 @@ impl Session {
     }
 
     pub(crate) fn save(&self) {
+        if cfg!(test) {
+            return;
+        }
         if let Some(path) = session_path() {
             self.save_to(&path);
         }

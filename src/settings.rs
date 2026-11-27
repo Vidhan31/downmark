@@ -221,19 +221,7 @@ impl Settings {
         settings.layout = Layout::Preview;
         settings.glance_mode = false;
         settings.recent_files.truncate(RECENT_LIMIT);
-        settings.tracked_folders.retain(|dir| dir.is_dir());
-        settings.project_folders.retain(|dir| dir.is_dir());
-        settings.recent_projects.retain(|dir| dir.is_dir());
-        if let Some(ref filter) = settings.selected_project_filter
-            && (!filter.is_dir() || !settings.project_folders.contains(filter))
-        {
-            settings.selected_project_filter = None;
-        }
-        if let Some(ref active) = settings.active_project
-            && !active.is_dir()
-        {
-            settings.active_project = None;
-        }
+        settings.prune_missing();
         let folder = settings.image_folder.trim().trim_matches(['/', '\\']);
         settings.image_folder = if folder.is_empty() || folder.contains("..") {
             "assets".to_string()
@@ -246,6 +234,9 @@ impl Settings {
     /// Persist settings. Failures are not fatal: preferences simply are not
     /// remembered.
     pub(crate) fn save(&self) {
+        if cfg!(test) {
+            return;
+        }
         let Some(path) = settings_path() else {
             return;
         };
@@ -264,6 +255,89 @@ impl Settings {
         self.recent_files.insert(0, path);
         self.recent_files.truncate(RECENT_LIMIT);
     }
+
+    /// Remove file and folder entries that are confirmed absent or of the wrong type.
+    ///
+    /// Returns `true` if any stored entry was removed or cleared.
+    pub(crate) fn prune_missing(&mut self) -> bool {
+        let prev_projects = self.project_folders.len();
+        self.project_folders
+            .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
+        let projects_changed = self.project_folders.len() != prev_projects;
+        self.prune_non_project_entries() || projects_changed
+    }
+
+    /// Remove missing non-project entries and reconcile `project_folders` against
+    /// a freshly scanned snapshot's `valid_projects`.
+    pub(crate) fn prune_missing_with_projects(&mut self, valid_projects: &[PathBuf]) -> bool {
+        let prev_projects = self.project_folders.len();
+        self.project_folders.retain(|dir| {
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            valid_projects.contains(&canonical)
+        });
+        let projects_changed = self.project_folders.len() != prev_projects;
+        self.prune_non_project_entries() || projects_changed
+    }
+
+    fn prune_non_project_entries(&mut self) -> bool {
+        let prev_recent = self.recent_files.len();
+        let prev_tracked = self.tracked_folders.len();
+        let prev_recent_projects = self.recent_projects.len();
+        let prev_filter = self.selected_project_filter.clone();
+        let prev_active = self.active_project.clone();
+
+        self.recent_files
+            .retain(|path| path_exists_as_file_or_unconfirmed(path));
+        self.tracked_folders
+            .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
+        self.recent_projects
+            .retain(|dir| path_exists_as_dir_or_unconfirmed(dir));
+        if let Some(ref filter) = self.selected_project_filter {
+            let filter_canon = filter.canonicalize().unwrap_or_else(|_| filter.clone());
+            let in_projects = self.project_folders.iter().any(|dir| {
+                dir == filter || dir.canonicalize().unwrap_or_else(|_| dir.clone()) == filter_canon
+            });
+            if !path_exists_as_dir_or_unconfirmed(filter) || !in_projects {
+                self.selected_project_filter = None;
+            }
+        }
+        if let Some(ref active) = self.active_project
+            && !path_exists_as_dir_or_unconfirmed(active)
+        {
+            self.active_project = None;
+        }
+
+        self.recent_files.len() != prev_recent
+            || self.tracked_folders.len() != prev_tracked
+            || self.recent_projects.len() != prev_recent_projects
+            || self.selected_project_filter != prev_filter
+            || self.active_project != prev_active
+    }
+}
+
+/// Returns `true` if `path` is a regular file or if metadata lookup failed for a
+/// non-absence reason (such as permission denied or a transient I/O error).
+pub(crate) fn path_exists_as_file_or_unconfirmed(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file(),
+        Err(err) => !is_confirmed_absent(&err),
+    }
+}
+
+/// Returns `true` if `path` is a directory or if metadata lookup failed for a
+/// non-absence reason (such as permission denied or a transient I/O error).
+pub(crate) fn path_exists_as_dir_or_unconfirmed(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_dir(),
+        Err(err) => !is_confirmed_absent(&err),
+    }
+}
+
+fn is_confirmed_absent(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 pub(crate) fn clamp_font_size(size: f32) -> f32 {
@@ -379,5 +453,118 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.font_family.as_deref(), Some("Inter"));
         assert_eq!(settings.mono_font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn prune_missing_removes_deleted_files_and_folders() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "downmark_settings_prune_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let existing_file = proj.join("keep.md");
+        std::fs::write(&existing_file, "# Keep\n").unwrap();
+        let missing_file = proj.join("deleted.md");
+        let missing_dir = dir.join("deleted_proj");
+
+        let mut settings = Settings {
+            recent_files: vec![existing_file.clone(), missing_file],
+            tracked_folders: vec![proj.clone(), missing_dir.clone()],
+            project_folders: vec![proj.clone(), missing_dir.clone()],
+            recent_projects: vec![proj.clone(), missing_dir.clone()],
+            selected_project_filter: Some(missing_dir.clone()),
+            active_project: Some(missing_dir),
+            ..Settings::default()
+        };
+
+        assert!(settings.prune_missing());
+        assert_eq!(settings.recent_files, vec![existing_file]);
+        assert_eq!(settings.tracked_folders, vec![proj.clone()]);
+        assert_eq!(settings.project_folders, vec![proj.clone()]);
+        assert_eq!(settings.recent_projects, vec![proj]);
+        assert_eq!(settings.selected_project_filter, None);
+        assert_eq!(settings.active_project, None);
+        assert!(!settings.prune_missing());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_missing_preserves_entries_on_permission_denied() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "downmark_settings_perm_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let locked = dir.join("locked");
+        let inner_dir = locked.join("proj");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        let inner_file = inner_dir.join("note.md");
+        std::fs::write(&inner_file, "# Note\n").unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut settings = Settings {
+            recent_files: vec![inner_file.clone()],
+            tracked_folders: vec![inner_dir.clone()],
+            project_folders: vec![inner_dir.clone()],
+            recent_projects: vec![inner_dir.clone()],
+            selected_project_filter: Some(inner_dir.clone()),
+            active_project: Some(inner_dir.clone()),
+            ..Settings::default()
+        };
+
+        let changed = settings.prune_missing();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!changed);
+        assert_eq!(settings.recent_files, vec![inner_file]);
+        assert_eq!(settings.project_folders, vec![inner_dir.clone()]);
+        assert_eq!(settings.selected_project_filter, Some(inner_dir.clone()));
+        assert_eq!(settings.active_project, Some(inner_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_missing_with_projects_keeps_canonical_selected_project_filter_for_symlink() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "downmark_settings_symlink_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("real_proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let symlink = dir.join("link_proj");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let canon_target = target.canonicalize().unwrap();
+
+        let mut settings = Settings {
+            project_folders: vec![symlink.clone()],
+            selected_project_filter: Some(canon_target.clone()),
+            ..Settings::default()
+        };
+
+        let changed = settings.prune_missing_with_projects(std::slice::from_ref(&canon_target));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!changed);
+        assert_eq!(settings.project_folders, vec![symlink]);
+        assert_eq!(settings.selected_project_filter, Some(canon_target));
     }
 }

@@ -1812,6 +1812,7 @@ dependencies = [
  "markdown",
  "merman",
  "mimalloc",
+ "notify",
  "resvg 0.50.0",
  "serde",
  "serde_json",

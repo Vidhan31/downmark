@@ -11,9 +11,9 @@ use std::{
 };
 
 use gpui_kit::{
-    Anchor, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EntityId, ExternalPaths,
-    FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu, MouseButton,
-    MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
+    Anchor, AnyWindowHandle, App, AppContext as _, Bounds, ClickEvent, Context, Entity, EntityId,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement, Menu,
+    MouseButton, MouseDownEvent, MouseMoveEvent, OwnedMenu, OwnedMenuItem, ParentElement as _,
     PathPromptOptions, Render, ScrollEvent, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowBounds,
     WindowControlArea,
@@ -58,20 +58,29 @@ use crate::{
     settings::{Appearance, Layout, LinkPlacement, clamp_font_size},
     settings_dialog,
     themes::{self, AppSettings},
+    watcher::{self, DiskWatcher, GlobalWatch, WatchDispatch, WatchTargets},
 };
 
 /// Shown when Downmark starts for the first time.
 const WELCOME: &str = include_str!("welcome.md");
-/// How often open files and the file sidebar are checked for changes made
-/// by other programs.
+/// Debounce delay to coalesce rapid bursts of filesystem notifications.
 #[cfg_attr(
     test,
     expect(
         dead_code,
-        reason = "periodic timer only loops in live runtime rather than test executor"
+        reason = "debounce timer only loops in live runtime rather than test executor"
     )
 )]
-const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Fallback polling interval used only when the OS filesystem watcher is unavailable or degraded.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "fallback polling timer only loops in live runtime rather than test executor"
+    )
+)]
+const FALLBACK_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 const WINDOW_CONTROL_WIDTH_PX: f32 = 34.;
 const TITLE_BAR_MENU_AND_GAP_WIDTH_PX: f32 = 36.;
 const NEW_TAB_BUTTON_WIDTH_PX: f32 = 32.;
@@ -103,6 +112,29 @@ enum Placement {
     ReplaceActive,
 }
 
+/// Outcome of reading a document's disk state against its known stamp.
+enum DiskReadOutcome {
+    NoChange,
+    Change(DiskChange),
+    Retry,
+}
+
+/// Validated disk-check result paired with the document identity and stamp it was checked against.
+struct CheckedDiskChange {
+    id: EntityId,
+    expected_path: PathBuf,
+    expected_known: Option<DiskStamp>,
+    expected_saved_hash: u64,
+    outcome: DiskReadOutcome,
+}
+
+#[cfg_attr(test, expect(dead_code, reason = "constructed in live watcher loop"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRetry {
+    Skip,
+    Retry,
+}
+
 /// What the watcher found for one open file.
 enum DiskChange {
     Missing,
@@ -112,6 +144,50 @@ enum DiskChange {
         stamp: Option<DiskStamp>,
     },
     Touched(Option<DiskStamp>),
+}
+
+/// Reads `path` and pairs the loaded contents with a validated `DiskStamp` from
+/// the same read, returning `Retry` when a transient read failure or mid-read
+/// modification prevents a consistent snapshot.
+fn read_validated_disk_change(
+    path: &Path,
+    known: Option<DiskStamp>,
+    saved_hash: u64,
+) -> DiskReadOutcome {
+    for _ in 0..2 {
+        let stamp_before = DiskStamp::of(path);
+        if stamp_before == known {
+            return DiskReadOutcome::NoChange;
+        }
+        if stamp_before.is_none() {
+            return if known.is_some() {
+                if crate::settings::path_exists_as_file_or_unconfirmed(path) {
+                    DiskReadOutcome::Retry
+                } else {
+                    DiskReadOutcome::Change(DiskChange::Missing)
+                }
+            } else {
+                DiskReadOutcome::NoChange
+            };
+        }
+        let Ok(loaded) = document::load(path) else {
+            return DiskReadOutcome::Retry;
+        };
+        let stamp_after = DiskStamp::of(path);
+        if stamp_after != stamp_before {
+            continue;
+        }
+        return DiskReadOutcome::Change(if content_hash(&loaded.text) == saved_hash {
+            DiskChange::Touched(stamp_after)
+        } else {
+            DiskChange::Changed {
+                text: loaded.text,
+                line_ending: loaded.line_ending,
+                stamp: stamp_after,
+            }
+        });
+    }
+    DiskReadOutcome::Retry
 }
 
 #[derive(Clone)]
@@ -171,8 +247,18 @@ impl WorkspaceTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RescanState {
+    #[default]
+    Idle,
+    InFlight {
+        pending_followup: bool,
+    },
+}
+
 pub(crate) struct Workspace {
     focus_handle: FocusHandle,
+    window_handle: AnyWindowHandle,
     tabs_scroll_handle: ScrollHandle,
     tabs: Vec<WorkspaceTab>,
     active: usize,
@@ -186,8 +272,14 @@ pub(crate) struct Workspace {
     discarded: HashSet<EntityId>,
     /// Files changed on disk that are waiting for the user to decide.
     pending_disk_prompt: HashSet<EntityId>,
+    /// Documents whose disk-change check was deferred while a dialog was open.
+    deferred_disk_docs: HashSet<EntityId>,
     last_session: Option<Session>,
     catalog: Entity<FolderCatalog>,
+    disk_watcher: DiskWatcher,
+    watch_sync_generation: u64,
+    rescan_generation: u64,
+    rescan_state: RescanState,
     _watch_task: Task<()>,
     tab_subscriptions: Vec<(EntityId, Vec<Subscription>)>,
     _subscriptions: Vec<Subscription>,
@@ -251,17 +343,8 @@ impl Workspace {
                 .unwrap_or(true)
         });
 
-        let watch_task = cx.spawn_in(window, async move |this, cx| {
-            #[cfg(not(test))]
-            loop {
-                cx.background_executor().timer(WATCH_INTERVAL).await;
-                if this.update_in(cx, Self::check_disk).is_err() {
-                    break;
-                }
-            }
-            #[cfg(test)]
-            let _ = this.update_in(cx, Self::check_disk);
-        });
+        let (disk_watcher, watch_rx) = DiskWatcher::new();
+        let watch_task = Self::spawn_watch_task(watch_rx, window, cx);
 
         let catalog = cx.new(|_| {
             FolderCatalog::new(
@@ -272,6 +355,7 @@ impl Workspace {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
+            window_handle: window.window_handle(),
             tabs_scroll_handle: ScrollHandle::new(),
             tabs: Vec::new(),
             active: 0,
@@ -281,8 +365,13 @@ impl Workspace {
             closing: false,
             discarded: HashSet::new(),
             pending_disk_prompt: HashSet::new(),
+            deferred_disk_docs: HashSet::new(),
             last_session: None,
             catalog,
+            disk_watcher,
+            watch_sync_generation: 0,
+            rescan_generation: 0,
+            rescan_state: RescanState::Idle,
             _watch_task: watch_task,
             tab_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
@@ -291,6 +380,7 @@ impl Workspace {
             explicit_layout: layout,
         };
         this.restore(files, layout, glance, &settings, window, cx);
+        this.sync_disk_watcher(cx);
         this
     }
 
@@ -530,6 +620,7 @@ impl Workspace {
         }
         self.activate(self.active, window, cx);
         self.on_document_closed(window, cx);
+        self.sync_disk_watcher(cx);
     }
 
     /// Put `tab` in place of the active tab.
@@ -554,6 +645,7 @@ impl Workspace {
         }
         self.activate(position, window, cx);
         self.on_document_closed(window, cx);
+        self.sync_disk_watcher(cx);
     }
 
     /// Prune unreferenced diagram caches and trim allocator arenas when documents close.
@@ -706,11 +798,13 @@ impl Workspace {
                     if let Some(target) = target {
                         this.reveal_target(&doc, target, window, cx);
                     }
+                    this.sync_disk_watcher(cx);
                 }
                 Err(err) => {
                     AppSettings::update(cx, |settings| {
                         settings.recent_files.retain(|recent| recent != &path);
                     });
+                    this.sync_disk_watcher(cx);
                     this.notify_error(
                         format!("Couldn’t open “{}”. {err}", display_name(Some(&path))),
                         window,
@@ -807,10 +901,12 @@ impl Workspace {
                                 settings.tracked_folders.push(path.clone());
                             }
                         });
+                        this.rescan_generation += 1;
                         this.catalog.update(cx, |catalog, cx| {
                             catalog.add_project_folder(path);
                             cx.notify();
                         });
+                        this.sync_disk_watcher(cx);
                     }
                 }
             });
@@ -838,10 +934,12 @@ impl Workspace {
                 settings.selected_project_filter = None;
             }
         });
+        self.rescan_generation += 1;
         self.catalog.update(cx, |catalog, cx| {
             catalog.remove_project_folder(&path);
             cx.notify();
         });
+        self.sync_disk_watcher(cx);
     }
 
     #[expect(dead_code, reason = "Maintained for programmatic folder removal")]
@@ -859,21 +957,297 @@ impl Workspace {
                 settings.active_project = settings.recent_projects.first().cloned();
             }
         });
+        self.rescan_generation += 1;
         self.catalog.update(cx, |catalog, cx| {
             catalog.remove_folder(&path);
             cx.notify();
         });
+        self.sync_disk_watcher(cx);
     }
 
     fn rescan_catalog(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let catalog = self.catalog.clone();
-        cx.spawn_in(window, async move |_this, cx| {
-            catalog.update(cx, |catalog, cx| {
-                catalog.rescan();
-                cx.notify();
+        if let RescanState::InFlight {
+            ref mut pending_followup,
+        } = self.rescan_state
+        {
+            *pending_followup = true;
+            return;
+        }
+        self.rescan_state = RescanState::InFlight {
+            pending_followup: false,
+        };
+        self.rescan_generation += 1;
+        let generation = self.rescan_generation;
+        let project_folders = self.catalog.read(cx).project_folders().to_vec();
+        let task = cx
+            .background_executor()
+            .spawn(async move { FolderCatalog::scan_snapshot(project_folders) });
+        cx.spawn_in(window, async move |this, cx| {
+            let mut snapshot = task.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                let mut followup = matches!(
+                    this.rescan_state,
+                    RescanState::InFlight {
+                        pending_followup: true
+                    }
+                );
+                this.rescan_state = RescanState::Idle;
+
+                if this.rescan_generation == generation {
+                    // Preserve any configured project root that exists at commit time
+                    // even if it was absent when `scan_snapshot` ran, and schedule a
+                    // follow-up scan so its contents are indexed.
+                    let existing_roots: Vec<PathBuf> = this
+                        .catalog
+                        .read(cx)
+                        .project_folders()
+                        .iter()
+                        .filter(|dir| {
+                            !snapshot.project_folders.contains(*dir)
+                                && crate::settings::path_exists_as_dir_or_unconfirmed(dir)
+                        })
+                        .cloned()
+                        .collect();
+                    if !existing_roots.is_empty() {
+                        snapshot.project_folders.extend(existing_roots);
+                        followup = true;
+                    }
+                    AppSettings::update(cx, |settings| {
+                        settings.prune_missing_with_projects(&snapshot.project_folders);
+                    });
+                    this.catalog.update(cx, |catalog, cx| {
+                        catalog.apply_snapshot(snapshot);
+                        cx.notify();
+                    });
+                    this.sync_disk_watcher(cx);
+                }
+                if followup {
+                    this.rescan_catalog(window, cx);
+                }
             });
         })
         .detach();
+    }
+
+    fn sync_disk_watcher(&mut self, cx: &mut Context<'_, Self>) {
+        let open_files = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path(cx).cloned())
+            .collect();
+        let recent_files = AppSettings::get(cx).recent_files.clone();
+        let project_folders = self.catalog.read(cx).project_folders().to_vec();
+        let targets = WatchTargets {
+            open_files,
+            recent_files,
+            project_folders,
+            global_watch: if cfg!(test) {
+                GlobalWatch::Skip
+            } else {
+                GlobalWatch::Include
+            },
+        };
+        self.watch_sync_generation += 1;
+        let generation = self.watch_sync_generation;
+        let task = cx.background_executor().spawn(async move {
+            let dirs = watcher::collect_watch_dirs(&targets);
+            (targets, dirs)
+        });
+        cx.spawn(async move |this, cx| {
+            let (targets, dirs) = task.await;
+            let outcome = this
+                .update(cx, |this, _| {
+                    (this.watch_sync_generation == generation).then(|| {
+                        (
+                            this.window_handle,
+                            this.disk_watcher.apply_sync(&targets, &dirs),
+                        )
+                    })
+                })
+                .ok()
+                .flatten();
+            if let Some((window_handle, outcome)) = outcome
+                && (outcome.added_file_parents || outcome.added_catalog_dirs)
+            {
+                _ = window_handle.update(cx, |_, window, cx| {
+                    _ = this.update(cx, |this, cx| {
+                        if outcome.added_file_parents {
+                            this.check_disk(window, cx);
+                        }
+                        if outcome.added_catalog_dirs {
+                            this.rescan_catalog(window, cx);
+                        }
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "watch wakeup handler runs in live watcher loop; tests call apply_watch_dispatch directly"
+        )
+    )]
+    fn handle_watch_wakeup(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let dispatch = self.disk_watcher.drain_dispatch();
+        self.apply_watch_dispatch(dispatch, window, cx);
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::needless_pass_by_value,
+            reason = "receiver is moved into the live watcher loop"
+        )
+    )]
+    fn spawn_watch_task(
+        watch_rx: smol::channel::Receiver<()>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Task<()> {
+        cx.spawn_in(window, async move |this, cx| {
+            #[cfg(not(test))]
+            {
+                let mut resync_tick: u8 = 0;
+                let mut next_poll_at: Option<std::time::Instant> = None;
+                loop {
+                    let degraded = this
+                        .read_with(cx, |this, _| this.disk_watcher.is_degraded())
+                        .unwrap_or(true);
+                    if degraded {
+                        enum DegradedWakeup {
+                            Event(bool),
+                            Timer,
+                        }
+                        let deadline = *next_poll_at.get_or_insert_with(|| {
+                            std::time::Instant::now() + FALLBACK_WATCH_INTERVAL
+                        });
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        let wakeup = smol::future::race(
+                            async { DegradedWakeup::Event(watch_rx.recv().await.is_ok()) },
+                            async {
+                                cx.background_executor().timer(remaining).await;
+                                DegradedWakeup::Timer
+                            },
+                        )
+                        .await;
+                        match wakeup {
+                            DegradedWakeup::Event(false) => break,
+                            DegradedWakeup::Event(true) => {
+                                cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                                while watch_rx.try_recv().is_ok() {}
+                                if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
+                                    break;
+                                }
+                            }
+                            DegradedWakeup::Timer => {
+                                next_poll_at =
+                                    Some(std::time::Instant::now() + FALLBACK_WATCH_INTERVAL);
+                                resync_tick = resync_tick.wrapping_add(1);
+                                let retry_sync = if resync_tick.is_multiple_of(5) {
+                                    SyncRetry::Retry
+                                } else {
+                                    SyncRetry::Skip
+                                };
+                                if this
+                                    .update_in(cx, |this, window, cx| {
+                                        this.poll_degraded_targets(retry_sync, window, cx);
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    resync_tick = 0;
+                    next_poll_at = None;
+                    if watch_rx.recv().await.is_err() {
+                        break;
+                    }
+                    cx.background_executor().timer(WATCH_DEBOUNCE).await;
+                    while watch_rx.try_recv().is_ok() {}
+                    if this.update_in(cx, Self::handle_watch_wakeup).is_err() {
+                        break;
+                    }
+                }
+            }
+            #[cfg(test)]
+            {
+                let _ = watch_rx;
+                let _ = this.update_in(cx, Self::check_disk);
+            }
+        })
+    }
+
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "degraded fallback polling runs in live watcher loop"
+        )
+    )]
+    fn poll_degraded_targets(
+        &mut self,
+        retry_sync: SyncRetry,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.check_disk(window, cx);
+        let uncovered_recent_pruned = {
+            let watcher = &self.disk_watcher;
+            let mut pruned = false;
+            AppSettings::update(cx, |settings| {
+                let prev = settings.recent_files.len();
+                settings.recent_files.retain(|path| {
+                    watcher.covers_file_parent(path)
+                        || crate::settings::path_exists_as_file_or_unconfirmed(path)
+                });
+                pruned = settings.recent_files.len() != prev;
+            });
+            pruned
+        };
+        if retry_sync == SyncRetry::Retry || uncovered_recent_pruned {
+            self.sync_disk_watcher(cx);
+        }
+    }
+
+    fn apply_watch_dispatch(
+        &mut self,
+        dispatch: WatchDispatch,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !dispatch.any() {
+            return;
+        }
+        if dispatch.open_files {
+            self.check_disk(window, cx);
+        }
+        let mut resync_watches = dispatch.resync_watches;
+        if dispatch.recent_files {
+            let mut changed = false;
+            AppSettings::update(cx, |settings| {
+                let prev = settings.recent_files.len();
+                settings
+                    .recent_files
+                    .retain(|path| crate::settings::path_exists_as_file_or_unconfirmed(path));
+                changed = settings.recent_files.len() != prev;
+            });
+            resync_watches |= changed;
+        }
+        if resync_watches && !dispatch.catalog {
+            self.sync_disk_watcher(cx);
+        }
+        if dispatch.catalog {
+            self.rescan_catalog(window, cx);
+        }
     }
 
     #[expect(clippy::unused_self, reason = "Workspace notification method")]
@@ -973,6 +1347,15 @@ impl Workspace {
 
     /// Look for open files other programs changed, moved or deleted.
     fn check_disk(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.check_disk_with_retry(0, window, cx);
+    }
+
+    fn check_disk_with_retry(
+        &mut self,
+        retry_attempt: u8,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         let targets: Vec<(EntityId, PathBuf, Option<DiskStamp>, u64)> = self
             .tabs
             .iter()
@@ -994,57 +1377,95 @@ impl Workspace {
             targets
                 .into_iter()
                 .filter_map(|(id, path, known, saved_hash)| {
-                    let stamp = DiskStamp::of(&path);
-                    if stamp == known {
-                        return None;
-                    }
-                    let change = match stamp {
-                        None if known.is_some() => DiskChange::Missing,
-                        None => return None,
-                        Some(_) => match document::load(&path) {
-                            Ok(loaded) if content_hash(&loaded.text) == saved_hash => {
-                                DiskChange::Touched(stamp)
-                            }
-                            Ok(loaded) => DiskChange::Changed {
-                                text: loaded.text,
-                                line_ending: loaded.line_ending,
-                                stamp,
-                            },
-                            Err(_) => return None,
-                        },
-                    };
-                    Some((id, change))
+                    let outcome = read_validated_disk_change(&path, known, saved_hash);
+                    (!matches!(outcome, DiskReadOutcome::NoChange)).then_some(CheckedDiskChange {
+                        id,
+                        expected_path: path,
+                        expected_known: known,
+                        expected_saved_hash: saved_hash,
+                        outcome,
+                    })
                 })
                 .collect::<Vec<_>>()
         });
         cx.spawn_in(window, async move |this, cx| {
             let changes = task.await;
+            let mut needs_retry = false;
             _ = this.update_in(cx, |this, window, cx| {
-                for (id, change) in changes {
-                    this.apply_disk_change(id, change, window, cx);
+                for checked in changes {
+                    if matches!(checked.outcome, DiskReadOutcome::Retry) {
+                        needs_retry = true;
+                    } else {
+                        this.apply_disk_change(checked, window, cx);
+                    }
                 }
             });
+            if needs_retry && retry_attempt < 2 {
+                let delay = Duration::from_millis(100 * u64::from(retry_attempt + 1));
+                cx.background_executor().timer(delay).await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.check_disk_with_retry(retry_attempt + 1, window, cx);
+                });
+            }
         })
         .detach();
     }
 
     fn apply_disk_change(
         &mut self,
-        id: EntityId,
-        change: DiskChange,
+        checked: CheckedDiskChange,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let CheckedDiskChange {
+            id,
+            expected_path,
+            expected_known,
+            expected_saved_hash,
+            outcome,
+        } = checked;
+        let DiskReadOutcome::Change(change) = outcome else {
+            return;
+        };
         let Some(doc) = self.tab_index(id).and_then(|ix| match &self.tabs[ix] {
             WorkspaceTab::Document(doc) => Some(doc.clone()),
             WorkspaceTab::NewTab(_) => None,
         }) else {
             return;
         };
-        let name = doc.read(cx).name();
+        let (current_path, current_known, current_saved_hash, name) = {
+            let doc_ref = doc.read(cx);
+            (
+                doc_ref.path().cloned(),
+                doc_ref.disk_stamp(),
+                doc_ref.saved_hash(),
+                doc_ref.name(),
+            )
+        };
+        if current_path.as_ref() != Some(&expected_path)
+            || current_known != expected_known
+            || current_saved_hash != expected_saved_hash
+        {
+            self.deferred_disk_docs.insert(id);
+            cx.notify();
+            return;
+        }
         match change {
             DiskChange::Touched(stamp) => doc.update(cx, |doc, _| doc.set_disk_stamp(stamp)),
             DiskChange::Missing => {
+                if crate::settings::path_exists_as_file_or_unconfirmed(&expected_path) {
+                    return;
+                }
+                if let Some(missing_path) = doc.read(cx).path().cloned()
+                    && !crate::settings::path_exists_as_file_or_unconfirmed(&missing_path)
+                {
+                    AppSettings::update(cx, |settings| {
+                        settings
+                            .recent_files
+                            .retain(|recent| recent != &missing_path);
+                    });
+                    self.sync_disk_watcher(cx);
+                }
                 doc.update(cx, DocumentView::mark_missing);
                 window.push_notification(
                     Notification::warning(format!(
@@ -1059,63 +1480,84 @@ impl Workspace {
                 stamp,
             } => {
                 if !doc.read(cx).is_dirty() {
-                    doc.update(cx, |doc, cx| doc.reload(text, line_ending, window, cx));
+                    doc.update(cx, |doc, cx| {
+                        doc.reload(text, line_ending, stamp, window, cx);
+                    });
                     return;
                 }
                 if window.has_active_dialog(cx) {
-                    // Ask once the current dialog is answered.
+                    // Defer and retry once the blocking dialog closes.
+                    self.deferred_disk_docs.insert(id);
                     return;
                 }
-                doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
-                self.pending_disk_prompt.insert(id);
-                if let Some(ix) = self.tab_index(id) {
-                    self.activate(ix, window, cx);
-                }
-                let workspace = cx.weak_entity();
-                let text = Arc::new(text);
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let (keep, reload) = (workspace.clone(), workspace.clone());
-                    let (reload_doc, text) = (doc.clone(), Arc::clone(&text));
-                    alert
-                        .title(format!("“{name}” changed on disk"))
-                        .description(
-                            "Another program saved this file while you have unsaved changes here.",
-                        )
-                        .footer(
-                            DialogFooter::new()
-                                .justify_end()
-                                .child(
-                                    Button::new("reload")
-                                        .label("Use the file on disk")
-                                        .outline()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            let text = text.as_ref().clone();
-                                            reload_doc.update(cx, |doc, cx| {
-                                                doc.reload(text, line_ending, window, cx);
-                                            });
-                                            _ = reload.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("keep")
-                                        .label("Keep my changes")
-                                        .primary()
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            _ = keep.update(cx, |this, cx| {
-                                                this.pending_disk_prompt.remove(&id);
-                                                this.focus_active(window, cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                });
+                self.prompt_disk_conflict(id, doc, name, text, line_ending, stamp, window, cx);
             }
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Disk conflict dialog needs document identity, loaded content, and GPUI context"
+    )]
+    fn prompt_disk_conflict(
+        &mut self,
+        id: EntityId,
+        doc: Entity<DocumentView>,
+        name: String,
+        text: String,
+        line_ending: LineEnding,
+        stamp: Option<DiskStamp>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        doc.update(cx, |doc, _| doc.set_disk_stamp(stamp));
+        self.pending_disk_prompt.insert(id);
+        if let Some(ix) = self.tab_index(id) {
+            self.activate(ix, window, cx);
+        }
+        let workspace = cx.weak_entity();
+        let text = Arc::new(text);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (keep, reload) = (workspace.clone(), workspace.clone());
+            let (reload_doc, text) = (doc.clone(), Arc::clone(&text));
+            alert
+                .title(format!("“{name}” changed on disk"))
+                .description("Another program saved this file while you have unsaved changes here.")
+                .footer(
+                    DialogFooter::new()
+                        .justify_end()
+                        .child(
+                            Button::new("reload")
+                                .label("Use the file on disk")
+                                .outline()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let text = text.as_ref().clone();
+                                    reload_doc.update(cx, |doc, cx| {
+                                        doc.reload(text, line_ending, stamp, window, cx);
+                                    });
+                                    _ = reload.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.focus_active(window, cx);
+                                        this.check_disk(window, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("keep")
+                                .label("Keep my changes")
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    _ = keep.update(cx, |this, cx| {
+                                        this.pending_disk_prompt.remove(&id);
+                                        this.focus_active(window, cx);
+                                        this.check_disk(window, cx);
+                                    });
+                                }),
+                        ),
+                )
+        });
     }
 
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1589,6 +2031,7 @@ impl Workspace {
         match doc.update(cx, |doc, cx| doc.write_to(path, cx)) {
             Ok(()) => {
                 self.save_session(window, cx);
+                self.sync_disk_watcher(cx);
                 true
             }
             Err(err) => {
@@ -2372,6 +2815,16 @@ impl Render for Workspace {
     )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         self.update_window_title(window, cx);
+        if (!self.deferred_disk_docs.is_empty() || !self.pending_disk_prompt.is_empty())
+            && !window.has_active_dialog(cx)
+        {
+            self.pending_disk_prompt.clear();
+            self.deferred_disk_docs.clear();
+            cx.spawn_in(window, async move |this, cx| {
+                _ = this.update_in(cx, Self::check_disk);
+            })
+            .detach();
+        }
         // Keyboard commands need a focused element inside the workspace; if
         // focus was lost (e.g. its element left the layout), take it back.
         if window.focused(cx).is_none() {
@@ -3537,5 +3990,423 @@ mod tests {
         ws.read_with(cx, |ws, _| {
             assert_eq!(ws.tabs.len(), 1, "full middle click on tab must close it");
         });
+    }
+
+    #[gpui_kit::test]
+    fn rescan_catalog_clears_missing_recent_and_scanned_entries(cx: &mut gpui_kit::TestAppContext) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_rescan_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let keep_doc = proj.join("README.md");
+        let stale_doc = proj.join("stale.md");
+        let recent_deleted = root.join("gone.md");
+        std::fs::write(&keep_doc, "# Keep\n").unwrap();
+        std::fs::write(&stale_doc, "# Stale\n").unwrap();
+        std::fs::write(&recent_deleted, "# Gone\n").unwrap();
+
+        let canon_keep = keep_doc.canonicalize().unwrap();
+        let canon_gone = recent_deleted.canonicalize().unwrap();
+        let canon_proj = proj.canonicalize().unwrap();
+
+        let (workspace, cx_window) = cx.add_window_view(|window, cx| {
+            gpui_kit::init(cx);
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                project_folders: vec![canon_proj.clone()],
+                selected_project_filter: Some(canon_proj.clone()),
+                recent_files: vec![canon_keep.clone(), canon_gone.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            let app_menu_bar = AppMenuBar::new(cx);
+            Workspace::new(
+                Vec::new(),
+                None,
+                GlanceStart::Normal,
+                app_menu_bar,
+                window,
+                cx,
+            )
+        });
+
+        workspace.read_with(cx_window, |ws, cx| {
+            assert_eq!(ws.catalog.read(cx).project_docs().len(), 2);
+            assert_eq!(AppSettings::get(cx).recent_files.len(), 2);
+        });
+
+        std::fs::remove_file(&stale_doc).unwrap();
+        std::fs::remove_file(&recent_deleted).unwrap();
+
+        cx_window.update(|window, cx| {
+            workspace.update(cx, |ws, cx| ws.rescan_catalog(window, cx));
+        });
+        cx_window.run_until_parked();
+
+        workspace.read_with(cx_window, |ws, cx| {
+            let docs = ws.catalog.read(cx).project_docs();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].file.file_name, "README.md");
+            assert_eq!(AppSettings::get(cx).recent_files, vec![canon_keep]);
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn watch_dispatch_reloads_clean_open_file_and_prunes_missing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_watch_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let file_path = root.join("live.md");
+        std::fs::write(&file_path, "# Before\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::write(&canon_file, "# After external edit\n").unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: true,
+                        recent_files: false,
+                        catalog: false,
+                        resync_watches: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            let doc = ws.active_document().expect("active document");
+            assert_eq!(
+                doc.read(cx).editor().read(cx).value(),
+                "# After external edit\n"
+            );
+            assert!(!doc.read(cx).is_dirty());
+        });
+
+        std::fs::remove_file(&canon_file).unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: true,
+                        recent_files: true,
+                        catalog: false,
+                        resync_watches: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            let doc = ws.active_document().expect("active document");
+            assert!(doc.read(cx).is_dirty());
+            assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn watch_dispatch_prunes_recent_files_even_when_catalog_also_true(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "downmark_ws_recent_and_catalog_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let gone = root.join("gone.md");
+        std::fs::write(&gone, "# Gone\n").unwrap();
+        let canon_gone = gone.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                recent_files: vec![canon_gone.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        Vec::new(),
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::remove_file(&canon_gone).unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.apply_watch_dispatch(
+                    WatchDispatch {
+                        open_files: false,
+                        recent_files: true,
+                        catalog: true,
+                        resync_watches: false,
+                    },
+                    window,
+                    cx,
+                );
+                // Immediately supersede the catalog rescan before it completes.
+                ws.rescan_generation += 1;
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |_ws, cx| {
+            assert_eq!(AppSettings::get(cx).recent_files, Vec::<PathBuf>::new());
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui_kit::test]
+    fn stale_disk_change_schedules_render_and_retries(cx: &mut gpui_kit::TestAppContext) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "downmark_ws_deferred_{}_{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let file_path = root.join("live.md");
+        std::fs::write(&file_path, "# Before\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::write(&canon_file, "# Retried\n").unwrap();
+        cx.update_window(window_handle, |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let doc = ws.active_document().expect("active document");
+                let id = doc.entity_id();
+                let saved_hash = doc.read(cx).saved_hash();
+                // Pass a mismatched expected_known so apply_disk_change defers it as stale.
+                ws.apply_disk_change(
+                    CheckedDiskChange {
+                        id,
+                        expected_path: canon_file.clone(),
+                        expected_known: None,
+                        expected_saved_hash: saved_hash,
+                        outcome: DiskReadOutcome::Change(DiskChange::Touched(None)),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(ws.deferred_disk_docs.contains(&id));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |ws, cx| {
+            assert!(
+                ws.deferred_disk_docs.is_empty(),
+                "expected render to drain deferred_disk_docs"
+            );
+            let doc = ws.active_document().expect("active document");
+            assert_eq!(doc.read(cx).editor().read(cx).value(), "# Retried\n");
+        });
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    fn unconfirmed_metadata_error_does_not_mark_open_doc_missing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("downmark_ws_perm_{}_{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+
+        let file_path = locked.join("live.md");
+        std::fs::write(&file_path, "# Live\n").unwrap();
+        let canon_file = file_path.canonicalize().unwrap();
+
+        cx.update(gpui_kit::init);
+        let mut ws_entity = None;
+        let (window_handle, _) = cx.update(|cx| {
+            let settings = crate::settings::Settings {
+                tabs: true,
+                restore_session: false,
+                recent_files: vec![canon_file.clone()],
+                ..Default::default()
+            };
+            cx.set_global(AppSettings(settings));
+            gpui_kit::open_window(gpui_kit::WindowOptions::default(), cx, |window, cx| {
+                let app_menu_bar = AppMenuBar::new(cx);
+                let entity = cx.new(|cx| {
+                    Workspace::new(
+                        vec![FileTarget {
+                            path: canon_file.clone(),
+                            target: None,
+                        }],
+                        None,
+                        GlanceStart::Normal,
+                        app_menu_bar,
+                        window,
+                        cx,
+                    )
+                });
+                ws_entity = Some(entity.clone());
+                entity
+            })
+            .unwrap()
+        });
+        let workspace = ws_entity.unwrap();
+        cx.run_until_parked();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = matches!(
+            std::fs::metadata(&canon_file),
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied
+        );
+        if denied {
+            cx.update_window(window_handle, |_, window, cx| {
+                workspace.update(cx, |ws, cx| {
+                    ws.apply_watch_dispatch(
+                        WatchDispatch {
+                            open_files: true,
+                            recent_files: true,
+                            catalog: false,
+                            resync_watches: false,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+
+            workspace.read_with(cx, |ws, cx| {
+                let doc = ws.active_document().expect("active document");
+                assert!(
+                    !doc.read(cx).is_dirty(),
+                    "permission denied must not mark open document missing"
+                );
+                assert_eq!(AppSettings::get(cx).recent_files, vec![canon_file.clone()]);
+            });
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
